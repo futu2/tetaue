@@ -1,36 +1,36 @@
-# Aggregation with @fold and a join, teta-style.
+# Aggregation with fold and a join, teta-style.
 #
-# @fold is the aggregate projection: every entry is either @group (a GROUP BY
-# key) or an aggregate (@count, @sum, @avg, @min, @max).
+# fold is the aggregate projection: every entry is either group (a GROUP BY
+# key) or an aggregate (count, sum, avg, min, max).
 
-users = @table "users" {
-    id = @int,
-    name = @string,
+users = table "users" {
+    id = int,
+    name = string,
 },
 
-orders = @table "orders" {
-    id = @int,
-    user_id = @int,
-    total = @float,
-    status = @string,
+orders = table "orders" {
+    id = int,
+    user_id = int,
+    total = float,
+    status = string,
 },
 
 # Rename the colliding "id" column on the left side before joining:
-user_rows = users |> @map (u => { uid = u.id, name = u.name }),
+user_rows = users & map (u => { uid = u.id, name = u.name }),
 
 by_user = user_rows
-    |> @join orders {
+    & join orders {
         on = (u, o) => u.uid == o.user_id,
         kind = "inner",
     }
-    |> @fold (o => {
-        user_id = @group o.user_id,
-        name = @group o.name,
-        order_count = @count o.id,
-        total_spent = @sum o.total,
-        avg_order = @avg o.total,
+    & fold (o => {
+        user_id = group o.user_id,
+        name = group o.name,
+        order_count = count o.id,
+        total_spent = sum o.total,
+        avg_order = avg o.total,
     })
-    |> @sort (r => [@desc r.total_spent])
-    |> @take 20,
+    & sort (r => [desc r.total_spent])
+    & take 20,
 
 by_user

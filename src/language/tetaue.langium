@@ -5,9 +5,11 @@
  *   - `#` line comments, files are modules ending in an expression
  *   - `{ field = value, ... }` maps (table schemas, projections, join specs)
  *   - `a => a` lambdas, `(l, r) => ...` multi-param lambdas
- *   - `@`-prefixed builtins (@table, @filter, @map, ...)
+ *   - builtins live in a prelude of plain identifiers (table, filter, ...)
+ * Operators follow Haskell: `&` is the pipeline (`a & f` ⇔ `f a`), `$` is
+ * right-associative application (`f $ a` ⇔ `f a`).
  * Semantics follow teta (https://github.com/futu2/teta): immutable queries,
- * curried query steps, composed with the `|>` pipe operator, rendered to SQL.
+ * curried query steps, composed with `&`, rendered to SQL.
  ******************************************************************************/
 
 grammar Tetaue
@@ -31,14 +33,16 @@ Expression:
 //   == != < <= > >=  (comparison, non-chained)
 //   &&      (and)
 //   ||      (or)
-//   |>      (pipe — loosest)
+//   &       (pipeline: `a & f` ⇔ `f a`, left-assoc — Haskell-style)
+//   $       (application: `f $ a` ⇔ `f a`, right-assoc — Haskell-style)
 infix BinaryExpression on UnaryExpression:
     '*' | '/' | '%'
     > '+' | '-'
     > '==' | '!=' | '<' | '<=' | '>' | '>='
     > '&&'
     > '||'
-    > '|>';
+    > '&'
+    > right assoc '$';
 
 UnaryExpression:
     {infer UnaryMinus} '-' operand=UnaryExpression
@@ -47,8 +51,8 @@ UnaryExpression:
 AccessExpression infers Expr:
     Application ({infer AccessExpression.receiver=current} '.' property=ID)*;
 
-// Juxtaposition application: `@filter (u => u.age >= 18)` is @filter applied
-// to a lambda; `@table "users" { ... }` is @table applied to two arguments.
+// Juxtaposition application: `filter (u => u.age >= 18)` is filter applied
+// to a lambda; `table "users" { ... }` is table applied to two arguments.
 // Arguments are postfix chains (atom + field access) — NOT applications — so
 // `f a b` stays a flat, curried application instead of nesting `a (b)`.
 Application infers Expr:
@@ -61,13 +65,12 @@ Atom infers Expr:
     {infer NumberLiteral} value=NUMBER
     | {infer StringLiteral} value=STRING
     | {infer BooleanLiteral} value=('true' | 'false')
-    | {infer NullLiteral} '@null'
+    | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
     | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
     // single-param lambda: `u => ...`; multi-param requires parens: `(l, r) => ...`
     | {infer Lambda} param=ID '=>' body=Expression
     | {infer Lambda} '(' params+=ID (',' params+=ID)+ ')' '=>' body=Expression
-    | {infer BuiltinCall} '@' name=ID
     | {infer Identifier} name=ID
     | '(' Expression ')';
 

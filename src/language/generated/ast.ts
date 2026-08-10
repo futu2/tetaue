@@ -18,7 +18,9 @@ export type TetaueTerminalNames = keyof typeof TetaueTerminals;
 
 export type TetaueKeywordNames =
     | "!="
+    | "$"
     | "%"
+    | "&"
     | "&&"
     | "("
     | ")"
@@ -35,14 +37,12 @@ export type TetaueKeywordNames =
     | "=>"
     | ">"
     | ">="
-    | "@"
-    | "@null"
     | "["
     | "]"
     | "false"
+    | "null"
     | "true"
     | "{"
-    | "|>"
     | "||"
     | "}";
 
@@ -86,7 +86,7 @@ export interface BinaryExpression extends langium.AstNode {
     readonly $container: AccessExpression | Application | BinaryExpression | Binding | Lambda | ListLiteral | MapEntry | Model | UnaryMinus;
     readonly $type: 'BinaryExpression';
     left: UnaryExpression;
-    operator: '!=' | '%' | '&&' | '*' | '+' | '-' | '/' | '<' | '<=' | '==' | '>' | '>=' | '|>' | '||';
+    operator: '!=' | '$' | '%' | '&&' | '&' | '*' | '+' | '-' | '/' | '<' | '<=' | '==' | '>' | '>=' | '||';
     right: UnaryExpression;
 }
 
@@ -133,22 +133,7 @@ export function isBooleanLiteral(item: unknown): item is BooleanLiteral {
     return reflection.isInstance(item, BooleanLiteral.$type);
 }
 
-export interface BuiltinCall extends langium.AstNode {
-    readonly $container: AccessExpression | Application | BinaryExpression | UnaryMinus;
-    readonly $type: 'BuiltinCall';
-    name: string;
-}
-
-export const BuiltinCall = {
-    $type: 'BuiltinCall',
-    name: 'name'
-} as const;
-
-export function isBuiltinCall(item: unknown): item is BuiltinCall {
-    return reflection.isInstance(item, BuiltinCall.$type);
-}
-
-export type Expr = AccessExpression | Application | BooleanLiteral | BuiltinCall | Expression | Identifier | Lambda | ListLiteral | MapLiteral | NullLiteral | NumberLiteral | StringLiteral;
+export type Expr = AccessExpression | Application | BooleanLiteral | Expression | Identifier | Lambda | ListLiteral | MapLiteral | NullLiteral | NumberLiteral | StringLiteral;
 
 export const Expr = {
     $type: 'Expr'
@@ -339,7 +324,6 @@ export type TetaueAstType = {
     BinaryExpression: BinaryExpression
     Binding: Binding
     BooleanLiteral: BooleanLiteral
-    BuiltinCall: BuiltinCall
     Expr: Expr
     Expression: Expression
     Identifier: Identifier
@@ -415,15 +399,6 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
             properties: {
                 value: {
                     name: BooleanLiteral.value
-                }
-            },
-            superTypes: [Expr.$type]
-        },
-        BuiltinCall: {
-            name: BuiltinCall.$type,
-            properties: {
-                name: {
-                    name: BuiltinCall.name
                 }
             },
             superTypes: [Expr.$type]

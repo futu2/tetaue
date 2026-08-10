@@ -9,7 +9,7 @@
 import type { AstNode } from 'langium';
 import {
     isAccessExpression, isApplication, isBinaryExpression, isBooleanLiteral,
-    isBuiltinCall, isIdentifier, isLambda, isListLiteral, isMapLiteral,
+    isIdentifier, isLambda, isListLiteral, isMapLiteral,
     isNullLiteral, isNumberLiteral, isStringLiteral, isUnaryMinus,
     type Binding, type Expr, type Lambda, type Model, type UnaryExpression,
 } from './generated/ast.js';
@@ -26,7 +26,7 @@ export interface SqlColumn {
     /** Table name for qualification, or null for computed columns. */
     table: string | null;
     /**
-     * For derived columns (projections from @map/@fold): the defining SQL
+     * For derived columns (projections from map/fold): the defining SQL
      * expression, inlined whenever the column is referenced later in the
      * pipeline (teta-style). Undefined for base table columns.
      */
@@ -97,6 +97,8 @@ export type Value =
 export interface Ctx {
     env: Map<string, Value>;
     diagnostics: Diagnostic[];
+    /** Names bound anywhere in the module (for forward-reference hints). */
+    moduleBindings: Set<string>;
 }
 
 const ERROR: Value = { kind: 'error' };
@@ -111,7 +113,7 @@ export function isError(v: Value): boolean {
 
 const TYPE_NAMES: Record<TypeOrNull, string> = {
     int: 'int', float: 'float', string: 'string', bool: 'bool',
-    date: 'date', timestamp: 'timestamp', null: '@null',
+    date: 'date', timestamp: 'timestamp', null: 'null',
 };
 
 export function typeName(t: TypeOrNull): string {
@@ -131,14 +133,14 @@ export function comparable(a: TypeOrNull, b: TypeOrNull): boolean {
 export function describe(v: Value): string {
     switch (v.kind) {
         case 'query': return 'a query';
-        case 'fn': return `a function (@${v.name})`;
-        case 'step': return `a query step (@${v.name})`;
+        case 'fn': return `a function (${v.name})`;
+        case 'step': return `a query step (${v.name})`;
         case 'lambda': return 'a lambda';
         case 'row': return 'a row';
         case 'expr': return `an expression of type ${typeName(v.node.type)}`;
         case 'list': return 'a list';
         case 'map': return 'a map';
-        case 'sql-type': return `type @${v.type}`;
+        case 'sql-type': return `type ${v.type}`;
         case 'error': return 'an error';
     }
 }
@@ -229,9 +231,9 @@ function forbid(node: SqlNode, kinds: SqlNode['kind'][], what: string, at: AstNo
 
 function kindLabel(kind: SqlNode['kind']): string {
     switch (kind) {
-        case 'agg': return 'aggregates (@sum, @count, ...)';
-        case 'group': return '@group';
-        case 'order': return 'order items (@asc/@desc)';
+        case 'agg': return 'aggregates (sum, count, ...)';
+        case 'group': return 'group';
+        case 'order': return 'order items (asc/desc)';
         default: return kind;
     }
 }
@@ -296,7 +298,7 @@ export function apply(f: Value, arg: Value, at: AstNode | undefined, ctx: Ctx): 
             return f.apply(arg, at, ctx);
         case 'step': {
             if (arg.kind !== 'query') {
-                ctx.diagnostics.push({ node: at ?? astOf(arg) ?? f.ast ?? fallbackNode(ctx), message: `step '@${f.name}' expects a query, got ${describe(arg)} — use it in a pipeline: query |> @${f.name} ...` });
+                ctx.diagnostics.push({ node: at ?? astOf(arg) ?? f.ast ?? fallbackNode(ctx), message: `step '${f.name}' expects a query, got ${describe(arg)} — use it in a pipeline: query & ${f.name} ...` });
                 return ERROR;
             }
             const next = f.apply(arg.query, at, ctx);
@@ -307,7 +309,7 @@ export function apply(f: Value, arg: Value, at: AstNode | undefined, ctx: Ctx): 
             const env = new Map(f.closure);
             env.set(f.params[0]!, arg);
             if (remaining.length === 0) {
-                return evalExpr(f.body, { env, diagnostics: ctx.diagnostics });
+                return evalExpr(f.body, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
             }
             return { kind: 'lambda', params: remaining, body: f.body, closure: env, ast: f.ast };
         }
@@ -345,7 +347,7 @@ function evalBinary(op: string, l: Value, r: Value, at: AstNode, ctx: Ctx): Valu
         const lNull = ln.kind === 'lit' && ln.value === null;
         const rNull = rn.kind === 'lit' && rn.value === null;
         if (lNull && rNull) {
-            ctx.diagnostics.push({ node: at, message: `cannot compare @null with @null` });
+            ctx.diagnostics.push({ node: at, message: `cannot compare null with null` });
             return ERROR;
         }
         if (lNull || rNull) {
@@ -396,7 +398,7 @@ function access(recv: Value, prop: string, at: AstNode, ctx: Ctx): Value {
             ctx.diagnostics.push({ node: at, message: `unknown column '${prop}' — available: ${[...recv.schema.keys()].join(', ')}` });
             return ERROR;
         }
-        // Derived columns (from @map/@fold projections) are inlined: the
+        // Derived columns (from map/fold projections) are inlined: the
         // defining expression is substituted, so later steps reference the
         // real expression instead of a SELECT alias.
         if (col.expr) {
@@ -405,7 +407,7 @@ function access(recv: Value, prop: string, at: AstNode, ctx: Ctx): Value {
         return mkExpr(colNode(prop, col.table, col.type), at);
     }
     if (recv.kind === 'query') {
-        ctx.diagnostics.push({ node: at, message: `tables have no fields — access columns through a row parameter inside a lambda, e.g. @map (u => u.${prop})` });
+        ctx.diagnostics.push({ node: at, message: `tables have no fields — access columns through a row parameter inside a lambda, e.g. map (u => u.${prop})` });
         return ERROR;
     }
     ctx.diagnostics.push({ node: at, message: `cannot access field '${prop}' on ${describe(recv)}` });
@@ -414,11 +416,17 @@ function access(recv: Value, prop: string, at: AstNode, ctx: Ctx): Value {
 
 export function evalExpr(e: Expr, ctx: Ctx): Value {
     if (isBinaryExpression(e)) {
-        if (e.operator === '|>') {
-            // pipe: `left |> right` ⇔ apply right to left
+        if (e.operator === '&') {
+            // pipeline: `left & right` ⇔ apply right to left
             const left = evalUnary(e.left, ctx);
             const right = evalUnary(e.right, ctx);
             return apply(right, left, e, ctx);
+        }
+        if (e.operator === '$') {
+            // application: `left $ right` ⇔ apply left to right (right-assoc)
+            const left = evalUnary(e.left, ctx);
+            const right = evalUnary(e.right, ctx);
+            return apply(left, right, e, ctx);
         }
         const l = evalUnary(e.left, ctx);
         const r = evalUnary(e.right, ctx);
@@ -472,21 +480,17 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         return { kind: 'map', entries, ast: e };
     }
     if (isLambda(e)) {
-        return { kind: 'lambda', params: lambdaParams(e), body: e.body, closure: ctx.env, ast: e };
-    }
-    if (isBuiltinCall(e)) {
-        const factory = BUILTINS[e.name];
-        if (!factory) {
-            ctx.diagnostics.push({ node: e, message: `unknown builtin '@${e.name}'` });
-            return ERROR;
-        }
-        const v = factory();
-        return v;
+        // Snapshot the current scope: lambdas see only bindings defined so far.
+        return { kind: 'lambda', params: lambdaParams(e), body: e.body, closure: new Map(ctx.env), ast: e };
     }
     if (isIdentifier(e)) {
         const v = ctx.env.get(e.name);
         if (v) return v;
-        const known = [...ctx.env.keys()];
+        if (ctx.moduleBindings.has(e.name)) {
+            ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}' — bindings must be defined before use` });
+            return ERROR;
+        }
+        const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k));
         ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
         return ERROR;
     }
@@ -549,10 +553,10 @@ const BUILTINS: Record<string, () => Value> = {
     table: () => fn('table', (arg1, at1, ctx) => {
         const name = stringValue(arg1);
         if (name === null) {
-            ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `@table expects a table name string, e.g. @table "users" { ... }` });
+            ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `table expects a table name string, e.g. table "users" { ... }` });
             return ERROR;
         }
-        return fn('table-schema', (arg2, at2, ctx2) => {
+        return fn('table', (arg2, at2, ctx2) => {
             const schema = schemaFromMap(arg2, at2, ctx2);
             if (!schema) return ERROR;
             for (const col of schema.values()) col.table = name;
@@ -563,43 +567,43 @@ const BUILTINS: Record<string, () => Value> = {
     // --- query steps -----------------------------------------------------
     filter: () => fn('filter', (pred, at, ctx) => {
         if (pred.kind !== 'lambda' || pred.params.length !== 1) {
-            ctx.diagnostics.push({ node: at ?? pred.ast, message: `@filter expects a one-parameter predicate lambda, e.g. @filter (u => u.age >= 18)` });
+            ctx.diagnostics.push({ node: at ?? pred.ast, message: `filter expects a one-parameter predicate lambda, e.g. filter (u => u.age >= 18)` });
             return ERROR;
         }
         return step('filter', (q, at2, ctx2) => {
             const having = hasFoldStep(q);
             const env = new Map(pred.closure);
             env.set(pred.params[0]!, { kind: 'row', schema: querySchema(q) });
-            const v = evalExpr(pred.body, { env, diagnostics: ctx2.diagnostics });
+            const v = evalExpr(pred.body, { env, diagnostics: ctx2.diagnostics, moduleBindings: ctx.moduleBindings });
             const node = exprNode(v);
             if (!node || node.type !== 'bool') {
-                ctx2.diagnostics.push({ node: at2 ?? pred.body, message: `@filter predicate must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(v)}` });
+                ctx2.diagnostics.push({ node: at2 ?? pred.body, message: `filter predicate must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(v)}` });
                 return null;
             }
-            // After @fold the predicate becomes HAVING, where aggregates are allowed.
+            // After fold the predicate becomes HAVING, where aggregates are allowed.
             const forbidden: SqlNode['kind'][] = having ? ['order'] : ['agg', 'group', 'order'];
-            if (forbid(node, forbidden, 'the @filter predicate', at2 ?? pred.body, ctx2)) return null;
+            if (forbid(node, forbidden, 'the filter predicate', at2 ?? pred.body, ctx2)) return null;
             return addStep(q, { kind: 'filter', cond: node, having });
         });
     }),
 
     map: () => fn('map', (sel, at, ctx) => {
         if (sel.kind !== 'lambda' || sel.params.length !== 1) {
-            ctx.diagnostics.push({ node: at ?? sel.ast, message: `@map expects a one-parameter projection lambda, e.g. @map (u => { id = u.id })` });
+            ctx.diagnostics.push({ node: at ?? sel.ast, message: `map expects a one-parameter projection lambda, e.g. map (u => { id = u.id })` });
             return ERROR;
         }
         return step('map', (q, at2, ctx2) => {
             if (hasFoldStep(q)) {
-                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `cannot apply @map after @fold — nested aggregation is not supported (use @fold's projection instead)` });
+                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `cannot apply map after fold — nested aggregation is not supported (use fold's projection instead)` });
                 return null;
             }
             const env = new Map(sel.closure);
             env.set(sel.params[0]!, { kind: 'row', schema: querySchema(q) });
-            const v = evalExpr(sel.body, { env, diagnostics: ctx2.diagnostics });
+            const v = evalExpr(sel.body, { env, diagnostics: ctx2.diagnostics, moduleBindings: ctx.moduleBindings });
             const row = rowFromMap(v, at2 ?? sel.body, ctx2, 'projection');
             if (!row) return null;
             if (row.fields.length === 0) {
-                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `@map projection must contain at least one field` });
+                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `map projection must contain at least one field` });
                 return null;
             }
             return addStep(q, { kind: 'map', proj: row });
@@ -608,13 +612,13 @@ const BUILTINS: Record<string, () => Value> = {
 
     sort: () => fn('sort', (sel, at, ctx) => {
         if (sel.kind !== 'lambda' || sel.params.length !== 1) {
-            ctx.diagnostics.push({ node: at ?? sel.ast, message: `@sort expects a one-parameter lambda, e.g. @sort (u => [@asc u.name])` });
+            ctx.diagnostics.push({ node: at ?? sel.ast, message: `sort expects a one-parameter lambda, e.g. sort (u => [asc u.name])` });
             return ERROR;
         }
         return step('sort', (q, at2, ctx2) => {
             const env = new Map(sel.closure);
             env.set(sel.params[0]!, { kind: 'row', schema: querySchema(q) });
-            const v = evalExpr(sel.body, { env, diagnostics: ctx2.diagnostics });
+            const v = evalExpr(sel.body, { env, diagnostics: ctx2.diagnostics, moduleBindings: ctx.moduleBindings });
             const items = orderItems(v, at2 ?? sel.body, ctx2, hasFoldStep(q));
             if (!items) return null;
             return addStep(q, { kind: 'sort', items });
@@ -624,7 +628,7 @@ const BUILTINS: Record<string, () => Value> = {
     take: () => fn('take', (arg, at, ctx) => {
         const n = numberValue(arg);
         if (n === null || !Number.isInteger(n) || n < 0) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@take expects a non-negative integer literal, got ${n === null ? describe(arg) : String(n)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `take expects a non-negative integer literal, got ${n === null ? describe(arg) : String(n)}` });
             return ERROR;
         }
         return step('take', (q) => addStep(q, { kind: 'take', n }));
@@ -632,7 +636,7 @@ const BUILTINS: Record<string, () => Value> = {
 
     distinct: () => fn('distinct', (arg, at, ctx) => {
         if (arg.kind !== 'query') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@distinct expects a query, got ${describe(arg)} — use it in a pipeline: query |> @distinct` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `distinct expects a query, got ${describe(arg)} — use it in a pipeline: query & distinct` });
             return ERROR;
         }
         return { kind: 'query', query: { ...arg.query, distinct: true }, ast: at };
@@ -640,19 +644,19 @@ const BUILTINS: Record<string, () => Value> = {
 
     fold: () => fn('fold', (sel, at, ctx) => {
         if (sel.kind !== 'lambda' || sel.params.length !== 1) {
-            ctx.diagnostics.push({ node: at ?? sel.ast, message: `@fold expects a one-parameter lambda, e.g. @fold (o => { user_id = @group o.user_id, total = @sum o.total })` });
+            ctx.diagnostics.push({ node: at ?? sel.ast, message: `fold expects a one-parameter lambda, e.g. fold (o => { user_id = group o.user_id, total = sum o.total })` });
             return ERROR;
         }
         return step('fold', (q, at2, ctx2) => {
             if (hasFoldStep(q)) {
-                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `only one @fold per pipeline is supported` });
+                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `only one fold per pipeline is supported` });
                 return null;
             }
             const env = new Map(sel.closure);
             env.set(sel.params[0]!, { kind: 'row', schema: querySchema(q) });
-            const v = evalExpr(sel.body, { env, diagnostics: ctx2.diagnostics });
+            const v = evalExpr(sel.body, { env, diagnostics: ctx2.diagnostics, moduleBindings: ctx.moduleBindings });
             if (v.kind !== 'map') {
-                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `@fold expects a projection map, got ${describe(v)}` });
+                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `fold expects a projection map, got ${describe(v)}` });
                 return null;
             }
             const row: RowNode = { fields: [] };
@@ -660,18 +664,18 @@ const BUILTINS: Record<string, () => Value> = {
             for (const { key, value } of v.entries) {
                 const node = exprNode(value);
                 if (!node) {
-                    ctx2.diagnostics.push({ node: value.ast ?? at2, message: `fold entry '${key}' must be an aggregate (@count, @sum, ...) or @group, got ${describe(value)}` });
+                    ctx2.diagnostics.push({ node: value.ast ?? at2, message: `fold entry '${key}' must be an aggregate (count, sum, ...) or group, got ${describe(value)}` });
                     return null;
                 }
                 if (node.kind === 'agg') aggregates++;
                 if (node.kind !== 'agg' && node.kind !== 'group') {
-                    ctx2.diagnostics.push({ node: value.ast ?? at2, message: `fold entry '${key}' must be wrapped in an aggregate (@count, @sum, ...) or @group` });
+                    ctx2.diagnostics.push({ node: value.ast ?? at2, message: `fold entry '${key}' must be wrapped in an aggregate (count, sum, ...) or group` });
                     return null;
                 }
                 row.fields.push({ key, node });
             }
             if (aggregates === 0) {
-                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `@fold must contain at least one aggregate (@count, @sum, ...)` });
+                ctx2.diagnostics.push({ node: at2 ?? sel.body, message: `fold must contain at least one aggregate (count, sum, ...)` });
                 return null;
             }
             return addStep(q, { kind: 'fold', proj: row });
@@ -680,16 +684,16 @@ const BUILTINS: Record<string, () => Value> = {
 
     join: () => fn('join', (right, at, ctx) => {
         if (right.kind !== 'query') {
-            ctx.diagnostics.push({ node: at ?? right.ast, message: `@join expects a query on the right side, got ${describe(right)} — e.g. users |> @join orders { on = (u, o) => u.id == o.user_id }` });
+            ctx.diagnostics.push({ node: at ?? right.ast, message: `join expects a query on the right side, got ${describe(right)} — e.g. users & join orders { on = (u, o) => u.id == o.user_id }` });
             return ERROR;
         }
         if (right.query.steps.length > 0 || right.query.distinct) {
-            ctx.diagnostics.push({ node: at ?? right.ast, message: `the right side of @join must be a plain table (no steps yet)` });
+            ctx.diagnostics.push({ node: at ?? right.ast, message: `the right side of join must be a plain table (no steps yet)` });
             return ERROR;
         }
-        return fn('join-spec', (spec, at2, ctx2) => {
+        return fn('join', (spec, at2, ctx2) => {
             if (spec.kind !== 'map') {
-                ctx2.diagnostics.push({ node: at2 ?? spec.ast, message: `@join expects a spec map { on = (l, r) => ..., kind = "inner" }` });
+                ctx2.diagnostics.push({ node: at2 ?? spec.ast, message: `join expects a spec map { on = (l, r) => ..., kind = "inner" }` });
                 return ERROR;
             }
             let onLambda: Value | null = null;
@@ -719,7 +723,7 @@ const BUILTINS: Record<string, () => Value> = {
             }
             return step('join', (q, at3, ctx3) => {
                 if (hasFoldStep(q)) {
-                    ctx3.diagnostics.push({ node: at3 ?? onLambda?.ast, message: `cannot apply @join after @fold` });
+                    ctx3.diagnostics.push({ node: at3 ?? onLambda?.ast, message: `cannot apply join after fold` });
                     return null;
                 }
                 // Assign a unique alias for the right-hand table (self-joins).
@@ -740,7 +744,7 @@ const BUILTINS: Record<string, () => Value> = {
                 const leftSchema = querySchema(q);
                 for (const name of rightSchema.keys()) {
                     if (leftSchema.has(name)) {
-                        ctx3.diagnostics.push({ node: at3 ?? onLambda?.ast, message: `join result has overlapping column '${name}' on both sides — rename one side first, e.g. @map (u => { ... })` });
+                        ctx3.diagnostics.push({ node: at3 ?? onLambda?.ast, message: `join result has overlapping column '${name}' on both sides — rename one side first, e.g. map (u => { ... })` });
                         return null;
                     }
                 }
@@ -748,7 +752,7 @@ const BUILTINS: Record<string, () => Value> = {
                 const p = onLambda.params;
                 env.set(p[0]!, { kind: 'row', schema: leftSchema });
                 env.set(p[1]!, { kind: 'row', schema: rightSchema });
-                const v = evalExpr(onLambda.body, { env, diagnostics: ctx3.diagnostics });
+                const v = evalExpr(onLambda.body, { env, diagnostics: ctx3.diagnostics, moduleBindings: ctx.moduleBindings });
                 const node = exprNode(v);
                 if (!node || node.type !== 'bool') {
                     ctx3.diagnostics.push({ node: at3 ?? onLambda.body, message: `join 'on' condition must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(v)}` });
@@ -765,11 +769,11 @@ const BUILTINS: Record<string, () => Value> = {
     asc: () => fn('asc', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@asc expects an expression, e.g. @asc u.name` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `asc expects an expression, e.g. asc u.name` });
             return ERROR;
         }
         if (node.kind === 'order' || node.type === 'null') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@asc cannot wrap ${node.type === 'null' ? '@null' : kindLabel(node.kind)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `asc cannot wrap ${node.type === 'null' ? 'null' : kindLabel(node.kind)}` });
             return ERROR;
         }
         return mkExpr({ kind: 'order', expr: node, dir: 'ASC', type: node.type }, at);
@@ -777,11 +781,11 @@ const BUILTINS: Record<string, () => Value> = {
     desc: () => fn('desc', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@desc expects an expression, e.g. @desc u.age` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `desc expects an expression, e.g. desc u.age` });
             return ERROR;
         }
         if (node.kind === 'order' || node.type === 'null') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@desc cannot wrap ${node.type === 'null' ? '@null' : kindLabel(node.kind)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `desc cannot wrap ${node.type === 'null' ? 'null' : kindLabel(node.kind)}` });
             return ERROR;
         }
         return mkExpr({ kind: 'order', expr: node, dir: 'DESC', type: node.type }, at);
@@ -796,11 +800,11 @@ const BUILTINS: Record<string, () => Value> = {
     group: () => fn('group', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@group expects an expression, e.g. @group o.user_id` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `group expects an expression, e.g. group o.user_id` });
             return ERROR;
         }
         if (node.kind === 'agg' || node.kind === 'group' || node.kind === 'order' || node.type === 'null') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@group cannot wrap ${node.type === 'null' ? '@null' : kindLabel(node.kind)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `group cannot wrap ${node.type === 'null' ? 'null' : kindLabel(node.kind)}` });
             return ERROR;
         }
         return mkExpr({ kind: 'group', expr: node, table: nodeTable(node), type: node.type }, at);
@@ -810,10 +814,10 @@ const BUILTINS: Record<string, () => Value> = {
     not: () => fn('not', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node || node.type !== 'bool') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@not expects a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `not expects a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
             return ERROR;
         }
-        if (forbid(node, ['agg', 'group', 'order'], '@not', at ?? arg.ast, ctx)) return ERROR;
+        if (forbid(node, ['agg', 'group', 'order'], 'not', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'not', expr: node, type: 'bool' }, at);
     }),
 
@@ -828,31 +832,31 @@ const BUILTINS: Record<string, () => Value> = {
     abs: () => fn('abs', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node || !isNumeric(node.type)) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@abs expects a numeric expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `abs expects a numeric expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
             return ERROR;
         }
-        if (forbid(node, ['agg', 'group', 'order'], '@abs', at ?? arg.ast, ctx)) return ERROR;
+        if (forbid(node, ['agg', 'group', 'order'], 'abs', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'call', name: 'abs', args: [node], type: node.type as SqlType }, at);
     }),
     coalesce: () => fn('coalesce', (arg1, at1, ctx) => {
         const node1 = exprNode(arg1);
         if (!node1) {
-            ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `@coalesce expects expressions, e.g. @coalesce u.nickname u.name` });
+            ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `coalesce expects expressions, e.g. coalesce u.nickname u.name` });
             return ERROR;
         }
-        return fn('coalesce-2', (arg2, at2, ctx2) => {
+        return fn('coalesce', (arg2, at2, ctx2) => {
             const node2 = exprNode(arg2);
             if (!node2) {
-                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `@coalesce expects two expressions, got ${describe(arg2)}` });
+                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `coalesce expects two expressions, got ${describe(arg2)}` });
                 return ERROR;
             }
             if (node1.kind === 'agg' || node2.kind === 'agg') {
-                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `@coalesce cannot wrap aggregates` });
+                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `coalesce cannot wrap aggregates` });
                 return ERROR;
             }
             const t = (node1.type === 'null') ? node2.type : node1.type;
             if (node1.type !== 'null' && node2.type !== 'null' && !comparable(node1.type, node2.type)) {
-                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `@coalesce requires matching types, got ${typeName(node1.type)} and ${typeName(node2.type)}` });
+                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `coalesce requires matching types, got ${typeName(node1.type)} and ${typeName(node2.type)}` });
                 return ERROR;
             }
             return mkExpr({ kind: 'call', name: 'coalesce', args: [node1, node2], type: t === 'null' ? 'string' : t }, at2);
@@ -864,15 +868,15 @@ function aggBuiltin(name: string, numeric: 'numeric' | 'any'): () => Value {
     return () => fn(name, (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@${name} expects an expression, e.g. @${name} o.total` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects an expression, e.g. ${name} o.total` });
             return ERROR;
         }
         if (node.kind === 'agg' || node.kind === 'group' || node.kind === 'order') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@${name} cannot wrap ${kindLabel(node.kind)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} cannot wrap ${kindLabel(node.kind)}` });
             return ERROR;
         }
         if (numeric === 'numeric' && !isNumeric(node.type)) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@${name} expects a numeric expression, got type ${typeName(node.type)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects a numeric expression, got type ${typeName(node.type)}` });
             return ERROR;
         }
         let type: SqlType = node.type as SqlType;
@@ -886,10 +890,10 @@ function stringFnBuiltin(name: string, result: SqlType): () => Value {
     return () => fn(name, (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node || node.type !== 'string') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `@${name} expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
             return ERROR;
         }
-        if (forbid(node, ['agg', 'group', 'order'], `@${name}`, at ?? arg.ast, ctx)) return ERROR;
+        if (forbid(node, ['agg', 'group', 'order'], `${name}`, at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'call', name, args: [node], type: result }, at);
     });
 }
@@ -898,19 +902,19 @@ function inBuiltin(negated: boolean): () => Value {
     return () => fn('is_in', (value, at, ctx) => {
         const node = exprNode(value);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? value.ast, message: `@is_in expects a value expression, e.g. @is_in u.id [1, 2, 3]` });
+            ctx.diagnostics.push({ node: at ?? value.ast, message: `is_in expects a value expression, e.g. is_in u.id [1, 2, 3]` });
             return ERROR;
         }
-        return fn('is_in-list', (listVal, at2, ctx2) => {
+        return fn('is_in', (listVal, at2, ctx2) => {
             if (listVal.kind !== 'list' || listVal.items.length === 0) {
-                ctx2.diagnostics.push({ node: at2 ?? listVal.ast, message: `@is_in expects a non-empty list, e.g. @is_in u.id [1, 2, 3]` });
+                ctx2.diagnostics.push({ node: at2 ?? listVal.ast, message: `is_in expects a non-empty list, e.g. is_in u.id [1, 2, 3]` });
                 return ERROR;
             }
             const items: SqlNode[] = [];
             for (const item of listVal.items) {
                 const itemNode = exprNode(item);
                 if (!itemNode) {
-                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `@is_in list items must be expressions, got ${describe(item)}` });
+                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `is_in list items must be expressions, got ${describe(item)}` });
                     return ERROR;
                 }
                 const isNullItem = itemNode.kind === 'lit' && itemNode.value === null;
@@ -919,12 +923,12 @@ function inBuiltin(negated: boolean): () => Value {
                     continue;
                 }
                 if (!comparable(node.type, itemNode.type)) {
-                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `@is_in list items must match type ${typeName(node.type)}, got ${typeName(itemNode.type)}` });
+                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `is_in list items must match type ${typeName(node.type)}, got ${typeName(itemNode.type)}` });
                     return ERROR;
                 }
                 items.push(itemNode);
             }
-            if (forbid(node, ['agg', 'group', 'order'], '@is_in', at2 ?? value.ast, ctx2)) return ERROR;
+            if (forbid(node, ['agg', 'group', 'order'], 'is_in', at2 ?? value.ast, ctx2)) return ERROR;
             return mkExpr({ kind: 'in', expr: node, list: items, negated, type: 'bool' }, at2);
         });
     });
@@ -932,13 +936,13 @@ function inBuiltin(negated: boolean): () => Value {
 
 function schemaFromMap(v: Value, at: AstNode | undefined, ctx: Ctx): Schema | null {
     if (v.kind !== 'map') {
-        ctx.diagnostics.push({ node: at ?? v.ast, message: `expected a schema map like { id = @int, name = @string }, got ${describe(v)}` });
+        ctx.diagnostics.push({ node: at ?? v.ast, message: `expected a schema map like { id = int, name = string }, got ${describe(v)}` });
         return null;
     }
     const schema: Schema = new Map();
     for (const { key, value } of v.entries) {
         if (value.kind !== 'sql-type') {
-            ctx.diagnostics.push({ node: value.ast ?? at, message: `schema entry '${key}' must be a type (@int, @string, @bool, @float, @date, @timestamp), got ${describe(value)}` });
+            ctx.diagnostics.push({ node: value.ast ?? at, message: `schema entry '${key}' must be a type (int, string, bool, float, date, timestamp), got ${describe(value)}` });
             continue;
         }
         schema.set(key, { type: value.type, table: null });
@@ -959,7 +963,7 @@ function rowFromMap(v: Value, at: AstNode, ctx: Ctx, what: string): RowNode | nu
             continue;
         }
         if (node.type === 'null') {
-            ctx.diagnostics.push({ node: value.ast ?? at, message: `${what} entry '${key}' cannot be @null` });
+            ctx.diagnostics.push({ node: value.ast ?? at, message: `${what} entry '${key}' cannot be null` });
             continue;
         }
         if (node.kind === 'agg' || node.kind === 'group' || node.kind === 'order') {
@@ -975,12 +979,12 @@ function orderItems(v: Value, at: AstNode, ctx: Ctx, afterFold: boolean): { node
     const collect = (value: Value, out: { node: SqlNode; dir: 'ASC' | 'DESC' }[]): boolean => {
         const node = exprNode(value);
         if (!node || node.kind !== 'order') {
-            ctx.diagnostics.push({ node: value.ast ?? at, message: `@sort expects order items like @asc u.name or a list of them, got ${node ? `an expression of type ${typeName(node.type)}` : describe(value)}` });
+            ctx.diagnostics.push({ node: value.ast ?? at, message: `sort expects order items like asc u.name or a list of them, got ${node ? `an expression of type ${typeName(node.type)}` : describe(value)}` });
             return false;
         }
-        // After @fold, ordering by a group key or aggregate is allowed (ORDER BY SUM(...)).
+        // After fold, ordering by a group key or aggregate is allowed (ORDER BY SUM(...)).
         const forbidden: SqlNode['kind'][] = afterFold ? [] : ['agg', 'group', 'order'];
-        if (forbid(node.expr, forbidden, '@sort', value.ast ?? at, ctx)) return false;
+        if (forbid(node.expr, forbidden, 'sort', value.ast ?? at, ctx)) return false;
         out.push({ node: node.expr, dir: node.dir });
         return true;
     };
@@ -1007,8 +1011,14 @@ export interface AnalysisResult {
 /** Evaluate a module: all bindings in order, then the final query expression. */
 export function analyze(model: Model): AnalysisResult {
     const diagnostics: Diagnostic[] = [];
+    // The environment starts with the prelude of builtins (table, filter, ...).
+    // User bindings may shadow them.
     const env = new Map<string, Value>();
-    const ctx: Ctx = { env, diagnostics };
+    for (const [name, factory] of Object.entries(BUILTINS)) {
+        env.set(name, factory());
+    }
+    const moduleBindings = new Set(model.bindings.map(b => b.name));
+    const ctx: Ctx = { env, diagnostics, moduleBindings };
 
     const seen = new Set<string>();
     for (const binding of model.bindings) {

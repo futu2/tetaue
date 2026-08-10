@@ -1,21 +1,21 @@
 # String and null handling, NULL-agnostic predicates.
 
-users = @table "users" {
-    id = @int,
-    email = @string,
-    nickname = @string,
-    last_seen = @timestamp,
+users = table "users" {
+    id = int,
+    email = string,
+    nickname = string,
+    last_seen = timestamp,
 },
 
-# `== @null` renders as IS NULL; `!= @null` renders as IS NOT NULL.
+# `== null` renders as IS NULL; `!= null` renders as IS NOT NULL.
 active = users
-    |> @filter (u => u.email != @null && u.nickname == @null)
-    |> @map (u => {
+    & filter (u => u.email != null && u.nickname == null)
+    & map (u => {
         id = u.id,
-        contact = @coalesce u.nickname u.email,
-        email_upper = @upper u.email,
-        email_len = @length u.email,
+        contact = coalesce u.nickname u.email,
+        email_upper = upper u.email,
+        email_len = length u.email,
     })
-    |> @distinct,
+    & distinct,
 
 active
