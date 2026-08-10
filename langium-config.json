@@ -1,0 +1,10 @@
+{
+  "projectName": "Tetaue",
+  "languages": [{
+    "id": "tetaue",
+    "grammar": "src/language/tetaue.langium",
+    "fileExtensions": [".tetaue"]
+  }],
+  "out": "src/language/generated",
+  "mode": "production"
+}

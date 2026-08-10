@@ -1,0 +1,33 @@
+{
+  "name": "tetaue",
+  "version": "0.1.0",
+  "description": "tetaue — a pure functional SQL query language, built with Langium on bun/TypeScript. Inspired by futu2/teta and mikitori/moria.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "tetaue": "./bin/tetaue.ts"
+  },
+  "files": [
+    "bin",
+    "src",
+    "examples",
+    "README.md"
+  ],
+  "scripts": {
+    "langium:generate": "langium generate",
+    "build": "bun run langium:generate",
+    "check": "tsc --noEmit",
+    "test": "bun test",
+    "render": "bun run src/cli.ts render",
+    "check:examples": "bun run src/cli.ts check examples/adults.tetaue && bun run src/cli.ts check examples/orders.tetaue && bun run src/cli.ts check examples/strings.tetaue"
+  },
+  "dependencies": {
+    "langium": "~4.3.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^24.0.0",
+    "langium-cli": "~4.3.0",
+    "typescript": "^5.9.0"
+  }
+}

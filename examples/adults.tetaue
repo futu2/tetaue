@@ -1,0 +1,19 @@
+# tetaue — the classic "adults" query, teta-README style.
+#
+# A module is a sequence of comma-terminated bindings followed by one final
+# expression (the query). Top-level bindings end with a comma, moria-map style.
+
+users = @table "users" {
+    id = @int,
+    name = @string,
+    age = @int,
+    active = @bool,
+},
+
+adults = users
+    |> @filter (u => u.active && u.age >= 18)
+    |> @map (u => { id = u.id, name = u.name })
+    |> @sort (u => [@asc u.name])
+    |> @take 10,
+
+adults
