@@ -171,7 +171,7 @@ describe('joins', () => {
         users = table "users" { id = int, name = string }
         orders = table "orders" { oid = int, user_id = int, total = float }
         q = users
-            & join "orders" {
+            & join { right = orders,
                 on = (u, o) => u.id == o.user_id,
                 kind = "left",
             }
@@ -191,7 +191,7 @@ describe('joins', () => {
         const sql = render(`
             users = table "users" { id = int }
             orders = table "orders" { user_id = int }
-            q = users & join "orders" { on = (u, o) => u.id == o.user_id }
+            q = users & join { right = orders, on = (u, o) => u.id == o.user_id }
         `);
         expect(sql).toContain('INNER JOIN "orders"');
     });
@@ -200,7 +200,7 @@ describe('joins', () => {
         const messages = errors(`
             users = table "users" { id = int }
             orders = table "orders" { id = int }
-            q = users & join "orders" { on = (u, o) => u.id == o.id }
+            q = users & join { right = orders, on = (u, o) => u.id == o.id }
         `);
         expect(messages.join('\n')).toContain('overlapping column');
     });
@@ -299,5 +299,59 @@ describe('haskell-style operators (review change)', () => {
             min_age = 18
         `);
         expect(messages.join('\n')).toContain("unknown identifier 'min_age' — bindings must be defined before use");
+    });
+});
+
+describe('composable joins (review change)', () => {
+    test('the right side is a first-class query value, not a name', () => {
+        const sql = render(`
+            users = table "users" { id = int, name = string }
+            orders = table "orders" { user_id = int, total = float }
+            q = users & join { right = orders, on = (u, o) => u.id == o.user_id }
+        `);
+        expect(sql).toContain('INNER JOIN "orders" ON "users"."id" = "orders"."user_id"');
+    });
+
+    test('a mapped right side composes as a subquery with aliased output', () => {
+        const sql = render(`
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int, total = float }
+            o2 = orders & map (o => { uid = o.user_id, amount = o.total })
+            q = users & join { right = o2, on = (u, o) => u.id == o.uid }
+        `);
+        expect(sql).toContain('INNER JOIN (SELECT "user_id" AS "uid", "total" AS "amount" FROM "orders") AS "orders" ON "users"."id" = "orders"."uid"');
+    });
+
+    test('a stepped self-join gets a unique subquery alias', () => {
+        const sql = render(`
+            users = table "users" { id = int }
+            q = users
+                & join { right = users & map (u => { uid = u.id }), on = (l, r) => l.id == r.uid }
+        `);
+        expect(sql).toContain('INNER JOIN (SELECT "id" AS "uid" FROM "users") AS "users_1" ON "users"."id" = "users_1"."uid"');
+    });
+
+    test('a distinct right side renders as a DISTINCT subquery', () => {
+        const sql = render(`
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            q = users & join { right = orders & distinct, on = (u, o) => u.id == o.user_id }
+        `);
+        expect(sql).toContain('INNER JOIN (SELECT DISTINCT * FROM "orders") AS "orders" ON "users"."id" = "orders"."user_id"');
+    });
+
+    test('join composes inside a pipeline with other steps', () => {
+        const sql = render(`
+            users = table "users" { id = int, active = bool }
+            orders = table "orders" { user_id = int, total = float }
+            q = users
+                & filter (u => u.active)
+                & join { right = orders, on = (u, o) => u.id == o.user_id, kind = "left" }
+                & map (r => { uid = r.id, total = r.total })
+                & take 5
+        `);
+        expect(sql).toContain('LEFT JOIN "orders" ON "users"."id" = "orders"."user_id"');
+        expect(sql).toContain('WHERE ("users"."active")');
+        expect(sql).toContain('LIMIT 5');
     });
 });

@@ -87,7 +87,7 @@ import "tables.tetaue"
 adults = users & filter (u => u.active && u.age >= 18)
 
 report = adults
-    & join "orders" { on = (u, o) => u.id == o.user_id, kind = "inner" }
+    & join { right = orders, on = (u, o) => u.id == o.user_id, kind = "inner" }
     & fold (r => { user_id = group r.user_id, order_count = count r.id })
 ```
 
@@ -95,8 +95,6 @@ report = adults
   come before the first binding).
 - Paths resolve relative to the importing file; nested imports work; cycles and
   missing files are reported as errors.
-- Imported bindings are evaluated in order, so `join "orders"` resolves the table by
-  name from the bindings defined before the join.
 
 ## Language at a glance
 
@@ -128,11 +126,18 @@ and checked statically against every operation.
 | `take n` | LIMIT | `LIMIT n` |
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
 | `fold (o => { k = group o.k, s = sum o.v })` | aggregation | `SELECT ... GROUP BY ...` |
-| `join "table" { on = (l, r) => ..., kind = "inner" }` | join | `... JOIN ... ON ...` |
+| `join { right = table, on = (l, r) => ..., kind = "inner" }` | join | `... JOIN ... ON ...` |
 
 Everything is curried: `filter (u => ...)` is a *step* value; applying it to a query
 (`users & filter (u => ...)`) builds a new query. Steps are first-class values, so you
-can bind them and reuse them:
+can bind them and reuse them. `join` composes the same way: its `right` entry is a
+first-class query value (any binding or pipeline — stepped right sides render as
+subqueries), never a table name.
+
+```
+paid_orders = orders & filter (o => o.status == "paid")
+q = users & join { right = paid_orders, on = (u, o) => u.id == o.user_id }
+```
 
 ```
 by_age = sort (u => [desc u.age])
@@ -204,6 +209,6 @@ produces typed Query values and diagnostics, so `check` and `render` never disag
 ## Roadmap
 
 - `values(...)` inline row literals, `union` / `unionAll` set operations
-- joins with stepped right-hand sides (subqueries), `prepare`-style parameters
+- `prepare`-style parameters, `union` / `unionAll`, more of teta's catalog
 - more of teta's catalog: `when`/CASE, date functions, window functions
 - `langium/lsp` language server (hover, go-to-definition, completion) for VS Code

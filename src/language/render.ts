@@ -192,11 +192,20 @@ export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat
     // JOINs
     for (const step of q.steps) {
         if (step.kind === 'join') {
-            const rightAlias = step.right.aliases[0] ?? step.right.root.name;
-            const aliasClause = rightAlias === step.right.root.name
-                ? ''
-                : ` AS ${dialect.quoteIdentifier(rightAlias)}`;
-            clauses.push(`${JOIN_SQL[step.joinKind]} ${dialect.quoteIdentifier(step.right.root.name)}${aliasClause} ON ${renderExpr(step.on, ctx)}`);
+            const right = step.right;
+            const rightAlias = right.aliases[0] ?? right.root.name;
+            let rightSql: string;
+            if (right.steps.length === 0 && !right.distinct) {
+                // plain table: `JOIN "orders" [AS "orders_1"]`
+                const aliasClause = rightAlias === right.root.name
+                    ? ''
+                    : ` AS ${dialect.quoteIdentifier(rightAlias)}`;
+                rightSql = `${dialect.quoteIdentifier(right.root.name)}${aliasClause}`;
+            } else {
+                // stepped right side: render as a subquery so joins compose
+                rightSql = `(${renderQuery(right, dialect, 'compact')}) AS ${dialect.quoteIdentifier(rightAlias)}`;
+            }
+            clauses.push(`${JOIN_SQL[step.joinKind]} ${rightSql} ON ${renderExpr(step.on, ctx)}`);
         }
     }
 

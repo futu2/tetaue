@@ -61,14 +61,14 @@ describe('multi-file modules', () => {
         expect(sql).toContain('FROM "users"');
     });
 
-    test('join by name works with an imported table', () => {
+    test("join composes with an imported table as the right value", () => {
         const sql = renderFiles({
             'tables.tetaue': TABLES,
             'main.tetaue': `
                 import "tables.tetaue"
                 q = users
                     & map (u => { uid = u.id })
-                    & join "orders" { on = (u, o) => u.uid == o.user_id }
+                    & join { right = orders, on = (u, o) => u.uid == o.user_id }
             `,
         }, 'main.tetaue');
         expect(sql).toContain('INNER JOIN "orders" ON "users"."id" = "orders"."user_id"');

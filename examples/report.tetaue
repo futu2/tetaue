@@ -7,7 +7,7 @@ adults = users & filter (u => u.active && u.age >= 18)
 
 report = adults
     & map (u => { uid = u.id, name = u.name })
-    & join "orders" {
+    & join { right = orders,
         on = (u, o) => u.uid == o.user_id,
         kind = "inner",
     }

@@ -19,7 +19,7 @@ orders = table "orders" {
 user_rows = users & map (u => { uid = u.id, name = u.name })
 
 by_user = user_rows
-    & join "orders" {
+    & join { right = orders,
         on = (u, o) => u.uid == o.user_id,
         kind = "inner",
     }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { errors, buildDocument, services } from './helpers.ts';
+import { errors, render, buildDocument, services } from './helpers.ts';
 
 const USERS = `users = table "users" {
     id = int,
@@ -96,7 +96,7 @@ describe('semantic errors', () => {
         const messages = errors(`
             users = table "users" { id = int }
             orders = table "orders" { user_id = int }
-            q = users & join "orders" { on = u => u.id == 1 }
+            q = users & join { right = orders, on = u => u.id == 1 }
         `);
         expect(messages.join('\n')).toContain("join 'on' must be a two-parameter lambda");
     });
@@ -105,19 +105,19 @@ describe('semantic errors', () => {
         const messages = errors(`
             users = table "users" { id = int }
             orders = table "orders" { user_id = int }
-            q = users & join "orders" { on = (u, o) => u.id == o.user_id, foo = 1 }
+            q = users & join { right = orders, on = (u, o) => u.id == o.user_id, foo = 1 }
         `);
         expect(messages.join('\n')).toContain("unknown join spec key 'foo'");
     });
 
-    test('right side of join must be a plain table', () => {
-        const messages = errors(`
+    test('stepped right side of a join renders as a subquery', () => {
+        const sql = render(`
             users = table "users" { id = int }
-            orders = table "orders" { user_id = int }
-            filtered = orders & filter (o => o.user_id > 0)
-            q = users & join "filtered" { on = (u, o) => u.id == o.user_id }
+            orders = table "orders" { user_id = int, status = string }
+            paid = orders & filter (o => o.status == "paid")
+            q = users & join { right = paid, on = (u, o) => u.id == o.user_id }
         `);
-        expect(messages.join('\n')).toContain('must be a plain table');
+        expect(sql).toContain('INNER JOIN (SELECT * FROM "orders" WHERE ("status" = \'paid\')) AS "orders" ON "users"."id" = "orders"."user_id"');
     });
 
     test('not requires boolean', () => {
