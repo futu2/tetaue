@@ -2,7 +2,7 @@
  * tetaue — a pure functional SQL query language.
  *
  * Syntax is inspired by moria (https://codeberg.org/mikitori/moria):
- *   - `#` line comments, files are modules ending in an expression
+ *   - `#` line comments, multi-file modules via `import "path.tetaue"`
  *   - `{ field = value, ... }` maps (table schemas, projections, join specs)
  *   - `a => a` lambdas, `(l, r) => ...` multi-param lambdas
  *   - builtins live in a prelude of plain identifiers (table, filter, ...)
@@ -10,19 +10,24 @@
  * right-associative application (`f $ a` ⇔ `f a`).
  * Semantics follow teta (https://github.com/futu2/teta): immutable queries,
  * curried query steps, composed with `&`, rendered to SQL.
+ *
+ * A module is a list of bindings; the LAST binding is the module's query.
+ * Bindings need no terminator: application arguments may not be bare
+ * identifiers (use `u.field` access chains or parentheses), so the parser
+ * always knows where one binding ends and the next begins.
  ******************************************************************************/
 
 grammar Tetaue
 
 entry Model:
-    (bindings+=Binding)*
-    query=Expression;
+    (imports+=Import)*
+    (bindings+=Binding)*;
 
-// Top-level bindings are comma-terminated (moria map style) so that the
-// expression parser knows where one binding ends and the next begins —
-// juxtaposition application would otherwise swallow the next binding's name.
+Import:
+    'import' path=STRING;
+
 Binding:
-    name=ID '=' value=Expression ',';
+    name=ID '=' value=Expression;
 
 Expression:
     BinaryExpression;
@@ -58,8 +63,23 @@ AccessExpression infers Expr:
 Application infers Expr:
     {infer Application} func=Atom (arguments+=Argument)*;
 
+// Application arguments may be literals, containers, lambdas, parenthesized
+// expressions, or `u.field` access chains — but NOT bare identifiers.
+// A bare identifier after an application would be ambiguous with the start of
+// the next binding (bindings need no terminator), so bare values must be
+// parenthesized: f (g).
 Argument infers Expr:
-    Atom ({infer AccessExpression.receiver=current} '.' property=ID)*;
+    Atom ({infer AccessExpression.receiver=current} '.' property=ID)+
+    | {infer NumberLiteral} value=NUMBER
+    | {infer StringLiteral} value=STRING
+    | {infer BooleanLiteral} value=('true' | 'false')
+    | {infer NullLiteral} 'null'
+    | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
+    | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
+    // single-param lambda: `u => ...`; multi-param requires parens: `(l, r) => ...`
+    | {infer Lambda} param=ID '=>' body=Expression
+    | {infer Lambda} '(' params+=ID (',' params+=ID)+ ')' '=>' body=Expression
+    | '(' Expression ')';
 
 Atom infers Expr:
     {infer NumberLiteral} value=NUMBER
@@ -68,7 +88,6 @@ Atom infers Expr:
     | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
     | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
-    // single-param lambda: `u => ...`; multi-param requires parens: `(l, r) => ...`
     | {infer Lambda} param=ID '=>' body=Expression
     | {infer Lambda} '(' params+=ID (',' params+=ID)+ ')' '=>' body=Expression
     | {infer Identifier} name=ID

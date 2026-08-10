@@ -6,133 +6,130 @@ const USERS = `users = table "users" {
     name = string,
     age = int,
     active = bool,
-},`;
+}`;
 
 describe('semantic errors', () => {
     test('misspelled builtin is an unknown identifier', () => {
-        expect(errors(`${USERS}\nq = users & frobnicate (u => u.age),\nq`).join('\n')).toContain("unknown identifier 'frobnicate'");
+        expect(errors(`${USERS}\nq = users & frobnicate (u => u.age)`).join('\n')).toContain("unknown identifier 'frobnicate'");
     });
 
     test('unknown identifier', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => u.age >= nope),\nq`).join('\n')).toContain("unknown identifier 'nope'");
+        expect(errors(`${USERS}\nq = users & filter (u => u.age >= nope)`).join('\n')).toContain("unknown identifier 'nope'");
     });
 
     test('duplicate binding name', () => {
-        expect(errors(`${USERS}\nusers = table "x" { a = int },\nusers`).join('\n')).toContain("duplicate binding name 'users'");
+        expect(errors(`${USERS}\nusers = table "x" { a = int }`).join('\n')).toContain("duplicate binding name 'users'");
     });
 
     test('unknown column', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => u.missing == 1),\nq`).join('\n')).toContain("unknown column 'missing'");
+        expect(errors(`${USERS}\nq = users & filter (u => u.missing == 1)`).join('\n')).toContain("unknown column 'missing'");
     });
 
     test('type mismatch in comparison (int vs string)', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => u.age == "yes"),\nq`).join('\n')).toContain('cannot compare int with string');
+        expect(errors(`${USERS}\nq = users & filter (u => u.age == "yes")`).join('\n')).toContain('cannot compare int with string');
     });
 
     test('type mismatch in comparison (bool vs int)', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => u.active == 1),\nq`).join('\n')).toContain('cannot compare bool with int');
+        expect(errors(`${USERS}\nq = users & filter (u => u.active == 1)`).join('\n')).toContain('cannot compare bool with int');
     });
 
     test('arithmetic requires numbers', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { x = u.name + 1 }),\nq`).join('\n')).toContain("'+' requires numeric operands");
+        expect(errors(`${USERS}\nq = users & map (u => { x = u.name + 1 })`).join('\n')).toContain("'+' requires numeric operands");
     });
 
     test('&& requires booleans', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => u.age && u.active),\nq`).join('\n')).toContain("'&&' requires boolean operands");
+        expect(errors(`${USERS}\nq = users & filter (u => u.age && u.active)`).join('\n')).toContain("'&&' requires boolean operands");
     });
 
     test('filter predicate must be boolean', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => u.age),\nq`).join('\n')).toContain('filter predicate must be a boolean expression');
+        expect(errors(`${USERS}\nq = users & filter (u => u.age)`).join('\n')).toContain('filter predicate must be a boolean expression');
     });
 
     test('take expects a non-negative integer literal', () => {
-        expect(errors(`${USERS}\nq = users & take 3.5,\nq`).join('\n')).toContain('take expects a non-negative integer literal');
+        expect(errors(`${USERS}\nq = users & take 3.5`).join('\n')).toContain('take expects a non-negative integer literal');
     });
 
     test('aggregates are rejected outside fold', () => {
-        const messages = errors(`${USERS}\nq = users & map (u => { n = count u.id }),\nq`);
+        const messages = errors(`${USERS}\nq = users & map (u => { n = count u.id })`);
         expect(messages.join('\n')).toContain('cannot contain aggregates');
     });
 
     test('fold entries must be group or aggregate', () => {
-        const messages = errors(`${USERS}\nq = users & fold (u => { id = u.id }),\nq`);
+        const messages = errors(`${USERS}\nq = users & fold (u => { id = u.id })`);
         expect(messages.join('\n')).toContain('must be wrapped in an aggregate');
     });
 
     test('fold requires at least one aggregate', () => {
-        const messages = errors(`${USERS}\nq = users & fold (u => { id = group u.id }),\nq`);
+        const messages = errors(`${USERS}\nq = users & fold (u => { id = group u.id })`);
         expect(messages.join('\n')).toContain('at least one aggregate');
     });
 
     test('duplicate projection keys', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { a = u.id, a = u.age }),\nq`).join('\n')).toContain("duplicate map key 'a'");
+        expect(errors(`${USERS}\nq = users & map (u => { a = u.id, a = u.age })`).join('\n')).toContain("duplicate map key 'a'");
     });
 
     test('schema entry must be a type', () => {
-        expect(errors(`t = table "t" { a = 42 },\nt`).join('\n')).toContain("schema entry 'a' must be a type");
+        expect(errors(`t = table "t" { a = 42 }`).join('\n')).toContain("schema entry 'a' must be a type");
     });
 
     test('table requires a name string', () => {
-        expect(errors(`t = table 42 {},\nt`).join('\n')).toContain('table expects a table name string');
+        expect(errors(`t = table 42 {}`).join('\n')).toContain('table expects a table name string');
     });
 
-    test('module must end with a query', () => {
-        expect(errors(`${USERS}\n42`).join('\n')).toContain('module must end with a query expression');
+    test("a module's last binding must be a query", () => {
+        expect(errors(`${USERS}\nq = 42`).join('\n')).toContain("a module's last binding must be a query");
     });
 
     test('fields cannot be accessed on tables', () => {
-        expect(errors(`${USERS}\nq = users.id,\nq`).join('\n')).toContain('tables have no fields');
+        expect(errors(`${USERS}\nq = users.id`).join('\n')).toContain('tables have no fields');
     });
 
     test('string functions require strings', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { x = upper u.age }),\nq`).join('\n')).toContain('upper expects a string expression');
+        expect(errors(`${USERS}\nq = users & map (u => { x = upper u.age })`).join('\n')).toContain('upper expects a string expression');
     });
 
     test('sum requires numeric', () => {
-        expect(errors(`${USERS}\nq = users & fold (u => { x = sum u.name }),\nq`).join('\n')).toContain('sum expects a numeric expression');
+        expect(errors(`${USERS}\nq = users & fold (u => { x = sum u.name })`).join('\n')).toContain('sum expects a numeric expression');
     });
 
     test('join on must be a two-parameter lambda', () => {
         const messages = errors(`
-            users = table "users" { id = int },
-            orders = table "orders" { user_id = int },
-            q = users & join orders { on = u => u.id == 1 },
-            q
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            q = users & join "orders" { on = u => u.id == 1 }
         `);
         expect(messages.join('\n')).toContain("join 'on' must be a two-parameter lambda");
     });
 
     test('join spec unknown key', () => {
         const messages = errors(`
-            users = table "users" { id = int },
-            orders = table "orders" { user_id = int },
-            q = users & join orders { on = (u, o) => u.id == o.user_id, foo = 1 },
-            q
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            q = users & join "orders" { on = (u, o) => u.id == o.user_id, foo = 1 }
         `);
         expect(messages.join('\n')).toContain("unknown join spec key 'foo'");
     });
 
     test('right side of join must be a plain table', () => {
         const messages = errors(`
-            users = table "users" { id = int },
-            orders = table "orders" { user_id = int },
-            filtered = orders & filter (o => o.user_id > 0),
-            q = users & join filtered { on = (u, o) => u.id == o.user_id },
-            q
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            filtered = orders & filter (o => o.user_id > 0)
+            q = users & join "filtered" { on = (u, o) => u.id == o.user_id }
         `);
         expect(messages.join('\n')).toContain('must be a plain table');
     });
 
     test('not requires boolean', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => not u.age),\nq`).join('\n')).toContain('not expects a boolean expression');
+        expect(errors(`${USERS}\nq = users & filter (u => not u.age)`).join('\n')).toContain('not expects a boolean expression');
     });
 
     test('is_in type mismatch', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => is_in u.age ["a", "b"]),\nq`).join('\n')).toContain('must match type int');
+        expect(errors(`${USERS}\nq = users & filter (u => is_in u.age ["a", "b"])`).join('\n')).toContain('must match type int');
     });
 
     test('coalesce type mismatch', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { x = coalesce u.name u.age }),\nq`).join('\n')).toContain('coalesce requires matching types');
+        expect(errors(`${USERS}\nq = users & map (u => { x = coalesce u.name u.age })`).join('\n')).toContain('coalesce requires matching types');
     });
 });
 
@@ -144,18 +141,18 @@ describe('parse errors and the Langium validation pipeline', () => {
     });
 
     test('semantic errors surface through the Langium DocumentBuilder', async () => {
-        const doc = await buildDocument(`${USERS}\nq = users & filter (u => u.age == "x"),\nq`);
+        const doc = await buildDocument(`${USERS}\nq = users & filter (u => u.age == "x")`);
         const messages = (doc.diagnostics ?? []).map(d => d.message);
         expect(messages.join('\n')).toContain('cannot compare int with string');
     });
 
     test('valid module has no diagnostics', async () => {
-        const doc = await buildDocument(`${USERS}\nq = users & take 5,\nq`);
+        const doc = await buildDocument(`${USERS}\nq = users & take 5`);
         expect(doc.diagnostics ?? []).toEqual([]);
     });
 
     test('diagnostics carry positions', async () => {
-        const doc = await buildDocument(`${USERS}\nq = users & filter (u => u.age == "x"),\nq`);
+        const doc = await buildDocument(`${USERS}\nq = users & filter (u => u.age == "x")`);
         const diag = (doc.diagnostics ?? [])[0]!;
         expect(diag.range.start.line).toBeGreaterThan(0);
     });

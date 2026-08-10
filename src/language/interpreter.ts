@@ -682,13 +682,24 @@ const BUILTINS: Record<string, () => Value> = {
         });
     }),
 
-    join: () => fn('join', (right, at, ctx) => {
+    join: () => fn('join', (arg, at, ctx) => {
+        const name = stringValue(arg);
+        if (name === null) {
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `join expects a table name string, e.g. join "orders" { on = (u, o) => u.id == o.user_id }` });
+            return ERROR;
+        }
+        const right = ctx.env.get(name);
+        if (!right) {
+            const hint = ctx.moduleBindings.has(name) ? ' — bindings must be defined before the join' : '';
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `unknown table '${name}'${hint}` });
+            return ERROR;
+        }
         if (right.kind !== 'query') {
-            ctx.diagnostics.push({ node: at ?? right.ast, message: `join expects a query on the right side, got ${describe(right)} — e.g. users & join orders { on = (u, o) => u.id == o.user_id }` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `'${name}' is ${describe(right)}, not a query — join expects a table defined earlier in the module` });
             return ERROR;
         }
         if (right.query.steps.length > 0 || right.query.distinct) {
-            ctx.diagnostics.push({ node: at ?? right.ast, message: `the right side of join must be a plain table (no steps yet)` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `the right side of join must be a plain table (no steps yet)` });
             return ERROR;
         }
         return fn('join', (spec, at2, ctx2) => {
@@ -1008,8 +1019,18 @@ export interface AnalysisResult {
     diagnostics: Diagnostic[];
 }
 
-/** Evaluate a module: all bindings in order, then the final query expression. */
-export function analyze(model: Model): AnalysisResult {
+export interface ProjectAnalysisOptions {
+    /** Require the last module's last binding to be a query (default true). */
+    requireQuery?: boolean;
+}
+
+/**
+ * Evaluate a project: the modules in import order (imports first, the root
+ * module last). All bindings share one environment seeded with the builtin
+ * prelude; the ROOT module's last binding is the project's query.
+ */
+export function analyzeProject(modules: Model[], options: ProjectAnalysisOptions = {}): AnalysisResult {
+    const { requireQuery = true } = options;
     const diagnostics: Diagnostic[] = [];
     // The environment starts with the prelude of builtins (table, filter, ...).
     // User bindings may shadow them.
@@ -1017,31 +1038,52 @@ export function analyze(model: Model): AnalysisResult {
     for (const [name, factory] of Object.entries(BUILTINS)) {
         env.set(name, factory());
     }
-    const moduleBindings = new Set(model.bindings.map(b => b.name));
+    const moduleBindings = new Set<string>();
+    for (const m of modules) {
+        for (const b of m.bindings) moduleBindings.add(b.name);
+    }
     const ctx: Ctx = { env, diagnostics, moduleBindings };
 
-    const seen = new Set<string>();
-    for (const binding of model.bindings) {
-        checkBinding(binding, ctx, seen);
+    let value: Value = ERROR;
+    for (const model of modules) {
+        const seen = new Set<string>();
+        for (const binding of model.bindings) {
+            value = checkBinding(binding, ctx, seen);
+        }
     }
-    const value = evalExpr(model.query, ctx);
 
-    if (!isError(value) && value.kind !== 'query') {
-        diagnostics.push({
-            node: model.query,
-            message: `a tetaue module must end with a query expression (a table or a pipeline), got ${describe(value)}`,
-        });
+    const root = modules[modules.length - 1];
+    if (requireQuery && root) {
+        const last = root.bindings[root.bindings.length - 1];
+        if (!last) {
+            value = ERROR;
+            diagnostics.push({
+                node: root,
+                message: `a module must have at least one binding — its last binding is the module's query`,
+            });
+        } else if (!isError(value) && value.kind !== 'query') {
+            diagnostics.push({
+                node: last,
+                message: `a module's last binding must be a query (a table or a pipeline), got ${describe(value)}`,
+            });
+        }
     }
     return { value, diagnostics };
 }
 
-function checkBinding(binding: Binding, ctx: Ctx, seen: Set<string>): void {
+/** Evaluate a single module (no imports). */
+export function analyze(model: Model): AnalysisResult {
+    return analyzeProject([model]);
+}
+
+function checkBinding(binding: Binding, ctx: Ctx, seen: Set<string>): Value {
     if (seen.has(binding.name)) {
         ctx.diagnostics.push({ node: binding, message: `duplicate binding name '${binding.name}'` });
     }
     seen.add(binding.name);
     const v = evalExpr(binding.value, ctx);
     ctx.env.set(binding.name, v);
+    return v;
 }
 
 // re-export for the validator

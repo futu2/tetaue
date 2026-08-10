@@ -6,11 +6,11 @@ const USERS = `users = table "users" {
     name = string,
     age = int,
     active = bool,
-},`;
+}`;
 
 describe('query roots', () => {
     test('bare table renders SELECT *', () => {
-        expect(render(`${USERS}\nusers`)).toBe('SELECT *\nFROM "users"');
+        expect(render(`${USERS}`)).toBe('SELECT *\nFROM "users"');
     });
 });
 
@@ -22,8 +22,7 @@ describe('pipeline steps', () => {
                 & filter (u => u.active && u.age >= 18)
                 & sort (u => [asc u.name, desc u.age])
                 & map (u => { id = u.id, name = u.name })
-                & take 10,
-            adults
+                & take 10
         `);
         expect(sql).toBe([
             'SELECT "id", "name"',
@@ -35,42 +34,40 @@ describe('pipeline steps', () => {
     });
 
     test('single sort item without a list', () => {
-        const sql = render(`${USERS}\nq = users & sort (u => asc u.name),\nq`);
+        const sql = render(`${USERS}\nq = users & sort (u => asc u.name)`);
         expect(sql).toContain('ORDER BY "name" ASC');
     });
 
     test('curried step reused as a binding', () => {
         const sql = render(`
             ${USERS}
-            by_age = sort (u => [desc u.age]),
-            q = users & by_age & take 5,
-            q
+            by_age = sort (u => [desc u.age])
+            q = users & by_age & take 5
         `);
         expect(sql).toContain('ORDER BY "age" DESC');
         expect(sql).toContain('LIMIT 5');
     });
 
     test('bare lambda argument without parens', () => {
-        const sql = render(`${USERS}\nq = users & filter u => u.age >= 21,\nq`);
+        const sql = render(`${USERS}\nq = users & filter u => u.age >= 21`);
         expect(sql).toContain('WHERE ("age" >= 21)');
     });
 
     test('multiple filter steps are ANDed', () => {
         const sql = render(`
             ${USERS}
-            q = users & filter (u => u.age >= 18) & filter (u => u.active),
-            q
+            q = users & filter (u => u.age >= 18) & filter (u => u.active)
         `);
         expect(sql).toContain('WHERE ("age" >= 18) AND ("active")');
     });
 
     test('unary minus on literals and columns', () => {
-        const sql = render(`${USERS}\nq = users & filter (u => u.age > -5),\nq`);
+        const sql = render(`${USERS}\nq = users & filter (u => u.age > -5)`);
         expect(sql).toContain('"age" > -5');
     });
 
     test('boolean literal dialect difference', () => {
-        const src = `${USERS}\nq = users & filter (u => u.active == true),\nq`;
+        const src = `${USERS}\nq = users & filter (u => u.active == true)`;
         expect(render(src, 'sqlite')).toContain('"active" = 1');
         expect(render(src, 'postgresql')).toContain('"active" = TRUE');
     });
@@ -82,8 +79,7 @@ describe('nulls', () => {
             ${USERS}
             q = users
                 & filter (u => u.name == null)
-                & filter (u => u.name != null),
-            q
+                & filter (u => u.name != null)
         `);
         expect(sql).toContain('"name" IS NULL');
         expect(sql).toContain('"name" IS NOT NULL');
@@ -100,8 +96,7 @@ describe('string functions', () => {
                     lower = lower u.name,
                     len = length u.name,
                     name_or_unknown = coalesce u.name "unknown",
-                }),
-            q
+                })
         `);
         expect(sql).toContain('UPPER("name") AS "upper"');
         expect(sql).toContain('LOWER("name") AS "lower"');
@@ -110,7 +105,7 @@ describe('string functions', () => {
     });
 
     test('string literal escaping', () => {
-        const sql = render(`${USERS}\nq = users & filter (u => u.name == "it's"),\nq`);
+        const sql = render(`${USERS}\nq = users & filter (u => u.name == "it's")`);
         expect(sql).toContain(`"name" = 'it''s'`);
     });
 });
@@ -121,8 +116,7 @@ describe('is_in', () => {
             ${USERS}
             q = users
                 & filter (u => is_in u.age [18, 21, 25])
-                & filter (u => is_not_in u.name ["a", "b"]),
-            q
+                & filter (u => is_not_in u.name ["a", "b"])
         `);
         expect(sql).toContain('"age" IN (18, 21, 25)');
         expect(sql).toContain(`"name" NOT IN ('a', 'b')`);
@@ -131,7 +125,7 @@ describe('is_in', () => {
 
 describe('distinct', () => {
     test('SELECT DISTINCT', () => {
-        const sql = render(`${USERS}\nq = users & distinct,\nq`);
+        const sql = render(`${USERS}\nq = users & distinct`);
         expect(sql).toContain('SELECT DISTINCT *');
     });
 });
@@ -143,7 +137,7 @@ describe('aggregation', () => {
                 user_id = int,
                 total = float,
                 status = string,
-            },
+            }
             q = orders
                 & fold (o => {
                     user_id = group o.user_id,
@@ -152,8 +146,7 @@ describe('aggregation', () => {
                     avg = avg o.total,
                     min_total = min o.total,
                     max_total = max o.total,
-                }),
-            q
+                })
         `);
         expect(sql).toContain('COUNT("user_id") AS "order_count"');
         expect(sql).toContain('SUM("total") AS "total"');
@@ -165,9 +158,8 @@ describe('aggregation', () => {
 
     test('fold without group keys has no GROUP BY', () => {
         const sql = render(`
-            orders = table "orders" { total = float },
-            q = orders & fold (o => { total = sum o.total }),
-            q
+            orders = table "orders" { total = float }
+            q = orders & fold (o => { total = sum o.total })
         `);
         expect(sql).not.toContain('GROUP BY');
         expect(sql).toContain('SUM("total") AS "total"');
@@ -176,15 +168,14 @@ describe('aggregation', () => {
 
 describe('joins', () => {
     const SRC = `
-        users = table "users" { id = int, name = string },
-        orders = table "orders" { oid = int, user_id = int, total = float },
+        users = table "users" { id = int, name = string }
+        orders = table "orders" { oid = int, user_id = int, total = float }
         q = users
-            & join orders {
+            & join "orders" {
                 on = (u, o) => u.id == o.user_id,
                 kind = "left",
             }
-            & map (r => { uid = r.id, oid = r.oid, total = r.total }),
-        q
+            & map (r => { uid = r.id, oid = r.oid, total = r.total })
     `;
 
     test('renders JOIN with qualified columns', () => {
@@ -198,20 +189,18 @@ describe('joins', () => {
 
     test('default join kind is inner', () => {
         const sql = render(`
-            users = table "users" { id = int },
-            orders = table "orders" { user_id = int },
-            q = users & join orders { on = (u, o) => u.id == o.user_id },
-            q
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            q = users & join "orders" { on = (u, o) => u.id == o.user_id }
         `);
         expect(sql).toContain('INNER JOIN "orders"');
     });
 
     test('overlapping columns are rejected', () => {
         const messages = errors(`
-            users = table "users" { id = int },
-            orders = table "orders" { id = int },
-            q = users & join orders { on = (u, o) => u.id == o.id },
-            q
+            users = table "users" { id = int }
+            orders = table "orders" { id = int }
+            q = users & join "orders" { on = (u, o) => u.id == o.id }
         `);
         expect(messages.join('\n')).toContain('overlapping column');
     });
@@ -219,49 +208,48 @@ describe('joins', () => {
 
 describe('dialects', () => {
     test('quoting differs per dialect', () => {
-        const src = `${USERS}\nq = users & take 1,\nq`;
+        const src = `${USERS}\nq = users & take 1`;
         expect(render(src, 'sqlite')).toContain('FROM "users"');
         expect(render(src, 'postgresql')).toContain('FROM "users"');
         expect(render(src, 'mysql')).toContain('FROM `users`');
     });
 
     test('compact format is a single line', () => {
-        const sql = render(`${USERS}\nq = users & take 1,\nq`, 'sqlite', 'compact');
+        const sql = render(`${USERS}\nq = users & take 1`, 'sqlite', 'compact');
         expect(sql).not.toContain('\n');
         expect(sql).toBe('SELECT * FROM "users" LIMIT 1');
     });
 });
 
 describe('parse structure', () => {
-    test('module has bindings and a query', () => {
-        const model = parseModel(`${USERS}\nq = users & take 1,\nq`);
+    test('module has bindings; last binding is the query', () => {
+        const model = parseModel(`${USERS}\nq = users & take 1`);
         expect(model.$type).toBe('Model');
         expect(model.bindings.length).toBe(2);
-        // bare atoms are wrapped in a zero-argument Application node by Langium
-        expect((model.query as { $type: string }).$type).toBe('Application');
+        expect(model.bindings[1]!.name).toBe('q');
+        // `users & take 1` is a pipeline — a BinaryExpression
+        expect((model.bindings[1]!.value as { $type: string }).$type).toBe('BinaryExpression');
     });
 
-    test('expression without bindings', () => {
-        const model = parseModel('table "t" { a = int }');
-        expect(model.bindings.length).toBe(0);
-        expect((model.query as { $type: string }).$type).toBe('Application');
+    test('a module with a single binding', () => {
+        const model = parseModel('q = table "t" { a = int }');
+        expect(model.bindings.length).toBe(1);
     });
 
     test('comments are hidden', () => {
-        const model = parseModel('# a comment\nusers = table "t" { a = int },\nusers');
+        const model = parseModel('# a comment\nusers = table "t" { a = int }');
         expect(model.bindings.length).toBe(1);
     });
 });
 
 describe('haskell-style operators (review change)', () => {
-    const USERS2 = `users = table "users" { id = int, name = string, age = int, active = bool },`;
+    const USERS2 = `users = table "users" { id = int, name = string, age = int, active = bool }`;
 
     test('$ is function application (right-associative)', () => {
         const sql = render(`
             ${USERS2}
-            by_age = sort $ u => [asc u.name],
-            q = users & by_age,
-            q
+            by_age = sort $ u => [asc u.name]
+            q = users & by_age
         `);
         expect(sql).toContain('ORDER BY "name" ASC');
     });
@@ -271,8 +259,7 @@ describe('haskell-style operators (review change)', () => {
             ${USERS2}
             q = users
                 & (filter $ u => u.age >= 18)
-                & (map $ u => { id = u.id }),
-            q
+                & (map $ u => { id = u.id })
         `);
         expect(sql).toBe([
             'SELECT "id"',
@@ -286,8 +273,7 @@ describe('haskell-style operators (review change)', () => {
             ${USERS2}
             adults = users
                 & filter (u => u.active && u.age >= 18)
-                & take 5,
-            adults
+                & take 5
         `);
         expect(sql).toContain('WHERE ("active" AND "age" >= 18)');
         expect(sql).toContain('LIMIT 5');
@@ -295,24 +281,22 @@ describe('haskell-style operators (review change)', () => {
 
     test('builtins are plain identifiers and may be shadowed', () => {
         const messages = errors(`
-            table = 42,
-            q = table "x" { a = int },
-            q
+            table = 42
+            q = table "x" { a = int }
         `);
         expect(messages.join('\n')).toContain('cannot apply');
     });
 
     test('null is the NULL literal keyword', () => {
-        const sql = render(`${USERS2}\nq = users & filter (u => u.name == null),\nq`);
+        const sql = render(`${USERS2}\nq = users & filter (u => u.name == null)`);
         expect(sql).toContain('"name" IS NULL');
     });
 
     test('bindings must be defined before use (lexical order)', () => {
         const messages = errors(`
             ${USERS2}
-            q = users & filter (u => u.age >= min_age),
-            min_age = 18,
-            q
+            q = users & filter (u => u.age >= min_age)
+            min_age = 18
         `);
         expect(messages.join('\n')).toContain("unknown identifier 'min_age' — bindings must be defined before use");
     });

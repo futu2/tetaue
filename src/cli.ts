@@ -4,23 +4,28 @@
  *   tetaue render <file> [--dialect sqlite|postgresql|mysql] [--format pretty|compact]
  *   tetaue check <file>
  *   tetaue parse <file>
+ *
+ * Modules may import other files (`import "path.tetaue"`); the whole import
+ * tree is loaded, analyzed, and reported.
  ******************************************************************************/
+import { readFileSync } from 'node:fs';
+import * as path from 'node:path';
 import { NodeFileSystem } from 'langium/node';
-import { URI } from 'langium';
-import path from 'node:path';
+import { URI, type AstNode } from 'langium';
 import { createTetaueServices } from './language/tetaue-module.js';
 import type { TetaueServices } from './language/tetaue-module.js';
-import { analyze } from './language/interpreter.js';
-import type { AnalysisResult } from './language/interpreter.js';
+import { analyzeProject, describe } from './language/interpreter.js';
 import { renderQuery, DIALECTS, isDialect } from './language/render.js';
 import type { RenderFormat } from './language/render.js';
+import { collectModuleTree, moduleOf } from './language/imports.js';
+import type { ProjectModule } from './language/imports.js';
 import type { Model } from './language/generated/ast.js';
 
 const HELP = `tetaue — a pure functional SQL query language
 
 Usage:
   tetaue render <file.tetaue> [--dialect <name>] [--format pretty|compact]
-      Validate the module and render its query to SQL.
+      Validate the module (and its imports) and render its query to SQL.
       Dialects: ${Object.keys(DIALECTS).join(', ')} (default: sqlite)
   tetaue check <file.tetaue>
       Validate the module and report all diagnostics.
@@ -41,27 +46,68 @@ function formatDiagnostic(file: string, node: { $cstNode?: { range: { start: { l
     return `${where}: error: ${message}`;
 }
 
-async function loadModel(file: string): Promise<{ services: TetaueServices; model: Model }> {
-    const services = createTetaueServices(NodeFileSystem);
-    const uri = URI.file(path.resolve(file));
-    const doc = await services.shared.workspace.LangiumDocuments.getOrCreateDocument(uri);
-    await services.shared.workspace.DocumentBuilder.build([doc], { validation: true });
-    const model = doc.parseResult.value as Model | undefined;
-    if (!model) {
-        const lexer = doc.parseResult.lexerErrors.map(e => e.message).join('; ');
-        const parser = doc.parseResult.parserErrors.map(e => e.message).join('; ');
-        throw new Error(`could not parse ${file}${lexer || parser ? `: ${lexer || parser}` : ''}`);
+function loadProject(file: string, services: TetaueServices): { modules: ProjectModule[]; main: ProjectModule } {
+    const rootUri = URI.file(path.resolve(file)).toString();
+    const rootText = readFileSync(URI.parse(rootUri).fsPath, 'utf8');
+
+    const parse = (text: string, uri: string): Model => {
+        const result = services.parser.LangiumParser.parse(text);
+        const parseErrors = [
+            ...result.lexerErrors.map(e => e.message),
+            ...result.parserErrors.map(e => e.message),
+        ];
+        if (!result.value || parseErrors.length > 0) {
+            throw new Error(parseErrors.join('; ') || 'no parse result');
+        }
+        return result.value as Model;
+    };
+
+    let main: ProjectModule;
+    try {
+        main = { model: parse(rootText, rootUri), uri: rootUri };
+    } catch (err) {
+        throw new Error(`${file}: ${err instanceof Error ? err.message : String(err)}`);
     }
-    return { services: services.tetaue, model };
+
+    const tree = collectModuleTree(main, {
+        resolve: (importerUri, spec) => {
+            const base = importerUri ? path.dirname(URI.parse(importerUri).fsPath) : path.dirname(file);
+            return URI.file(path.resolve(base, spec)).toString();
+        },
+        read: (uri) => {
+            try {
+                return readFileSync(URI.parse(uri).fsPath, 'utf8');
+            } catch {
+                return undefined;
+            }
+        },
+        parse,
+    });
+
+    // Prepend import-resolution errors onto the main module's analysis.
+    const { modules, diagnostics: treeDiagnostics } = tree;
+    if (treeDiagnostics.length > 0) {
+        console.error(`error: failed to resolve imports in ${file}`);
+        for (const d of treeDiagnostics) {
+            const m = moduleOf(d.node, modules) ?? main;
+            console.error(formatDiagnostic(m.uri ?? file, d.node, d.message));
+        }
+        process.exit(1);
+    }
+    return { modules, main };
 }
 
-function printDiagnostics(file: string, model: Model): AnalysisResult | null {
-    const result = analyze(model);
-    if (result.diagnostics.length === 0) return result;
-    for (const d of result.diagnostics) {
-        console.error(formatDiagnostic(file, d.node, d.message));
+function printSemanticDiagnostics(modules: ProjectModule[], main: ProjectModule): boolean {
+    const { value, diagnostics } = analyzeProject(modules.map(m => m.model), { requireQuery: true });
+    if (diagnostics.length === 0) return false;
+    for (const d of diagnostics) {
+        const m = moduleOf(d.node, modules) ?? main;
+        console.error(formatDiagnostic(m.uri ?? '<memory>', d.node, d.message));
     }
-    return null;
+    if (value.kind === 'error') {
+        console.error(`error: evaluation failed`);
+    }
+    return true;
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -101,9 +147,12 @@ export async function main(argv: string[]): Promise<number> {
     }
 
     const file = files[0]!;
-    let model: Model;
+    const services = createTetaueServices(NodeFileSystem).tetaue;
+
+    let modules: ProjectModule[];
+    let main: ProjectModule;
     try {
-        ({ model } = await loadModel(file));
+        ({ modules, main } = loadProject(file, services));
     } catch (err) {
         console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
         return 1;
@@ -111,19 +160,19 @@ export async function main(argv: string[]): Promise<number> {
 
     switch (command) {
         case 'render': {
-            const result = printDiagnostics(file, model);
-            if (!result) return 1;
-            if (result.value.kind !== 'query') return 1; // defensive: analyze() already reported this
-            console.log(renderQuery(result.value.query, DIALECTS[dialect]!, format));
+            if (printSemanticDiagnostics(modules, main)) return 1;
+            const { value } = analyzeProject(modules.map(m => m.model), { requireQuery: true });
+            if (value.kind !== 'query') return 1;
+            console.log(renderQuery(value.query, DIALECTS[dialect]!, format));
             return 0;
         }
         case 'check': {
-            if (!printDiagnostics(file, model)) return 1;
+            if (printSemanticDiagnostics(modules, main)) return 1;
             console.log(`OK — ${file} is a valid tetaue module`);
             return 0;
         }
         case 'parse': {
-            console.log(JSON.stringify(dumpAst(model), null, 2));
+            console.log(JSON.stringify(dumpAst(main.model), null, 2));
             return 0;
         }
         default:

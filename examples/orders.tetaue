@@ -6,20 +6,20 @@
 users = table "users" {
     id = int,
     name = string,
-},
+}
 
 orders = table "orders" {
     id = int,
     user_id = int,
     total = float,
     status = string,
-},
+}
 
 # Rename the colliding "id" column on the left side before joining:
-user_rows = users & map (u => { uid = u.id, name = u.name }),
+user_rows = users & map (u => { uid = u.id, name = u.name })
 
 by_user = user_rows
-    & join orders {
+    & join "orders" {
         on = (u, o) => u.uid == o.user_id,
         kind = "inner",
     }
@@ -31,6 +31,4 @@ by_user = user_rows
         avg_order = avg o.total,
     })
     & sort (r => [desc r.total_spent])
-    & take 20,
-
-by_user
+    & take 20

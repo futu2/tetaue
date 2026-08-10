@@ -5,7 +5,7 @@ users = table "users" {
     email = string,
     nickname = string,
     last_seen = timestamp,
-},
+}
 
 # `== null` renders as IS NULL; `!= null` renders as IS NOT NULL.
 active = users
@@ -16,6 +16,4 @@ active = users
         email_upper = upper u.email,
         email_len = length u.email,
     })
-    & distinct,
-
-active
+    & distinct

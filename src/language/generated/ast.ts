@@ -40,6 +40,7 @@ export type TetaueKeywordNames =
     | "["
     | "]"
     | "false"
+    | "import"
     | "null"
     | "true"
     | "{"
@@ -83,7 +84,7 @@ export function isApplication(item: unknown): item is Application {
 }
 
 export interface BinaryExpression extends langium.AstNode {
-    readonly $container: AccessExpression | Application | BinaryExpression | Binding | Lambda | ListLiteral | MapEntry | Model | UnaryMinus;
+    readonly $container: AccessExpression | Application | BinaryExpression | Binding | Lambda | ListLiteral | MapEntry | UnaryMinus;
     readonly $type: 'BinaryExpression';
     left: UnaryExpression;
     operator: '!=' | '$' | '%' | '&&' | '&' | '*' | '+' | '-' | '/' | '<' | '<=' | '==' | '>' | '>=' | '||';
@@ -168,6 +169,21 @@ export function isIdentifier(item: unknown): item is Identifier {
     return reflection.isInstance(item, Identifier.$type);
 }
 
+export interface Import extends langium.AstNode {
+    readonly $container: Model;
+    readonly $type: 'Import';
+    path: string;
+}
+
+export const Import = {
+    $type: 'Import',
+    path: 'path'
+} as const;
+
+export function isImport(item: unknown): item is Import {
+    return reflection.isInstance(item, Import.$type);
+}
+
 export interface Lambda extends langium.AstNode {
     readonly $container: AccessExpression | Application | BinaryExpression | UnaryMinus;
     readonly $type: 'Lambda';
@@ -237,13 +253,13 @@ export function isMapLiteral(item: unknown): item is MapLiteral {
 export interface Model extends langium.AstNode {
     readonly $type: 'Model';
     bindings: Array<Binding>;
-    query: Expression;
+    imports: Array<Import>;
 }
 
 export const Model = {
     $type: 'Model',
     bindings: 'bindings',
-    query: 'query'
+    imports: 'imports'
 } as const;
 
 export function isModel(item: unknown): item is Model {
@@ -327,6 +343,7 @@ export type TetaueAstType = {
     Expr: Expr
     Expression: Expression
     Identifier: Identifier
+    Import: Import
     Lambda: Lambda
     ListLiteral: ListLiteral
     MapEntry: MapEntry
@@ -424,6 +441,15 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
             },
             superTypes: [Expr.$type]
         },
+        Import: {
+            name: Import.$type,
+            properties: {
+                path: {
+                    name: Import.path
+                }
+            },
+            superTypes: []
+        },
         Lambda: {
             name: Lambda.$type,
             properties: {
@@ -484,8 +510,10 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                     defaultValue: [],
                     optional: true
                 },
-                query: {
-                    name: Model.query
+                imports: {
+                    name: Model.imports,
+                    defaultValue: [],
+                    optional: true
                 }
             },
             superTypes: []
