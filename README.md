@@ -220,9 +220,12 @@ Lambdas abstract over a row. Two ways to write them:
   `($1 + $2)` ≡ `(u, v) => u + v`. The highest `$n` used sets the arity:
   ```
   filter ($1.active && $1.age >= 18)          # ≡ filter (u => u.active && u.age >= 18)
-  map ({ id = $1.id, name = $1.name })
+  map { id = $1.id, name = $1.name }          # braces delimit the lambda — no extra parens
   join orders ($1.id == $2.user_id) "inner"   # two params: left row, right row
   ```
+  Parens inside are pure grouping: `map { a = ($1.id + 1) }` means exactly the same
+  as `map { a = $1.id + 1 }` — `$n` binds to the enclosing argument (the outermost
+  lambda), never to an inner pair of parens.
 - **Explicit** — `u => u.age >= 18` (one parameter) or `(l, r) => l.id == r.user_id`
   (two parameters, parens required). `$n` is not available inside an explicit body.
 

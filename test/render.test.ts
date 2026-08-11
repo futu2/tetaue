@@ -396,7 +396,7 @@ describe('implicit lambda parameters ($n)', () => {
     test('map projection with $1', () => {
         const sql = render(`
             ${USERS}
-            q = users & map ({ uid = $1.id, name = $1.name })
+            q = users & map { uid = $1.id, name = $1.name }
         `);
         expect(sql).toContain('SELECT "id" AS "uid", "name"');
     });
@@ -404,7 +404,7 @@ describe('implicit lambda parameters ($n)', () => {
     test('mapped %~ with $1', () => {
         const sql = render(`
             ${USERS}
-            q = users & mapped %~ ({ uid = $1.id })
+            q = users & mapped %~ { uid = $1.id }
         `);
         expect(sql).toContain('SELECT "id" AS "uid"');
     });
@@ -412,7 +412,7 @@ describe('implicit lambda parameters ($n)', () => {
     test('sort with $1', () => {
         const sql = render(`
             users = table "users" { id = int, age = int }
-            q = users & sort ([desc $1.age])
+            q = users & sort [desc $1.age]
         `);
         expect(sql).toContain('ORDER BY "age" DESC');
     });
@@ -420,7 +420,7 @@ describe('implicit lambda parameters ($n)', () => {
     test('fold with $1', () => {
         const sql = render(`
             orders = table "orders" { user_id = int, total = int }
-            q = orders & fold ({ uid = group $1.user_id, t = sum $1.total })
+            q = orders & fold { uid = group $1.user_id, t = sum $1.total }
         `);
         expect(sql).toContain('SELECT "user_id" AS "uid", SUM("total") AS "t"');
         expect(sql).toContain('GROUP BY "user_id"');
@@ -469,6 +469,12 @@ describe('implicit lambda parameters ($n)', () => {
         `);
         expect(sql).toContain('WHERE ("active" AND "age" >= 18)');
         expect(sql).toContain('SELECT "id" AS "uid"');
+    });
+
+    test('inner parens are pure grouping — they never rebind $n', () => {
+        const plain = 'users = table "users" { id = int, age = int }\nq = users & map { a = $1.age + 1 }';
+        const grouped = 'users = table "users" { id = int, age = int }\nq = users & map { a = ($1.age + 1) }';
+        expect(render(grouped)).toBe(render(plain));
     });
 
     test('$n and explicit lambdas coexist', () => {
