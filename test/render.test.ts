@@ -171,10 +171,7 @@ describe('joins', () => {
         users = table "users" { id = int, name = string }
         orders = table "orders" { oid = int, user_id = int, total = float }
         q = users
-            & join { right = orders,
-                on = (u, o) => u.id == o.user_id,
-                kind = "left",
-            }
+            & join orders (u, o) => u.id == o.user_id "left"
             & map (r => { uid = r.id, oid = r.oid, total = r.total })
     `;
 
@@ -187,11 +184,11 @@ describe('joins', () => {
         expect(sql).toContain('"orders"."oid"');
     });
 
-    test('default join kind is inner', () => {
+    test('explicit inner kind renders INNER JOIN', () => {
         const sql = render(`
             users = table "users" { id = int }
             orders = table "orders" { user_id = int }
-            q = users & join { right = orders, on = (u, o) => u.id == o.user_id }
+            q = users & join orders (u, o) => u.id == o.user_id "inner"
         `);
         expect(sql).toContain('INNER JOIN "orders"');
     });
@@ -200,7 +197,7 @@ describe('joins', () => {
         const messages = errors(`
             users = table "users" { id = int }
             orders = table "orders" { id = int }
-            q = users & join { right = orders, on = (u, o) => u.id == o.id }
+            q = users & join orders (u, o) => u.id == o.id "inner"
         `);
         expect(messages.join('\n')).toContain('overlapping column');
     });
@@ -307,7 +304,7 @@ describe('composable joins (review change)', () => {
         const sql = render(`
             users = table "users" { id = int, name = string }
             orders = table "orders" { user_id = int, total = float }
-            q = users & join { right = orders, on = (u, o) => u.id == o.user_id }
+            q = users & join orders (u, o) => u.id == o.user_id "inner"
         `);
         expect(sql).toContain('INNER JOIN "orders" ON "users"."id" = "orders"."user_id"');
     });
@@ -317,7 +314,7 @@ describe('composable joins (review change)', () => {
             users = table "users" { id = int }
             orders = table "orders" { user_id = int, total = float }
             o2 = orders & map (o => { uid = o.user_id, amount = o.total })
-            q = users & join { right = o2, on = (u, o) => u.id == o.uid }
+            q = users & join o2 (u, o) => u.id == o.uid "inner"
         `);
         expect(sql).toContain('INNER JOIN (SELECT "user_id" AS "uid", "total" AS "amount" FROM "orders") AS "orders" ON "users"."id" = "orders"."uid"');
     });
@@ -326,7 +323,7 @@ describe('composable joins (review change)', () => {
         const sql = render(`
             users = table "users" { id = int }
             q = users
-                & join { right = users & map (u => { uid = u.id }), on = (l, r) => l.id == r.uid }
+                & join (users & map (u => { uid = u.id })) (l, r) => l.id == r.uid "inner"
         `);
         expect(sql).toContain('INNER JOIN (SELECT "id" AS "uid" FROM "users") AS "users_1" ON "users"."id" = "users_1"."uid"');
     });
@@ -335,7 +332,7 @@ describe('composable joins (review change)', () => {
         const sql = render(`
             users = table "users" { id = int }
             orders = table "orders" { user_id = int }
-            q = users & join { right = orders & distinct, on = (u, o) => u.id == o.user_id }
+            q = users & join (orders & distinct) (u, o) => u.id == o.user_id "inner"
         `);
         expect(sql).toContain('INNER JOIN (SELECT DISTINCT * FROM "orders") AS "orders" ON "users"."id" = "orders"."user_id"');
     });
@@ -346,12 +343,33 @@ describe('composable joins (review change)', () => {
             orders = table "orders" { user_id = int, total = float }
             q = users
                 & filter (u => u.active)
-                & join { right = orders, on = (u, o) => u.id == o.user_id, kind = "left" }
+                & join orders (u, o) => u.id == o.user_id "left"
                 & map (r => { uid = r.id, total = r.total })
                 & take 5
         `);
         expect(sql).toContain('LEFT JOIN "orders" ON "users"."id" = "orders"."user_id"');
         expect(sql).toContain('WHERE ("users"."active")');
         expect(sql).toContain('LIMIT 5');
+    });
+
+    test('a zero-arg step does not swallow the next binding as an argument', () => {
+        const sql = render(`
+            users = table "users" { id = int }
+            a = users & distinct
+            b = users & take 1
+        `);
+        expect(sql).toContain('LIMIT 1');
+        expect(sql).not.toContain('distinct');
+    });
+
+    test('a bare-identifier right side does not swallow the next binding', () => {
+        const sql = render(`
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            q1 = users & join orders (u, o) => u.id == o.user_id "inner"
+            q2 = users & join orders (u, o) => u.id == o.user_id "inner"
+        `);
+        expect(sql).toContain('INNER JOIN "orders" ON "users"."id" = "orders"."user_id"');
+        expect(sql).not.toContain('orders_1');
     });
 });

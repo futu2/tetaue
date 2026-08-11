@@ -68,7 +68,7 @@ describe('multi-file modules', () => {
                 import "tables.tetaue"
                 q = users
                     & map (u => { uid = u.id })
-                    & join { right = orders, on = (u, o) => u.uid == o.user_id }
+                    & join orders (u, o) => u.uid == o.user_id "inner"
             `,
         }, 'main.tetaue');
         expect(sql).toContain('INNER JOIN "orders" ON "users"."id" = "orders"."user_id"');

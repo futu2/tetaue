@@ -96,18 +96,35 @@ describe('semantic errors', () => {
         const messages = errors(`
             users = table "users" { id = int }
             orders = table "orders" { user_id = int }
-            q = users & join { right = orders, on = u => u.id == 1 }
+            q = users & join orders (u => u.id == 1) "inner"
         `);
         expect(messages.join('\n')).toContain("join 'on' must be a two-parameter lambda");
     });
 
-    test('join spec unknown key', () => {
+    test('join kind must be inner/left/right/full', () => {
         const messages = errors(`
             users = table "users" { id = int }
             orders = table "orders" { user_id = int }
-            q = users & join { right = orders, on = (u, o) => u.id == o.user_id, foo = 1 }
+            q = users & join orders (u, o) => u.id == o.user_id "outer"
         `);
-        expect(messages.join('\n')).toContain("unknown join spec key 'foo'");
+        expect(messages.join('\n')).toContain('"inner", "left", "right" or "full"');
+    });
+
+    test('join kind is required (three positional args)', () => {
+        const messages = errors(`
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            q = users & join orders (u, o) => u.id == o.user_id
+        `);
+        expect(messages.join('\n')).toContain('"inner", "left", "right" or "full"');
+    });
+
+    test('join right must be a query', () => {
+        const messages = errors(`
+            users = table "users" { id = int }
+            q = users & join 42 (u, o) => u.id == o.user_id "inner"
+        `);
+        expect(messages.join('\n')).toContain('join expects a query as its first argument');
     });
 
     test('stepped right side of a join renders as a subquery', () => {
@@ -115,7 +132,7 @@ describe('semantic errors', () => {
             users = table "users" { id = int }
             orders = table "orders" { user_id = int, status = string }
             paid = orders & filter (o => o.status == "paid")
-            q = users & join { right = paid, on = (u, o) => u.id == o.user_id }
+            q = users & join paid (u, o) => u.id == o.user_id "inner"
         `);
         expect(sql).toContain('INNER JOIN (SELECT * FROM "orders" WHERE ("status" = \'paid\')) AS "orders" ON "users"."id" = "orders"."user_id"');
     });

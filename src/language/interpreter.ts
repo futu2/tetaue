@@ -1176,93 +1176,73 @@ const BUILTINS: Record<string, () => Value> = {
         });
     }),
 
-    join: () => fn('join', (spec, at, ctx) => {
-        // `join` takes ONE argument: a spec record. The right-hand side is a
-        // first-class query VALUE (any query — pipelines render as subqueries),
-        // so joins compose like every other step.
-        if (spec.kind !== 'record') {
-            ctx.diagnostics.push({ node: at ?? spec.ast, message: `join expects a spec record { right = orders, on = (l, r) => ..., kind = "inner" }` });
+    join: () => fn('join', (right, at, ctx) => {
+        // `join` takes THREE positional arguments: the right-hand query, the
+        // two-parameter `on` lambda, and the join kind string:
+        //   join orders (l, r) => l.id == r.user_id "inner"
+        // The right side is a first-class query VALUE (any query — pipelines
+        // render as subqueries), so joins compose like every other step.
+        if (right.kind !== 'query') {
+            ctx.diagnostics.push({ node: at ?? right.ast, message: `join expects a query as its first argument, got ${describe(right)} — bind a table or pipeline first, e.g. join orders (l, r) => ...` });
             return ERROR;
         }
-        let onLambda: Value | null = null;
-        let rightValue: Value | null = null;
-        let joinKind: JoinKind = 'inner';
-        for (const { key, value } of spec.fields) {
-            if (key === 'right') {
-                if (value.kind !== 'query') {
-                    ctx.diagnostics.push({ node: value.ast ?? at, message: `join 'right' must be a query, got ${describe(value)} — bind a table or pipeline first, e.g. right = orders` });
-                    return ERROR;
-                }
-                rightValue = value;
-            } else if (key === 'on') {
-                if (value.kind !== 'lambda' || value.params.length !== 2) {
-                    ctx.diagnostics.push({ node: value.ast ?? at, message: `join 'on' must be a two-parameter lambda, e.g. (l, r) => l.id == r.user_id` });
-                    return ERROR;
-                }
-                onLambda = value;
-            } else if (key === 'kind') {
-                const kind = stringValue(value);
-                if (kind === null || !(kind in JOIN_KINDS)) {
-                    ctx.diagnostics.push({ node: value.ast ?? at, message: `join 'kind' must be "inner", "left", "right" or "full", got ${kind ?? describe(value)}` });
-                    return ERROR;
-                }
-                joinKind = JOIN_KINDS[kind]!;
-            } else {
-                ctx.diagnostics.push({ node: value.ast ?? at, message: `unknown join spec key '${key}' — expected 'right', 'on' and 'kind'` });
+        return fn('join', (on, at2, ctx2) => {
+            if (on.kind !== 'lambda' || on.params.length !== 2) {
+                ctx2.diagnostics.push({ node: at2 ?? on.ast, message: `join 'on' must be a two-parameter lambda, e.g. (l, r) => l.id == r.user_id, got ${describe(on)}` });
                 return ERROR;
             }
-        }
-        if (!rightValue) {
-            ctx.diagnostics.push({ node: at ?? spec.ast, message: `join spec is missing the 'right' query — e.g. join { right = orders, on = (l, r) => l.id == r.user_id }` });
-            return ERROR;
-        }
-        if (!onLambda) {
-            ctx.diagnostics.push({ node: at ?? spec.ast, message: `join spec is missing the 'on' condition` });
-            return ERROR;
-        }
-        const right = rightValue;
-        return step('join', (q, at3, ctx3) => {
-            if (hasFoldStep(q)) {
-                ctx3.diagnostics.push({ node: at3 ?? onLambda?.ast, message: `cannot apply join after fold` });
-                return null;
-            }
-            // Assign a unique alias for the right-hand side (self-joins).
-            // The ON condition references the right side's OUTPUT columns by
-            // alias — a stepped right side renders as a subquery.
-            const rightName = right.query.root.name;
-            let alias = rightName;
-            let suffix = 1;
-            while (q.aliases.includes(alias)) {
-                alias = `${rightName}_${suffix++}`;
-            }
-            const rightSchema: Schema = new Map(
-                [...querySchema(right.query)].map(([key, col]) => [key, { type: col.type, table: alias }]),
-            );
-            const rightQuery: Query = {
-                ...right.query,
-                root: { name: rightName, schema: rightSchema },
-                aliases: [alias],
-            };
-            const leftSchema = querySchema(q);
-            for (const name of rightSchema.keys()) {
-                if (leftSchema.has(name)) {
-                    ctx3.diagnostics.push({ node: at3 ?? onLambda?.ast, message: `join result has overlapping column '${name}' on both sides — rename one side first, e.g. map (u => { ... })` });
-                    return null;
+            const onLambda = on;
+            return fn('join', (kindArg, atKind, ctxKind) => {
+                const kind = stringValue(kindArg);
+                if (kind === null || !(kind in JOIN_KINDS)) {
+                    ctxKind.diagnostics.push({ node: atKind ?? kindArg.ast, message: `join 'kind' must be "inner", "left", "right" or "full", got ${kind ?? describe(kindArg)}` });
+                    return ERROR;
                 }
-            }
-            const env = new Map(onLambda.closure);
-            const p = onLambda.params;
-            env.set(p[0]!, rowRecord(leftSchema, at3));
-            env.set(p[1]!, rowRecord(rightSchema, at3));
-            const v = evalExpr(onLambda.body, { env, diagnostics: ctx3.diagnostics, moduleBindings: ctx.moduleBindings });
-            const node = exprNode(v);
-            if (!node || node.type !== 'bool') {
-                ctx3.diagnostics.push({ node: at3 ?? onLambda.body, message: `join 'on' condition must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(v)}` });
-                return null;
-            }
-            if (forbid(node, ['agg', 'group', 'order'], 'the join condition', at3 ?? onLambda.body, ctx3)) return null;
-            const next: Query = { ...q, aliases: [...q.aliases, alias] };
-            return addStep(next, { kind: 'join', joinKind, right: rightQuery, on: node });
+                const joinKind = JOIN_KINDS[kind]!;
+                return step('join', (q, at3, ctx3) => {
+                    if (hasFoldStep(q)) {
+                        ctx3.diagnostics.push({ node: at3 ?? onLambda?.ast, message: `cannot apply join after fold` });
+                        return null;
+                    }
+                    // Assign a unique alias for the right-hand side (self-joins).
+                    // The ON condition references the right side's OUTPUT columns by
+                    // alias — a stepped right side renders as a subquery.
+                    const rightName = right.query.root.name;
+                    let alias = rightName;
+                    let suffix = 1;
+                    while (q.aliases.includes(alias)) {
+                        alias = `${rightName}_${suffix++}`;
+                    }
+                    const rightSchema: Schema = new Map(
+                        [...querySchema(right.query)].map(([key, col]) => [key, { type: col.type, table: alias }]),
+                    );
+                    const rightQuery: Query = {
+                        ...right.query,
+                        root: { name: rightName, schema: rightSchema },
+                        aliases: [alias],
+                    };
+                    const leftSchema = querySchema(q);
+                    for (const name of rightSchema.keys()) {
+                        if (leftSchema.has(name)) {
+                            ctx3.diagnostics.push({ node: at3 ?? onLambda?.ast, message: `join result has overlapping column '${name}' on both sides — rename one side first, e.g. map (u => { ... })` });
+                            return null;
+                        }
+                    }
+                    const env = new Map(onLambda.closure);
+                    const p = onLambda.params;
+                    env.set(p[0]!, rowRecord(leftSchema, at3));
+                    env.set(p[1]!, rowRecord(rightSchema, at3));
+                    const v = evalExpr(onLambda.body, { env, diagnostics: ctx3.diagnostics, moduleBindings: ctx.moduleBindings });
+                    const node = exprNode(v);
+                    if (!node || node.type !== 'bool') {
+                        ctx3.diagnostics.push({ node: at3 ?? onLambda.body, message: `join 'on' condition must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(v)}` });
+                        return null;
+                    }
+                    if (forbid(node, ['agg', 'group', 'order'], 'the join condition', at3 ?? onLambda.body, ctx3)) return null;
+                    const next: Query = { ...q, aliases: [...q.aliases, alias] };
+                    return addStep(next, { kind: 'join', joinKind, right: rightQuery, on: node });
+                });
+            });
         });
     }),
 

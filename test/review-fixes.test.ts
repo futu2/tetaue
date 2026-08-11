@@ -40,7 +40,7 @@ describe('derived columns (review fixes)', () => {
             orders = table "orders" { user_id = int }
             q = users
                 & map (u => { a = u.id })
-                & join { right = orders, on = (u, o) => u.a == o.user_id }
+                & join orders (u, o) => u.a == o.user_id "inner"
         `);
         expect(sql).toContain('ON "users"."id" = "orders"."user_id"');
     });
@@ -121,7 +121,7 @@ describe('aggregation edges (review fixes)', () => {
             users = table "users" { id = int }
             q = orders
                 & fold (o => { user_id = group o.user_id, total = sum o.total })
-                & join { right = users, on = (o, u) => o.user_id == u.id }
+                & join users (o, u) => o.user_id == u.id "inner"
         `);
         expect(messages.join('\n')).toContain('cannot apply join after fold');
     });
@@ -140,7 +140,7 @@ describe('self-joins (review fix)', () => {
         const sql = render(`
             a = table "users" { id = int }
             b = table "users" { uid = int }
-            q = a & join { right = b, on = (l, r) => l.id == r.uid }
+            q = a & join b (l, r) => l.id == r.uid "inner"
         `);
         expect(sql).toContain('INNER JOIN "users" AS "users_1" ON "users"."id" = "users_1"."uid"');
     });
@@ -151,8 +151,8 @@ describe('self-joins (review fix)', () => {
         const sql = render(`
             users = table "users" { id = int }
             orders = table "orders" { user_id = int }
-            q1 = users & join { right = orders, on = (u, o) => u.id == o.user_id }
-            q2 = users & join { right = orders, on = (u, o) => u.id == o.user_id }
+            q1 = users & join orders (u, o) => u.id == o.user_id "inner"
+            q2 = users & join orders (u, o) => u.id == o.user_id "inner"
         `);
         expect(sql).toContain('INNER JOIN "orders" ON');
         expect(sql).not.toContain('orders_1');

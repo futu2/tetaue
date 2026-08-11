@@ -72,10 +72,12 @@ users = table "users" { id = int, name = string }
 adults = users & filter (u => u.active) & take 5
 ```
 
-(That module's query is `adults`.) The one rule that makes this unambiguous: an
+(That module's query is `adults`.) The rule that makes this unambiguous: an
 application argument may be a literal, a map, a list, a lambda, a parenthesized
 expression, or a `u.field` access chain — but **not a bare identifier**; wrap bare
-values in parentheses: `f (g)`.
+values in parentheses: `f (g)`. The one exception is the **first** argument of an
+application, which may be a bare identifier when it is followed by further
+arguments — that's how `join orders (l, r) => ...` names its right-hand query.
 
 ### Multi-file modules
 
@@ -92,7 +94,7 @@ import "tables.tetaue"
 adults = users & filter (u => u.active && u.age >= 18)
 
 report = adults
-    & join { right = orders, on = (u, o) => u.id == o.user_id, kind = "inner" }
+    & join orders (u, o) => u.id == o.user_id "inner"
     & fold (r => { user_id = group r.user_id, order_count = count r.id })
 ```
 
@@ -112,7 +114,7 @@ report = adults
 true  false   # bool
 null          # SQL NULL
 [1, 2, 3]     # list (IN lists, sort items)
-{ a = 1 }     # record (schemas, projections, join specs)
+{ a = 1 }     # record (schemas, projections)
 ```
 
 ### Optics (the core abstraction)
@@ -169,17 +171,17 @@ and checked statically against every operation.
 | `take n` | LIMIT | `LIMIT n` |
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
 | `fold (o => { k = group o.k, s = sum o.v })` | aggregation | `SELECT ... GROUP BY ...` |
-| `join { right = table, on = (l, r) => ..., kind = "inner" }` | join | `... JOIN ... ON ...` |
+| `join table (l, r) => ... "inner"` | join | `... JOIN ... ON ...` |
 
 Everything is curried: `filtered (u => ...)` is a *step* value; applying it to a query
 (`users & filtered (u => ...)`) builds a new query. Steps are first-class values, so you
-can bind them and reuse them. `join` composes the same way: its `right` entry is a
+can bind them and reuse them. `join` composes the same way: its first argument is a
 first-class query value (any binding or pipeline — stepped right sides render as
 subqueries), never a table name.
 
 ```
 paid_orders = orders & filtered (o => o.status == "paid")
-q = users & join { right = paid_orders, on = (u, o) => u.id == o.user_id }
+q = users & join paid_orders (u, o) => u.id == o.user_id "inner"
 ```
 
 ```

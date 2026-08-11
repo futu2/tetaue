@@ -3,7 +3,7 @@
  *
  * Syntax is inspired by moria (https://codeberg.org/mikitori/moria):
  *   - `#` line comments, multi-file modules via `import "path.tetaue"`
- *   - `{ field = value, ... }` maps (table schemas, projections, join specs)
+ *   - `{ field = value, ... }` maps (table schemas, projections)
  *   - `a => a` lambdas, `(l, r) => ...` multi-param lambdas
  *   - builtins live in a prelude of plain identifiers (table, filter, ...)
  * Operators follow Haskell: `&` is the pipeline (`a & f` ⇔ `f a`), `$` is
@@ -13,7 +13,8 @@
  *
  * A module is a list of bindings; the LAST binding is the module's query.
  * Bindings need no terminator: application arguments may not be bare
- * identifiers (use `u.field` access chains or parentheses), so the parser
+ * identifiers — except as the FIRST argument, and only when followed by at
+ * least one more argument (`join orders (l, r) => ...`) — so the parser
  * always knows where one binding ends and the next begins.
  ******************************************************************************/
 
@@ -82,25 +83,30 @@ AccessExpression infers Expr:
 // to a lambda; `table "users" { ... }` is table applied to two arguments.
 // Arguments are postfix chains (atom + field access) — NOT applications — so
 // `f a b` stays a flat, curried application instead of nesting `a (b)`.
+// A bare identifier is allowed as the FIRST argument only, and only when
+// followed by at least one more argument (`join orders (l, r) => ...`). That
+// keeps bindings comma-free: `distinct` (zero args) followed by `x = ...`
+// can never swallow the next binding's name as an argument.
 Application infers Expr:
-    {infer Application} func=Atom (arguments+=Argument)*;
+    {infer Application} func=Atom
+    ( (arguments+=Argument)+
+    | arguments+=Identifier (arguments+=Argument)+
+    )?;
 
-// Application arguments may be literals, containers, lambdas, parenthesized
-// expressions, or `u.field` access chains — but NOT bare identifiers.
-// A bare identifier after an application would be ambiguous with the start of
-// the next binding (bindings need no terminator), so bare values must be
-// parenthesized: f (g).
+// Application arguments are literals, containers, lambdas, parenthesized
+// expressions, or `u.field` access chains. The multi-param lambda form comes
+// FIRST so `join orders (l, r) => ...` parses the lambda as an argument
+// instead of being shadowed by the `atom.field` chain below.
 Argument infers Expr:
-    Atom ({infer AccessExpression.receiver=current} '.' property=ID)+
+    {infer Lambda} '(' params+=ID (',' params+=ID)+ ')' '=>' body=Expression
+    | Atom ({infer AccessExpression.receiver=current} '.' property=ID)+
     | {infer NumberLiteral} value=NUMBER
     | {infer StringLiteral} value=STRING
     | {infer BooleanLiteral} value=('true' | 'false')
     | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
     | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
-    // single-param lambda: `u => ...`; multi-param requires parens: `(l, r) => ...`
     | {infer Lambda} param=ID '=>' body=Expression
-    | {infer Lambda} '(' params+=ID (',' params+=ID)+ ')' '=>' body=Expression
     | '(' Expression ')';
 
 Atom infers Expr:
@@ -112,8 +118,11 @@ Atom infers Expr:
     | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
     | {infer Lambda} param=ID '=>' body=Expression
     | {infer Lambda} '(' params+=ID (',' params+=ID)+ ')' '=>' body=Expression
-    | {infer Identifier} name=ID
+    | Identifier
     | '(' Expression ')';
+
+Identifier infers Expr:
+    {infer Identifier} name=ID;
 
 MapEntry:
     key=ID '=' value=Expression;
