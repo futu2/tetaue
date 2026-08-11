@@ -1,8 +1,12 @@
-# tetaue — the classic "adults" query, teta-README style.
+# tetaue — the classic "adults" query, written with the optics core.
 #
 # A module is a list of bindings; the LAST binding is the module's query.
 # Bindings need no terminator — `table "users" { ... }` is table applied to
 # two arguments, and the next binding starts right after the closing brace.
+#
+# The optics keep the single-focus steps lambda-free:
+#   mapped <<< name %~ upper            — transform a column across rows
+# Predicates and ordering keep their row lambda (as in Haskell's `filtered`).
 
 users = table "users" {
     id = int,
@@ -12,7 +16,7 @@ users = table "users" {
 }
 
 adults = users
-    & filter (u => u.active && u.age >= 18)
-    & map (u => { id = u.id, name = u.name })
+    & filtered (u => u.active && u ^. age >= 18)
+    & mapped <<< name %~ upper
     & sort (u => [asc u.name])
     & take 10

@@ -33,6 +33,8 @@ Expression:
     BinaryExpression;
 
 // Operator precedence, tightest first:
+//   >>> <<<  (optic/function composition, PureScript-style, right-assoc)
+//   ^. %~ .~  (lens operators — view / over / set, Haskell optics style)
 //   * / %   (multiplicative)
 //   + -     (additive)
 //   == != < <= > >=  (comparison, non-chained)
@@ -40,8 +42,28 @@ Expression:
 //   ||      (or)
 //   &       (pipeline: `a & f` ⇔ `f a`, left-assoc — Haskell-style)
 //   $       (application: `f $ a` ⇔ `f a`, right-assoc — Haskell-style)
+//
+// Lens operators follow the lens library:
+//   s ^. l      view — `s ^. field` ⇔ `view field s`
+//   l %~ f      over — `s & l %~ f`  ⇔ `over l f s`
+//   l .~ v      set  — `s & l .~ v`   ⇔ `set  l v s`
+// They bind tighter than arithmetic, like `^.` = infixl 8 in Haskell.
+//
+// Composition follows PureScript (`Control.Semigroupoid`): `<<<` is compose
+// (right-to-left, like Haskell `.` — the LEFT optic is the outer focus) and
+// `>>>` is its flip. `.` is reserved for record field access, so optic
+// composition is always written explicitly:
+//   mapped <<< name            ≡ mapped . name  (focus name inside rows)
+//   field "addr" <<< city      ≡ field "addr" . city
 infix BinaryExpression on UnaryExpression:
-    '*' | '/' | '%'
+    right assoc '>>>' | '<<<'
+    > '^.'
+    // `^.` binds tighter than `%~`/`.~`, like Haskell (`^.` = infixl 8,
+    // `%~`/`.~` = infixr 4 — we declare them left-assoc, which is equivalent
+    // in practice since the right operand is a transformer/value, not an
+    // optic): `u & l .~ v ^. m` is `u & (l .~ (v ^. m))`.
+    > '%~' | '.~'
+    > '*' | '/' | '%'
     > '+' | '-'
     > '==' | '!=' | '<' | '<=' | '>' | '>='
     > '&&'

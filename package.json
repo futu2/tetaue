@@ -19,7 +19,7 @@
     "check": "tsc --noEmit",
     "test": "bun test",
     "render": "bun run src/cli.ts render",
-    "check:examples": "bun run src/cli.ts check examples/adults.tetaue && bun run src/cli.ts check examples/orders.tetaue && bun run src/cli.ts check examples/strings.tetaue && bun run src/cli.ts check examples/report.tetaue"
+    "check:examples": "bun run src/cli.ts check examples/adults.tetaue && bun run src/cli.ts check examples/orders.tetaue && bun run src/cli.ts check examples/strings.tetaue && bun run src/cli.ts check examples/report.tetaue && bun run src/cli.ts check examples/optics.tetaue"
   },
   "dependencies": {
     "langium": "~4.3.1"

@@ -1,4 +1,10 @@
-# String and null handling, NULL-agnostic predicates.
+# String and null handling, in the optics style.
+#
+# `mapped <<< email %~ lower` is `over` the composed optic `mapped <<< email`:
+# for every row, view the `email` lens, apply lower, set it back — one column
+# transformed while the other columns pass through.
+#
+# `== null` renders as IS NULL; `!= null` renders as IS NOT NULL.
 
 users = table "users" {
     id = int,
@@ -7,10 +13,10 @@ users = table "users" {
     last_seen = timestamp,
 }
 
-# `== null` renders as IS NULL; `!= null` renders as IS NOT NULL.
 active = users
-    & filter (u => u.email != null && u.nickname == null)
-    & map (u => {
+    & filtered (u => u.email != null && u.nickname == null)
+    & mapped <<< email %~ lower
+    & mapped %~ (u => {
         id = u.id,
         contact = coalesce u.nickname u.email,
         email_upper = upper u.email,

@@ -3,10 +3,10 @@
 
 import "tables.tetaue"
 
-adults = users & filter (u => u.active && u.age >= 18)
+adults = users & filtered (u => u.active && u ^. age >= 18)
 
 report = adults
-    & map (u => { uid = u.id, name = u.name })
+    & mapped %~ (u => { uid = u.id, name = u.name })
     & join { right = orders,
         on = (u, o) => u.uid == o.user_id,
         kind = "inner",

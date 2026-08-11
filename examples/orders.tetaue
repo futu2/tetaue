@@ -1,7 +1,8 @@
-# Aggregation with fold and a join, teta-style.
+# Aggregation with fold and a join, in the optics style.
 #
 # fold is the aggregate projection: every entry is either group (a GROUP BY
-# key) or an aggregate (count, sum, avg, min, max).
+# key) or an aggregate (count, sum, avg, min, max). `filtered` selects rows
+# before the join; `mapped %~` projects a record per row.
 
 users = table "users" {
     id = int,
@@ -15,11 +16,13 @@ orders = table "orders" {
     status = string,
 }
 
+paid = orders & filtered (o => o.status == "paid")
+
 # Rename the colliding "id" column on the left side before joining:
-user_rows = users & map (u => { uid = u.id, name = u.name })
+user_rows = users & mapped %~ (u => { uid = u.id, name = u.name })
 
 by_user = user_rows
-    & join { right = orders,
+    & join { right = paid,
         on = (u, o) => u.uid == o.user_id,
         kind = "inner",
     }

@@ -1,0 +1,55 @@
+# The optics core — Haskell lens/optics style, PureScript composition.
+#
+# An optic focuses on part of a value. The three fundamental operations are
+#   view — read the focus:   s ^. l          (⇔ view l s)
+#   over — transform it:     s & l %~ f      (⇔ over l f s)
+#   set  — replace it:       s & l .~ v      (⇔ set  l v s)
+# and `&` is the pipeline, exactly like lens' `&`.
+#
+# Composition is explicit (PureScript operators), so `.` stays purely field
+# access on records:
+#   l1 <<< l2    compose — the LEFT optic is the outer focus (like Haskell `.`)
+#   l1 >>> l2    composeFlipped — the RIGHT optic is the outer focus
+# `mapped <<< name` reads "the name field inside the rows traversal".
+
+users = table "users" {
+    id = int,
+    name = string,
+    age = int,
+    active = bool,
+}
+
+# --- first-class indexed lenses -------------------------------------------
+# A field lens is an INDEXED lens: the index is the field name (like lens's
+# `ix` over a Map). `ix "name"` (alias `field "name"`) is a lens VALUE: bind
+# it, pass it around, compose it. Like Haskell's makeLenses, a bound lens is
+# used by name:
+#   u ^. nickname        views it
+#   mapped <<< nickname  composes it under the rows traversal
+nickname = ix "name"
+
+# --- setter reuse ---------------------------------------------------------
+# `name %~ upper` is a SETTER: a function record -> record. Setters are
+# first-class, so bind and reuse them; `&` applies them.
+loud = nickname %~ upper
+
+# --- put it together ------------------------------------------------------
+adults = users
+    & filtered (u => u.active && u ^. age >= 18)   # selection optic
+    & loud                                          # reused setter
+    & mapped %~ (u => { id = u.id, name = u.name }) # over the rows traversal
+    & sort (u => [asc u.name])
+    & take 10
+
+# `mapped <<< name %~ upper` applies the setter across every row in one step
+# (it renders as SELECT "id", UPPER("name") AS "name", ...).
+upper_names = users & mapped <<< name %~ upper
+
+# --- at: the total map lens -------------------------------------------------
+# `at "key"` is lens's fundamental map lens: the focus is the value or `none`
+# (absence, distinct from SQL null), so it can set, add, remove and rename:
+anon = users & at "name" .~ "anon" & take 5       # set a column
+no_names = users & at "name" .~ none & take 5     # remove it (SELECT ...)
+renamed = users & mapped %~ (u =>
+    u & at "user_name" .~ u ^. at "name"          # add a renamed copy
+      & at "name" .~ none)                        # drop the old key

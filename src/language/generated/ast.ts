@@ -20,6 +20,7 @@ export type TetaueKeywordNames =
     | "!="
     | "$"
     | "%"
+    | "%~"
     | "&"
     | "&&"
     | "("
@@ -29,16 +30,20 @@ export type TetaueKeywordNames =
     | ","
     | "-"
     | "."
+    | ".~"
     | "/"
     | "<"
+    | "<<<"
     | "<="
     | "="
     | "=="
     | "=>"
     | ">"
     | ">="
+    | ">>>"
     | "["
     | "]"
+    | "^."
     | "false"
     | "import"
     | "null"
@@ -87,7 +92,7 @@ export interface BinaryExpression extends langium.AstNode {
     readonly $container: AccessExpression | Application | BinaryExpression | Binding | Lambda | ListLiteral | MapEntry | UnaryMinus;
     readonly $type: 'BinaryExpression';
     left: UnaryExpression;
-    operator: '!=' | '$' | '%' | '&&' | '&' | '*' | '+' | '-' | '/' | '<' | '<=' | '==' | '>' | '>=' | '||';
+    operator: '!=' | '$' | '%' | '%~' | '&&' | '&' | '*' | '+' | '-' | '.~' | '/' | '<' | '<<<' | '<=' | '==' | '>' | '>=' | '>>>' | '^.' | '||';
     right: UnaryExpression;
 }
 
