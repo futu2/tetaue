@@ -7,7 +7,7 @@ adults = users & filtered (u => u.active && u ^. age >= 18)
 
 report = adults
     & mapped %~ (u => { uid = u.id, name = u.name })
-    & join orders (u, o) => u.uid == o.user_id "inner"
+    & join orders ($1.uid == $2.user_id) "inner"
     & fold (r => {
         user_id = group r.user_id,
         name = group r.name,

@@ -373,3 +373,119 @@ describe('composable joins (review change)', () => {
         expect(sql).not.toContain('orders_1');
     });
 });
+
+describe('implicit lambda parameters ($n)', () => {
+    const USERS = `users = table "users" { id = int, name = string, age = int, active = bool }`;
+
+    test('($1 + 3) is a one-parameter lambda', () => {
+        const sql = render(`
+            ${USERS}
+            q = users & map ({ x = $1.age + 3 })
+        `);
+        expect(sql).toContain('SELECT "age" + 3 AS "x"');
+    });
+
+    test('filter with $1', () => {
+        const sql = render(`
+            ${USERS}
+            q = users & filter ($1.active && $1.age >= 18)
+        `);
+        expect(sql).toContain('WHERE ("active" AND "age" >= 18)');
+    });
+
+    test('map projection with $1', () => {
+        const sql = render(`
+            ${USERS}
+            q = users & map ({ uid = $1.id, name = $1.name })
+        `);
+        expect(sql).toContain('SELECT "id" AS "uid", "name"');
+    });
+
+    test('mapped %~ with $1', () => {
+        const sql = render(`
+            ${USERS}
+            q = users & mapped %~ ({ uid = $1.id })
+        `);
+        expect(sql).toContain('SELECT "id" AS "uid"');
+    });
+
+    test('sort with $1', () => {
+        const sql = render(`
+            users = table "users" { id = int, age = int }
+            q = users & sort ([desc $1.age])
+        `);
+        expect(sql).toContain('ORDER BY "age" DESC');
+    });
+
+    test('fold with $1', () => {
+        const sql = render(`
+            orders = table "orders" { user_id = int, total = int }
+            q = orders & fold ({ uid = group $1.user_id, t = sum $1.total })
+        `);
+        expect(sql).toContain('SELECT "user_id" AS "uid", SUM("total") AS "t"');
+        expect(sql).toContain('GROUP BY "user_id"');
+    });
+
+    test('($1 + $2) is a two-parameter lambda — join on', () => {
+        const sql = render(`
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int, total = float }
+            q = users & join orders ($1.id == $2.user_id) "inner"
+        `);
+        expect(sql).toContain('INNER JOIN "orders" ON "users"."id" = "orders"."user_id"');
+    });
+
+    test('join kind still applies with $n', () => {
+        const sql = render(`
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            q = users & join orders ($1.id == $2.user_id) "left"
+        `);
+        expect(sql).toContain('LEFT JOIN "orders" ON "users"."id" = "orders"."user_id"');
+    });
+
+    test('$n bound by the enclosing lambda resolves inside nested calls', () => {
+        const sql = render(`
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int, status = string }
+            q = users & join orders ($1.id == $2.user_id && is_in $2.status ["paid", "sent"]) "inner"
+        `);
+        expect(sql).toContain('INNER JOIN "orders" ON "users"."id" = "orders"."user_id" AND "orders"."status" IN (\'paid\', \'sent\')');
+    });
+
+    test('$n works through the $ application operator', () => {
+        const sql = render(`
+            ${USERS}
+            q = users & (filter $ ($1.age >= 18))
+        `);
+        expect(sql).toContain('WHERE ("age" >= 18)');
+    });
+
+    test('a step with $n can be bound and reused', () => {
+        const sql = render(`
+            ${USERS}
+            adults = filter ($1.active && $1.age >= 18)
+            q = users & adults & map ({ uid = $1.id })
+        `);
+        expect(sql).toContain('WHERE ("active" AND "age" >= 18)');
+        expect(sql).toContain('SELECT "id" AS "uid"');
+    });
+
+    test('$n and explicit lambdas coexist', () => {
+        const sql = render(`
+            ${USERS}
+            q = users
+                & filter (u => u.active)
+                & map ({ id = $1.id, name = upper $1.name })
+        `);
+        expect(sql).toContain('WHERE ("active")');
+        expect(sql).toContain('SELECT "id", UPPER("name") AS "name"');
+    });
+
+    test('unary minus works in lambda bodies (explicit and $n)', () => {
+        const src1 = 'users = table "users" { id = int, age = int }\nq = users & map ({ a = -$1.age })';
+        expect(render(src1)).toContain('0 - "age" AS "a"');
+        const src2 = 'users = table "users" { id = int, age = int }\nq = users & map (u => { b = -u.age })';
+        expect(render(src2)).toContain('0 - "age" AS "b"');
+    });
+});

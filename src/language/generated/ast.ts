@@ -12,6 +12,7 @@ export const TetaueTerminals = {
     ID: /[_a-zA-Z][\w_]*/,
     NUMBER: /[0-9]+(\.[0-9]*)?/,
     STRING: /"(\\.|[^"\\])*"/,
+    LAMBDA_PARAM: /\$[0-9]+/,
 };
 
 export type TetaueTerminalNames = keyof typeof TetaueTerminals;
@@ -139,7 +140,7 @@ export function isBooleanLiteral(item: unknown): item is BooleanLiteral {
     return reflection.isInstance(item, BooleanLiteral.$type);
 }
 
-export type Expr = AccessExpression | Application | BooleanLiteral | Expression | Identifier | Lambda | ListLiteral | MapLiteral | NullLiteral | NumberLiteral | StringLiteral;
+export type Expr = AccessExpression | Application | BooleanLiteral | Expression | Identifier | Lambda | LambdaParam | ListLiteral | MapLiteral | NullLiteral | NumberLiteral | StringLiteral;
 
 export const Expr = {
     $type: 'Expr'
@@ -206,6 +207,21 @@ export const Lambda = {
 
 export function isLambda(item: unknown): item is Lambda {
     return reflection.isInstance(item, Lambda.$type);
+}
+
+export interface LambdaParam extends langium.AstNode {
+    readonly $container: AccessExpression | Application | BinaryExpression | UnaryMinus;
+    readonly $type: 'LambdaParam';
+    value: string;
+}
+
+export const LambdaParam = {
+    $type: 'LambdaParam',
+    value: 'value'
+} as const;
+
+export function isLambdaParam(item: unknown): item is LambdaParam {
+    return reflection.isInstance(item, LambdaParam.$type);
 }
 
 export interface ListLiteral extends langium.AstNode {
@@ -350,6 +366,7 @@ export type TetaueAstType = {
     Identifier: Identifier
     Import: Import
     Lambda: Lambda
+    LambdaParam: LambdaParam
     ListLiteral: ListLiteral
     MapEntry: MapEntry
     MapLiteral: MapLiteral
@@ -469,6 +486,15 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                     name: Lambda.params,
                     defaultValue: [],
                     optional: true
+                }
+            },
+            superTypes: [Expr.$type]
+        },
+        LambdaParam: {
+            name: LambdaParam.$type,
+            properties: {
+                value: {
+                    name: LambdaParam.value
                 }
             },
             superTypes: [Expr.$type]

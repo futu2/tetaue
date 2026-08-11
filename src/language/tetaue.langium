@@ -5,6 +5,8 @@
  *   - `#` line comments, multi-file modules via `import "path.tetaue"`
  *   - `{ field = value, ... }` maps (table schemas, projections)
  *   - `a => a` lambdas, `(l, r) => ...` multi-param lambdas
+ *   - implicit lambdas: a parenthesized expression using $n parameters,
+ *     `($1 + 3)` ≡ `u => u + 3`, `($1 + $2)` ≡ `(u, v) => u + v`
  *   - builtins live in a prelude of plain identifiers (table, filter, ...)
  * Operators follow Haskell: `&` is the pipeline (`a & f` ⇔ `f a`), `$` is
  * right-associative application (`f $ a` ⇔ `f a`).
@@ -119,6 +121,7 @@ Atom infers Expr:
     | {infer Lambda} param=ID '=>' body=Expression
     | {infer Lambda} '(' params+=ID (',' params+=ID)+ ')' '=>' body=Expression
     | Identifier
+    | {infer LambdaParam} value=LAMBDA_PARAM
     | '(' Expression ')';
 
 Identifier infers Expr:
@@ -133,3 +136,6 @@ hidden terminal COMMENT: /#[^\r\n]*/;
 terminal ID: /[_a-zA-Z][\w_]*/;
 terminal NUMBER returns number: /[0-9]+(\.[0-9]*)?/;
 terminal STRING: /"(\\.|[^"\\])*"/;
+// Implicit lambda parameters: `$1` is the first parameter, `$2` the second, ...
+// (longest match keeps `$` as the application operator and `$1` as a parameter).
+terminal LAMBDA_PARAM: /\$[0-9]+/;

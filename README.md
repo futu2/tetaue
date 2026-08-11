@@ -94,7 +94,7 @@ import "tables.tetaue"
 adults = users & filter (u => u.active && u.age >= 18)
 
 report = adults
-    & join orders (u, o) => u.id == o.user_id "inner"
+    & join orders ($1.id == $2.user_id) "inner"
     & fold (r => { user_id = group r.user_id, order_count = count r.id })
 ```
 
@@ -115,6 +115,7 @@ true  false   # bool
 null          # SQL NULL
 [1, 2, 3]     # list (IN lists, sort items)
 { a = 1 }     # record (schemas, projections)
+$1, $2        # implicit lambda parameters: ($1 + 3) ≡ u => u + 3
 ```
 
 ### Optics (the core abstraction)
@@ -171,7 +172,7 @@ and checked statically against every operation.
 | `take n` | LIMIT | `LIMIT n` |
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
 | `fold (o => { k = group o.k, s = sum o.v })` | aggregation | `SELECT ... GROUP BY ...` |
-| `join table (l, r) => ... "inner"` | join | `... JOIN ... ON ...` |
+| `join table ($1.id == $2.user_id) "inner"` | join | `... JOIN ... ON ...` |
 
 Everything is curried: `filtered (u => ...)` is a *step* value; applying it to a query
 (`users & filtered (u => ...)`) builds a new query. Steps are first-class values, so you
@@ -181,7 +182,7 @@ subqueries), never a table name.
 
 ```
 paid_orders = orders & filtered (o => o.status == "paid")
-q = users & join paid_orders (u, o) => u.id == o.user_id "inner"
+q = users & join paid_orders ($1.id == $2.user_id) "inner"
 ```
 
 ```
@@ -212,10 +213,21 @@ Application binds tightest: `upper u.name` is `upper (u.name)`.
 
 ### Lambdas
 
-- one parameter: `u => u.age >= 18` (parens optional when used as an application arg:
-  `filter u => u.active` also works)
-- two parameters (joins): `(l, r) => l.id == r.user_id` — parens required, at least two
-  params
+Lambdas abstract over a row. Two ways to write them:
+
+- **Implicit (`$n`)** — a parenthesized expression using `$1`, `$2`, ... is a lambda
+  whose parameters are the row bindings in order: `($1 + 3)` ≡ `u => u + 3`,
+  `($1 + $2)` ≡ `(u, v) => u + v`. The highest `$n` used sets the arity:
+  ```
+  filter ($1.active && $1.age >= 18)          # ≡ filter (u => u.active && u.age >= 18)
+  map ({ id = $1.id, name = $1.name })
+  join orders ($1.id == $2.user_id) "inner"   # two params: left row, right row
+  ```
+- **Explicit** — `u => u.age >= 18` (one parameter) or `(l, r) => l.id == r.user_id`
+  (two parameters, parens required). `$n` is not available inside an explicit body.
+
+Either form binds a step the same way: `adults = filter ($1.active)` is a step
+value, so `users & adults` works.
 
 ### Column references
 

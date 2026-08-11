@@ -137,6 +137,31 @@ describe('semantic errors', () => {
         expect(sql).toContain('INNER JOIN (SELECT * FROM "orders" WHERE ("status" = \'paid\')) AS "orders" ON "users"."id" = "orders"."user_id"');
     });
 
+    test('join on with a one-parameter $n expression is rejected', () => {
+        const messages = errors(`
+            users = table "users" { id = int }
+            orders = table "orders" { user_id = int }
+            q = users & join orders ($1.id == 3) "inner"
+        `);
+        expect(messages.join('\n')).toContain("join 'on' must be a two-parameter lambda");
+    });
+
+    test('$n inside an explicit lambda body is an error', () => {
+        const messages = errors(`
+            users = table "users" { id = int }
+            q = users & filter (u => $1.active)
+        `);
+        expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");
+    });
+
+    test('unbound $n at the top level is an error', () => {
+        const messages = errors(`
+            users = table "users" { id = int }
+            q = $1 + 3
+        `);
+        expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");
+    });
+
     test('not requires boolean', () => {
         expect(errors(`${USERS}\nq = users & filter (u => not u.age)`).join('\n')).toContain('not expects a boolean expression');
     });

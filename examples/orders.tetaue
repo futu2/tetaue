@@ -22,7 +22,7 @@ paid = orders & filtered (o => o.status == "paid")
 user_rows = users & mapped %~ (u => { uid = u.id, name = u.name })
 
 by_user = user_rows
-    & join paid (u, o) => u.uid == o.user_id "inner"
+    & join paid ($1.uid == $2.user_id) "inner"
     & fold (o => {
         user_id = group o.user_id,
         name = group o.name,

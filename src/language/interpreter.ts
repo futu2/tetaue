@@ -7,9 +7,10 @@
  * the CLI renderer (producing a Query value to render to SQL).
  ******************************************************************************/
 import type { AstNode } from 'langium';
+import { AstUtils } from 'langium';
 import {
     isAccessExpression, isApplication, isBinaryExpression, isBooleanLiteral,
-    isIdentifier, isLambda, isListLiteral, isMapLiteral,
+    isIdentifier, isLambda, isLambdaParam, isListLiteral, isMapLiteral,
     isNullLiteral, isNumberLiteral, isStringLiteral, isUnaryMinus,
     type Binding, type Expr, type Lambda, type Model, type UnaryExpression,
 } from './generated/ast.js';
@@ -840,7 +841,52 @@ function access(recv: Value, prop: string, at: AstNode, ctx: Ctx): Value {
     return ERROR;
 }
 
+// ---------------------------------------------------------------------------
+// $n implicit lambda parameters
+// ---------------------------------------------------------------------------
+
+/**
+ * Highest $n index in `node` that is NOT bound in `env` and not hidden inside
+ * an explicit lambda body (explicit lambdas are their own scope).
+ */
+function dollarArity(node: AstNode, env: Map<string, Value>): number {
+    let arity = 0;
+    for (const n of AstUtils.streamAst(node)) {
+        if (!isLambdaParam(n) || env.has(n.value)) continue;
+        let cur: AstNode | undefined = n;
+        let hidden = false;
+        while (cur) {
+            const parent: AstNode | undefined = cur.$container;
+            if (!parent) break;
+            if (isLambda(parent) && parent.body === cur) { hidden = true; break; }
+            cur = parent;
+        }
+        if (!hidden) arity = Math.max(arity, Number(n.value.slice(1)));
+    }
+    return arity;
+}
+
+/**
+ * Evaluate an expression as a value, but if it uses $n parameters that are not
+ * bound in the current environment, abstract it into an implicit lambda:
+ *   ($1 + 3)   ≡   u => u + 3
+ *   ($1 + $2)  ≡   (u, v) => u + v
+ * Lambda bodies are parenthesized, e.g. `filter ($1.active)`,
+ * `join orders ($1.id == $2.user_id) "inner"`.
+ */
+function evalArg(expr: Expr, ctx: Ctx): Value {
+    const arity = dollarArity(expr, ctx.env);
+    if (arity > 0) return dollarLambda(expr, arity, ctx);
+    return evalUnary(expr as UnaryExpression, ctx);
+}
+
+function dollarLambda(body: Expr, arity: number, ctx: Ctx): Value {
+    const params = Array.from({ length: arity }, (_, i) => `$${i + 1}`);
+    return { kind: 'lambda', params, body, closure: new Map(ctx.env), ast: body };
+}
+
 export function evalExpr(e: Expr, ctx: Ctx): Value {
+    if (isUnaryMinus(e)) return evalUnary(e, ctx);
     if (isBinaryExpression(e)) {
         if (e.operator === '&') {
             // pipeline: `left & right` ⇔ apply right to left
@@ -851,7 +897,7 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         if (e.operator === '$') {
             // application: `left $ right` ⇔ apply left to right (right-assoc)
             const left = evalUnary(e.left, ctx);
-            const right = evalUnary(e.right, ctx);
+            const right = evalArg(e.right as Expr, ctx);
             return apply(left, right, e, ctx);
         }
         if (e.operator === '>>>' || e.operator === '<<<') {
@@ -877,7 +923,7 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
             const lens = evalOpticPath(e.left, ctx);
             if (isError(lens)) return ERROR;
             if (lens.kind !== 'optic') return ERROR; // evalOpticPath guarantees an optic
-            const right = evalUnary(e.right, ctx);
+            const right = evalArg(e.right as Expr, ctx);
             if (isError(right)) return ERROR;
             if (e.operator === '%~' && right.kind !== 'fn' && right.kind !== 'lambda') {
                 ctx.diagnostics.push({ node: e, message: `'%~' expects a function — to set a constant use '.~', to remove a key use at "key" .~ none` });
@@ -899,10 +945,10 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         let f = evalExpr(e.func, ctx);
         for (const argExpr of e.arguments) {
             if (isError(f)) {
-                evalExpr(argExpr, ctx); // keep collecting diagnostics
+                evalArg(argExpr, ctx); // keep collecting diagnostics
                 continue;
             }
-            const arg = evalExpr(argExpr, ctx);
+            const arg = evalArg(argExpr, ctx);
             f = apply(f, arg, argExpr, ctx);
         }
         return f;
@@ -950,6 +996,12 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         }
         const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k));
         ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
+        return ERROR;
+    }
+    if (isLambdaParam(e)) {
+        const v = ctx.env.get(e.value);
+        if (v) return v;
+        ctx.diagnostics.push({ node: e, message: `unknown lambda parameter '${e.value}' — $n refers to the implicit parameters of the enclosing lambda, e.g. filter ($1.active)` });
         return ERROR;
     }
     ctx.diagnostics.push({ node: e, message: 'unexpected expression' });
