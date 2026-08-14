@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach artifacts to (e.g. v0.1.0). Required for manual runs.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install root dependencies
+        run: bun install
+
+      - name: Install extension dependencies
+        run: bun install
+        working-directory: extension
+
+      - name: Build VSIX
+        run: bun run package:extension
+
+      - name: Build standalone executables
+        run: bun run build:standalone:all
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ]; then
+            echo "::error::No release tag: push a v* tag, or provide the 'tag' input for manual runs."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            extension/tetaue-vscode-*.vsix
+            dist/tetaue-linux-x64
+            dist/tetaue-linux-arm64
+            dist/tetaue-darwin-x64
+            dist/tetaue-darwin-arm64
+            dist/tetaue-windows-x64.exe
+          generate_release_notes: true
