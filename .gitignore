@@ -3,3 +3,8 @@ dist/
 out/
 *.log
 .DS_Store
+.reasonix/
+extension/node_modules/
+extension/out/
+extension/server/
+extension/*.vsix

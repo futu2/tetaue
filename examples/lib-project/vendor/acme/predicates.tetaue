@@ -1,0 +1,4 @@
+# acme predicates — row-polymorphic helpers (no dependencies).
+
+# adult: forall r. { age: int | r } -> bool
+export adult = u => u.age >= 18

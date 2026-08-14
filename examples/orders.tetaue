@@ -1,32 +1,48 @@
-# Aggregation with fold and a join, in the optics style.
+# Aggregation with fold and a join.
 #
 # fold is the aggregate projection: every entry is either group (a GROUP BY
-# key) or an aggregate (count, sum, avg, min, max). `filtered` selects rows
-# before the join; `mapped %~` projects a record per row.
+# key) or an aggregate (count, sum, avg, min, max). `filter` selects rows
+# before the join; `join` merges two tables.
+#
+# join takes four positional arguments: the join kind (inner, left, right or
+# full — a bare identifier), the right-hand query, and the two-argument
+# (curried) `on` and `merger` functions that project the result row:
+#   join inner paid (l => r => l.id == r.user_id) (l => r => { user_id = r.user_id, ... })
+# The merger replaces the old disjoint-union of both rows: the result row is
+# exactly what it projects, so colliding column names are fine.
+#
+# Numbers are strict: `total: float` means comparisons and arithmetic need
+# float literals (`o.total >= 100.0`, never `100`). Annotations can also be
+# written on lambda parameters: `(o: { status: string | r }) => ...` checks
+# the body against the signature, and the tail `r` absorbs the other columns
+# when the step is applied.
 
-users = table "users" {
-    id = int,
-    name = string,
-}
+users: query {
+    id: int,
+    name: string,
+} = table "users"
 
-orders = table "orders" {
-    id = int,
-    user_id = int,
-    total = float,
-    status = string,
-}
+orders: query {
+    id: int,
+    user_id: int,
+    total: float,
+    status: string,
+} = table "orders"
 
-paid = orders & filtered (o => o.status == "paid")
+# An annotated lambda parameter: the row has at least `status: string`.
+paid = orders & filter (o: {status: string | r }) => o.status == "paid"
 
-# Rename the colliding "id" column on the left side before joining:
-user_rows = users & mapped %~ (u => { uid = u.id, name = u.name })
-
-by_user = user_rows
-    & join paid ($1.uid == $2.user_id) "inner"
+by_user = users
+    & join inner paid (l => r => l.id == r.user_id) (l => r => {
+        user_id = r.user_id,
+        name = l.name,
+        order_id = r.id,
+        total = r.total,
+    })
     & fold (o => {
         user_id = group o.user_id,
         name = group o.name,
-        order_count = count o.id,
+        order_count = count o.order_id,
         total_spent = sum o.total,
         avg_order = avg o.total,
     })

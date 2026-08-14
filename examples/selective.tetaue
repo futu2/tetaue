@@ -1,0 +1,18 @@
+# Selective imports — bring exactly the exports you use.
+#
+# `import "x.tetaue" (a, b)` imports ONLY `a` and `b` (they must be
+# exported); every other export stays invisible, so a big lib can't pollute
+# your scope. The list works with namespaced imports too, restricting the
+# namespace to those names: `import "x.tetaue" as t (a)` makes `t.a` valid
+# and `t.<anything else>` an error.
+#
+# Here `tables.tetaue` also exports `orders`, but we never see it — an
+# accidental reference to `orders` would be an "unknown identifier" error.
+
+import "tables.tetaue" (users)
+import "predicates.tetaue" as p (adult)
+
+adults = users
+    & filter (p.adult)          # p.adult is row-polymorphic through the namespace
+    & map (u => { id = u.id, name = u.name })
+    & take 10

@@ -1,15 +1,22 @@
 # Shared table definitions — import this file to get `users` and `orders`.
+#
+# The query type annotation is the schema: `id: int` is a non-null int
+# column; write `id: int?` for a nullable one — see examples/strings.tetaue.
+#
+# Only `export`ed bindings are visible to importers — everything else is
+# module-private. `import "tables.tetaue"` brings the exported bindings into
+# scope; `import "tables.tetaue" as t` reaches them qualified as `t.users`.
 
-users = table "users" {
-    id = int,
-    name = string,
-    age = int,
-    active = bool,
-}
+export users: query {
+    id: int,
+    name: string,
+    age: int,
+    active: bool,
+} = table "users"
 
-orders = table "orders" {
-    id = int,
-    user_id = int,
-    total = float,
-    status = string,
-}
+export orders: query {
+    id: int,
+    user_id: int,
+    total: float,
+    status: string,
+} = table "orders"

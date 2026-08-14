@@ -1,0 +1,8 @@
+# shared — a tiny reusable library (no dependencies of its own).
+#
+# `compact` projects any row that has `id` and `name` down to those two
+# columns. It is row-polymorphic, so it works on any table with those
+# fields — and being exported, the polymorphism survives qualified access.
+
+# compact: forall r. { id: int, name: string | r } -> { id: int, name: string }
+export compact = u => { id = u.id, name = u.name }

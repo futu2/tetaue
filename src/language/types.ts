@@ -1,0 +1,531 @@
+/******************************************************************************
+ * tetaue type system — the internal type representation behind inference.
+ *
+ * Types are Hindley–Milner monotypes extended with:
+ *   - row types `{ a: int, b: string | r }` (record rows with an optional
+ *     row variable tail) — the engine of row polymorphism;
+ *   - Maybe-style nullability `t?` ("a t or NULL"), transparent in
+ *     unification (absorption: t <: t?);
+ *   - the parameterized `query { row }` type for tables/pipelines.
+ *
+ * Variables are kind-flexible (a fresh variable becomes a row variable the
+ * first time it is unified with a row) and live in a mutable binding store
+ * owned by a TypeUniverse — one universe per inference run.
+ *
+ * See docs/design/type-system.md for the full specification.
+ ******************************************************************************/
+
+export type PrimName = 'int' | 'float' | 'string' | 'bool' | 'date' | 'timestamp';
+
+export type Type =
+    | { kind: 'var'; id: number }
+    | { kind: 'prim'; name: PrimName }
+    | { kind: 'nullable'; of: Type }
+    | { kind: 'fun'; from: Type; to: Type }
+    | { kind: 'list'; of: Type }
+    /** A record row: unordered label → type map, plus an optional tail variable. */
+    | { kind: 'row'; fields: Map<string, Type>; tail: Type | null }
+    | { kind: 'query'; row: Type }
+    | { kind: 'order' };
+
+export type VarKind = 'type' | 'row';
+
+export interface VarInfo {
+    /** Kind once pinned by a row/type constraint; 'flex' until then. */
+    kind: 'flex' | 'type' | 'row';
+    /** Rigid (skolemized) variables may never be bound — used to check annotations. */
+    rigid: boolean;
+    /** User-facing name from an annotation, or a generated name for messages. */
+    name: string | null;
+}
+
+export interface Scheme {
+    /** Quantified variables, in order. */
+    vars: { id: number; kind: VarKind; name: string | null }[];
+    type: Type;
+}
+
+/** Raised when two types cannot be unified; carries the resolved operands. */
+export class UnifyError extends Error {
+    a: Type;
+    b: Type;
+    constructor(a: Type, b: Type) {
+        super('cannot unify');
+        this.a = a;
+        this.b = b;
+    }
+}
+
+const PRIM_NAMES: Record<PrimName, string> = {
+    int: 'int', float: 'float', string: 'string', bool: 'bool',
+    date: 'date', timestamp: 'timestamp',
+};
+
+export function prim(name: PrimName): Type {
+    return { kind: 'prim', name };
+}
+
+export function nullable(t: Type): Type {
+    // `?` is idempotent: `t??` is `t?`.
+    return t.kind === 'nullable' ? t : { kind: 'nullable', of: t };
+}
+
+export function fun(from: Type, to: Type): Type {
+    return { kind: 'fun', from, to };
+}
+
+export function listOf(t: Type): Type {
+    return { kind: 'list', of: t };
+}
+
+export function queryOf(row: Type): Type {
+    return { kind: 'query', row };
+}
+
+export function rowOf(fields: [string, Type][], tail: Type | null = null): Type {
+    const map = new Map<string, Type>();
+    for (const [label, type] of fields) map.set(label, type);
+    return { kind: 'row', fields: map, tail };
+}
+
+// ---------------------------------------------------------------------------
+// TypeUniverse — variable store, resolution, unification
+// ---------------------------------------------------------------------------
+
+export class TypeUniverse {
+    private bindings = new Map<number, Type>();
+    private infos = new Map<number, VarInfo>();
+    private nextId = 1;
+    private nextName = 1;
+
+    fresh(kind: 'flex' | 'type' | 'row' = 'flex', name: string | null = null): Type {
+        const id = this.nextId++;
+        this.infos.set(id, { kind, rigid: false, name });
+        return { kind: 'var', id };
+    }
+
+    varInfo(id: number): VarInfo {
+        const info = this.infos.get(id);
+        if (!info) throw new Error(`unknown type variable ${id}`);
+        return info;
+    }
+
+    /** Follow variable bindings to the root type. */
+    resolve(t: Type): Type {
+        let cur = t;
+        while (cur.kind === 'var') {
+            const bound = this.bindings.get(cur.id);
+            if (bound === undefined) return cur;
+            cur = bound;
+        }
+        return cur;
+    }
+
+    /** Resolve, then normalize `?`: strip wrappers around vars that resolve to nullable. */
+    normalize(t: Type): Type {
+        const r = this.resolve(t);
+        if (r.kind === 'nullable') {
+            const inner = this.normalize(r.of);
+            return inner.kind === 'nullable' ? inner : nullable(inner);
+        }
+        if (r.kind === 'var') {
+            const bound = this.bindings.get(r.id);
+            if (bound) return this.normalize(bound);
+        }
+        return r;
+    }
+
+    /** Free (unbound) variable ids reachable from `t`, resolving bindings. */
+    freeVars(t: Type): Set<number> {
+        const out = new Set<number>();
+        const visit = (x: Type): void => {
+            const r = this.resolve(x);
+            switch (r.kind) {
+                case 'var': out.add(r.id); break;
+                case 'nullable': visit(r.of); break;
+                case 'fun': visit(r.from); visit(r.to); break;
+                case 'list': visit(r.of); break;
+                case 'row':
+                    for (const f of r.fields.values()) visit(f);
+                    if (r.tail) visit(r.tail);
+                    break;
+                case 'query': visit(r.row); break;
+                case 'prim': case 'order': break;
+            }
+        };
+        visit(t);
+        return out;
+    }
+
+    /** Bind `varId` to `t`; enforces kind, rigidity, and the occurs check. */
+    bind(varId: number, t: Type): void {
+        if (this.bindings.has(varId)) throw new Error(`type variable ${varId} already bound`);
+        const info = this.infos.get(varId)!;
+        if (info.rigid) {
+            throw new UnifyError({ kind: 'var', id: varId }, t);
+        }
+        const r = this.resolve(t);
+        if (r.kind === 'var' && r.id === varId) return; // self-binding: no-op
+        // Occurs check: the variable must not appear inside `t`.
+        if (this.freeVars(t).has(varId)) {
+            throw new UnifyError({ kind: 'var', id: varId }, t);
+        }
+        if (r.kind === 'var') {
+            // Var-to-var bind: propagate the restrictive (row) kind, and
+            // reject an explicit row-vs-type conflict.
+            const other = this.varInfo(r.id);
+            if (info.kind === 'row' && other.kind === 'type') {
+                throw new UnifyError({ kind: 'var', id: varId }, t);
+            }
+            if (info.kind === 'type' && other.kind === 'row') {
+                throw new UnifyError({ kind: 'var', id: varId }, t);
+            }
+            if (info.kind === 'row') other.kind = 'row';
+            else if (other.kind === 'row') info.kind = 'row';
+        } else {
+            // Kind discipline against concrete types: a row-pinned variable
+            // can only bind to rows, and a type-pinned variable only to
+            // non-rows. First binding pins a flexible variable's kind.
+            if (info.kind === 'flex') {
+                info.kind = r.kind === 'row' ? 'row' : 'type';
+            } else if (info.kind === 'row' && r.kind !== 'row') {
+                throw new UnifyError({ kind: 'var', id: varId }, t);
+            } else if (info.kind === 'type' && r.kind === 'row') {
+                throw new UnifyError({ kind: 'var', id: varId }, t);
+            }
+        }
+        this.bindings.set(varId, t);
+    }
+
+    /** Unify two types (with `?` absorption). Returns the unified type. Throws UnifyError. */
+    unify(a: Type, b: Type): Type {
+        a = this.resolve(a);
+        b = this.resolve(b);
+        if (a === b) return a;
+        if (a.kind === 'var' && b.kind === 'var' && a.id === b.id) return a;
+
+        if (a.kind === 'var') {
+            // `α` vs `α?` is fine: `?` is transparent (occurs check strips it).
+            if (b.kind === 'nullable') {
+                const inner = this.resolve(b.of);
+                if (inner.kind === 'var' && inner.id === a.id) return b;
+            }
+            this.bind(a.id, b);
+            return b;
+        }
+        if (b.kind === 'var') {
+            if (a.kind === 'nullable') {
+                const inner = this.resolve(a.of);
+                if (inner.kind === 'var' && inner.id === b.id) return a;
+            }
+            this.bind(b.id, a);
+            return a;
+        }
+
+        // `?` absorption: strip wrappers, re-unify, re-wrap.
+        const aNull = a.kind === 'nullable' ? a.of : null;
+        const bNull = b.kind === 'nullable' ? b.of : null;
+        if (aNull !== null || bNull !== null) {
+            const inner = this.unify(aNull ?? a, bNull ?? b);
+            return nullable(inner);
+        }
+
+        switch (a.kind) {
+            case 'prim':
+                if (b.kind === 'prim' && a.name === b.name) return a;
+                break;
+            case 'fun':
+                if (b.kind === 'fun') {
+                    this.unify(a.from, b.from);
+                    this.unify(a.to, b.to);
+                    return a;
+                }
+                break;
+            case 'list':
+                if (b.kind === 'list') {
+                    this.unify(a.of, b.of);
+                    return a;
+                }
+                break;
+            case 'query':
+                if (b.kind === 'query') {
+                    this.unifyRow(a.row, b.row);
+                    return a;
+                }
+                break;
+            case 'row':
+                if (b.kind === 'row') {
+                    this.unifyRow(a, b);
+                    return a;
+                }
+                break;
+            case 'order':
+                if (b.kind === 'order') return a;
+                break;
+        }
+        throw new UnifyError(a, b);
+    }
+
+    /** Resolve a row's tail chain, merging fields from materialized tails. */
+    resolveRow(r: Extract<Type, { kind: 'row' }>): { fields: Map<string, Type>; tail: Type | null } {
+        const fields = new Map<string, Type>();
+        for (const [label, type] of r.fields) fields.set(label, type);
+        let tail = r.tail;
+        while (tail) {
+            const rt = this.resolve(tail);
+            if (rt.kind === 'row') {
+                for (const [label, type] of rt.fields) {
+                    if (!fields.has(label)) fields.set(label, type);
+                }
+                tail = rt.tail;
+            } else {
+                break; // unbound tail variable
+            }
+        }
+        return { fields, tail };
+    }
+
+    private rowTailVar(r: { tail: Type | null }): { id: number } | null {
+        if (!r.tail) return null;
+        const t = this.resolve(r.tail);
+        return t.kind === 'var' ? t : null;
+    }
+
+    /**
+     * Absorb a label that exists only on one side into the other side's tail.
+     * The tail may already be materialized (a previous absorption) — recurse.
+     */
+    private absorbExtra(label: string, type: Type, row: { fields: Map<string, Type>; tail: Type | null }): void {
+        if (!row.tail) {
+            throw new UnifyError(rowOf([...row.fields]), rowOf([[label, type]]));
+        }
+        const t = this.resolve(row.tail);
+        if (t.kind === 'row') {
+            this.absorbExtra(label, type, t);
+            return;
+        }
+        if (t.kind !== 'var') {
+            throw new UnifyError(rowOf([...row.fields]), rowOf([[label, type]]));
+        }
+        const fresh = this.fresh('row');
+        this.bind(t.id, { kind: 'row', fields: new Map([[label, type]]), tail: fresh });
+    }
+
+    /** Unify two rows (or row variables). Shared labels unify; extras move into open tails. */
+    unifyRow(a: Type, b: Type): void {
+        a = this.resolve(a);
+        b = this.resolve(b);
+        if (a.kind === 'var' && b.kind === 'var') {
+            if (a.id !== b.id) this.bind(a.id, b);
+            return;
+        }
+        if (a.kind === 'var') {
+            if (b.kind !== 'row') throw new UnifyError(a, b);
+            this.bind(a.id, b);
+            return;
+        }
+        if (b.kind === 'var') {
+            if (a.kind !== 'row') throw new UnifyError(a, b);
+            this.bind(b.id, a);
+            return;
+        }
+        if (a.kind !== 'row' || b.kind !== 'row') throw new UnifyError(a, b);
+
+        const r1 = this.resolveRow(a);
+        const r2 = this.resolveRow(b);
+        const labels = new Set<string>([...r1.fields.keys(), ...r2.fields.keys()]);
+        for (const label of labels) {
+            const f1 = r1.fields.get(label);
+            const f2 = r2.fields.get(label);
+            if (f1 && f2) {
+                this.unify(f1, f2);
+            } else if (f1) {
+                this.absorbExtra(label, f1, r2);
+            } else {
+                this.absorbExtra(label, f2!, r1);
+            }
+        }
+        // Tail closure: after absorption, deep-resolve both rows. The tails are
+        // now unbound variables (or nothing) — no recursion needed.
+        const rr1 = this.resolveRow(a);
+        const rr2 = this.resolveRow(b);
+        const t1 = rr1.tail ? this.resolve(rr1.tail) : null;
+        const t2 = rr2.tail ? this.resolve(rr2.tail) : null;
+        const empty = { kind: 'row', fields: new Map<string, Type>(), tail: null } as Type;
+        if (t1 && t2) {
+            if (t1.kind === 'var' && t2.kind === 'var') this.unify(t1, t2);
+            else if (t1.kind === 'row' && t2.kind === 'row') this.unifyRow(t1, t2);
+            else throw new UnifyError(a, b);
+        } else if (t1) {
+            if (t1.kind === 'row') this.unifyRow(t1, empty);
+            // Sealing a rigid tail with an empty row adds no information — it
+            // just closes the row (annotation narrowing); leave it free.
+            else if (t1.kind === 'var' && !this.varInfo(t1.id).rigid) this.bind(t1.id, empty);
+        } else if (t2) {
+            if (t2.kind === 'row') this.unifyRow(t2, empty);
+            else if (t2.kind === 'var' && !this.varInfo(t2.id).rigid) this.bind(t2.id, empty);
+        }
+    }
+
+    /** Field type of a (possibly open) row for `e.l`; null if the row is closed without `l`. */
+    fieldOf(row: Type, label: string): { type: Type; open: boolean } | null {
+        const r = this.resolve(row);
+        if (r.kind === 'var') {
+            // An unconstrained variable becomes an open row with the field.
+            const fieldType = this.fresh('flex');
+            const tail = this.fresh('row');
+            this.bind(r.id, { kind: 'row', fields: new Map([[label, fieldType]]), tail });
+            return { type: fieldType, open: true };
+        }
+        if (r.kind !== 'row') return null;
+        const resolved = this.resolveRow(r);
+        const f = resolved.fields.get(label);
+        if (f) return { type: f, open: true };
+        if (resolved.tail) {
+            // Open row: extend the tail with the fresh field. The returned
+            // type must BE the type stored in the row, so later constraints
+            // (e.g. a comparison) propagate into the row.
+            const tailVar = this.rowTailVar(resolved);
+            if (tailVar) {
+                const fieldType = this.fresh('flex');
+                const fresh = this.fresh('row');
+                this.bind(tailVar.id, { kind: 'row', fields: new Map([[label, fieldType]]), tail: fresh });
+                return { type: fieldType, open: true };
+            }
+            return { type: this.fresh('flex'), open: true };
+        }
+        return null;
+    }
+
+    // -----------------------------------------------------------------------
+    // Schemes
+    // -----------------------------------------------------------------------
+
+    /** Generalize `t` over variables not free in `envTypes`. */
+    generalize(envTypes: Type[], t: Type): Scheme {
+        const envFree = new Set<number>();
+        for (const e of envTypes) {
+            for (const v of this.freeVars(e)) envFree.add(v);
+        }
+        const free = [...this.freeVars(t)].filter(v => !envFree.has(v));
+        return {
+            vars: free.map(id => {
+                const info = this.infos.get(id)!;
+                return { id, kind: info.kind === 'row' ? 'row' : 'type', name: info.name };
+            }),
+            type: t,
+        };
+    }
+
+    /** Instantiate a scheme: fresh flexible variables for quantified ones. */
+    instantiate(s: Scheme): Type {
+        if (s.vars.length === 0) return s.type;
+        const subst = new Map<number, Type>();
+        for (const v of s.vars) {
+            const fresh = this.fresh(v.kind === 'row' ? 'row' : 'flex', v.name);
+            subst.set(v.id, fresh);
+        }
+        return this.substitute(subst, s.type);
+    }
+
+    /** Skolemize free variables of `t`: mark them rigid (may not be bound). */
+    skolemize(t: Type): { type: Type; restore: () => void } {
+        const vars = [...this.freeVars(t)];
+        const prev = new Map<number, boolean>();
+        for (const id of vars) {
+            const info = this.infos.get(id)!;
+            prev.set(id, info.rigid);
+            info.rigid = true;
+        }
+        return {
+            type: t,
+            restore: () => {
+                for (const [id, rigid] of prev) this.infos.get(id)!.rigid = rigid;
+            },
+        };
+    }
+
+    private substitute(subst: Map<number, Type>, t: Type): Type {
+        const r = this.resolve(t);
+        if (r.kind === 'var') {
+            return subst.get(r.id) ?? r;
+        }
+        switch (r.kind) {
+            case 'nullable': return nullable(this.substitute(subst, r.of));
+            case 'fun': return fun(this.substitute(subst, r.from), this.substitute(subst, r.to));
+            case 'list': return listOf(this.substitute(subst, r.of));
+            case 'row': {
+                const fields = new Map<string, Type>();
+                for (const [label, type] of r.fields) fields.set(label, this.substitute(subst, type));
+                const tail = r.tail ? this.substitute(subst, r.tail) : null;
+                return { kind: 'row', fields, tail };
+            }
+            case 'query': return queryOf(this.substitute(subst, r.row));
+            case 'prim': case 'order': return r;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pretty printing
+    // -----------------------------------------------------------------------
+
+    /**
+     * Render a type for messages. When `nullable` is false (phase 1), `?`
+     * is stripped so inference messages match the interpreter's exactly.
+     *
+     * Rows are flattened through their open-tail chain (an open row is a
+     * linked list of single-field rows after unification) and shown as one
+     * record with a single `| tail` — `{ id: int | { name: string | r } }`
+     * renders as `{ id: int, name: string | r }`. When `friendlyVars` is
+     * true, unnamed variables render as `r`/`t` instead of `r12`/`t12` —
+     * used for hover, where only one type is shown at a time.
+     */
+    pretty(t: Type, showNullable: boolean = false, friendlyVars: boolean = false): string {
+        const p = (x: Type, paren: boolean): string => {
+            const r = this.resolve(x);
+            switch (r.kind) {
+                case 'var': {
+                    const info = this.infos.get(r.id)!;
+                    if (info.name) return info.name;
+                    if (friendlyVars) return info.kind === 'row' ? 'r' : 't';
+                    return info.kind === 'row' ? `r${r.id}` : `t${r.id}`;
+                }
+                case 'prim': return PRIM_NAMES[r.name];
+                case 'nullable':
+                    return showNullable ? `${p(r.of, false)}?` : p(r.of, false);
+                case 'list': return `[${p(r.of, false)}]`;
+                case 'row': {
+                    const { fields, tail } = this.resolveRow(r);
+                    const labels = [...fields.keys()].sort();
+                    const body = labels.map(l => `${l}: ${p(fields.get(l)!, false)}`).join(', ');
+                    const tailText = tail ? ` | ${p(tail, false)}` : '';
+                    return `{ ${body}${tailText} }`;
+                }
+                case 'query': return `query ${p(r.row, false)}`;
+                case 'fun': {
+                    const s = `${p(r.from, true)} -> ${p(r.to, false)}`;
+                    return paren ? `(${s})` : s;
+                }
+                case 'order': return 'order';
+            }
+        };
+        return p(t, false);
+    }
+
+    /** Pretty-print a row for "available: ..." lists: `id, name, age`. */
+    rowLabels(t: Type): string[] {
+        const r = this.resolve(t);
+        if (r.kind !== 'row') return [];
+        return [...this.resolveRow(r).fields.keys()].sort();
+    }
+}
+
+/** Convenience: fresh-var-creating helpers used by inference. */
+export function isNumericType(t: Type): boolean {
+    const r = t.kind === 'var' ? t : t; // resolved by caller
+    return r.kind === 'prim' && (r.name === 'int' || r.name === 'float');
+}
+
+export function isPrim(t: Type, name: PrimName): boolean {
+    return t.kind === 'prim' && t.name === name;
+}

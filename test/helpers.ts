@@ -5,7 +5,8 @@ import { NodeFileSystem } from 'langium/node';
 import { URI } from 'langium';
 import { createTetaueServices } from '../src/language/tetaue-module.js';
 import type { TetaueServices } from '../src/language/tetaue-module.js';
-import { analyze } from '../src/language/interpreter.js';
+import { analyze, analyzeProject } from '../src/language/interpreter.js';
+import { infer, inferProject, mergeDiagnostics } from '../src/language/inference.js';
 import { renderQuery, DIALECTS } from '../src/language/render.js';
 import type { RenderFormat } from '../src/language/render.js';
 import type { Model } from '../src/language/generated/ast.js';
@@ -38,6 +39,20 @@ export function parseModel(text: string): Model {
 /** Interpret a module and return the diagnostic messages (empty = valid). */
 export function errors(text: string): string[] {
     return analyze(parseModel(text)).diagnostics.map(d => d.message);
+}
+
+/** Run the type-inference pass and return its diagnostic messages. */
+export function typeErrors(text: string): string[] {
+    return infer(parseModel(text)).diagnostics.map(d => d.message);
+}
+
+/** Interpreter + inference diagnostics merged exactly as check/render surface them. */
+export function allErrors(text: string): string[] {
+    const model = parseModel(text);
+    const project = [{ model, uri: undefined, imports: [] }];
+    const { diagnostics } = analyzeProject(project, {});
+    const { diagnostics: typeDiagnostics } = inferProject(project);
+    return mergeDiagnostics(project, diagnostics, typeDiagnostics).map(d => d.message);
 }
 
 /** Interpret a module and render its query to SQL. Throws on diagnostics. */

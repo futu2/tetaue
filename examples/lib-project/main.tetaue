@@ -1,0 +1,34 @@
+# A project using libraries declared in tetaue.toml.
+#
+#   import "acme/tables"                flat: users, orders, user_summaries
+#   import "acme/predicates" as p       namespaced: p.adult
+#   import "shared/columns" (compact)   selective: just compact
+#
+# Resolution: relative to THIS file first (none of these exist here), then
+# each dependency from tetaue.toml. Hover `p.adult`, `compact`, or `users`
+# to see the doc comments from the lib files; Ctrl+click jumps to them.
+
+import "acme/tables"
+import "acme/predicates" as p
+import "shared/columns" (compact)
+
+# adult_users: adults, compacted with the shared projection.
+adult_users = users
+    & filter p.adult
+    & map compact
+    & take 10
+
+# spending: per-user order totals from the vendored acme tables.
+spending = users
+    & join inner orders (l => r => l.id == r.user_id) (l => r => {
+        user_id = r.user_id,
+        name = l.name,
+        total = r.total,
+    })
+    & fold (o => {
+        user_id = group o.user_id,
+        name = group o.name,
+        spent = sum o.total,
+    })
+    & sort (r => [desc r.spent])
+    & take 5

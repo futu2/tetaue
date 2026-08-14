@@ -1,0 +1,56 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmgrammar-schema/master/schema.json",
+  "name": "Tetaue",
+  "scopeName": "source.tetaue",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#keywords" },
+    { "include": "#numbers" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "match": "#.*$", "name": "comment.line.number-sign.tetaue" }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "begin": "\"",
+          "end": "\"",
+          "name": "string.quoted.double.tetaue",
+          "patterns": [
+            { "match": "\\\\.", "name": "constant.character.escape.tetaue" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "match": "\\b\\d+(\\.\\d+)?\\b", "name": "constant.numeric.tetaue" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(import|table|filter|filtered|map|sort|take|distinct|fold|join|asc|desc|group|count|sum|avg|min|max|coalesce|upper|lower|length|abs|is_in|is_not_in|not|true|false|null|query|forall|case|_)\\b",
+          "name": "keyword.other.tetaue"
+        },
+        {
+          "match": "\\b(int|float|string|bool|date|timestamp)\\b",
+          "name": "storage.type.tetaue"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "match": "&&|\\|\\||>>>|<<<|==|!=|<=|>=|=>|&|\\$|\\*|/|%|\\+|-|<|>",
+          "name": "keyword.operator.tetaue"
+        }
+      ]
+    }
+  }
+}

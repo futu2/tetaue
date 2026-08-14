@@ -1,0 +1,78 @@
+# tetaue — SQL CASE WHEN with `case { ... }`.
+#
+# `case` is a first-class expression: `case { cond => value, ..., _ => value }`
+# renders to `CASE WHEN cond THEN value ... [ELSE value] END`. Each branch
+# maps a boolean condition to a value; the FINAL branch's condition is the
+# `_` wildcard (a reserved keyword) and becomes the ELSE value. A `case`
+# without a `_` branch renders without ELSE — a non-matching row yields NULL.
+#
+#   case { u.active => u.name, _ => "inactive" }        → CASE WHEN active THEN name ELSE 'inactive' END
+#   case { u.age < 18 => "minor", _ => "adult" }        → CASE WHEN age < 18 THEN 'minor' ELSE 'adult' END
+#
+# Conditions must be boolean; all branch values (including the fallback) must
+# share a type — a `null` literal absorbs like `coalesce`. CASE is standard
+# SQL, so the rendering is identical across dialects.
+#
+# SIMPLE case: put a subject before the braces and every branch condition
+# becomes a comparison with it (SQL's `CASE subject WHEN value THEN ...`) —
+# perfect for code→label tables, where repeating `subject == ` is noise:
+#
+#   case u.status { "shipped" => "sent", _ => "pending" }
+#       → CASE WHEN status = 'shipped' THEN 'sent' ELSE 'pending' END
+#
+# Branch conditions may be any expression (compared with `==`); `null`
+# renders as IS NULL. See examples/lpbirthday.tetaue for a 20-arm mapping.
+#
+# Conditions are any boolean expression — access chains (`u.active`),
+# comparisons, calls — all parse fine before `=>`. The one collision: a
+# branch whose condition is a BARE identifier (`x => v`) is parsed as a
+# lambda, not a case arm — but a bare identifier can't be a boolean column
+# anyway (columns are read as `u.field`), so this never bites in practice.
+
+users: query {
+    id: int,
+    name: string,
+    age: int,
+    active: bool,
+} = table "users"
+
+orders: query {
+    id: int,
+    user_id: int,
+    total: float,
+    status: string,
+} = table "orders"
+
+# The simplest form: one branch plus the `_` fallback — an if/then/else.
+labels = users & map (u => {
+    label = case { u.active => u.name, _ => "inactive" },
+})
+
+# Multi-branch ladder: branches are tried in order, `_` is the ELSE value.
+# A `case` without `_` (maybe_high) renders `CASE ... END` — NULL when no
+# branch matches, so its type is `bool?`.
+q = orders
+    & filter (o => case { o.status == "cancelled" => false, _ => true })
+    & map (o => {
+        # Branches with numeric values — the CASE is the SELECT expression.
+        is_big = case { o.total >= 500.0 => 1, _ => 0 },
+
+        # A string ladder over the same row.
+        bucket = case { o.total < 100.0 => "low", o.total < 1000.0 => "mid", _ => "high" },
+
+        # status_label: string? — no `_` branch, so non-matching rows are NULL.
+        status_label = case { o.status == "shipped" => "sent", o.status == "cancelled" => "no" },
+
+        # SIMPLE case — subject before the braces; every branch condition is
+        # compared with it. `null` branches render as IS NULL.
+        shipped_at_all = case o.total { null => "unknown", _ => "known" },
+
+        # Nested case: the value of a branch is any expression, including
+        # another `case`. The parens are needed so the inner case isn't read
+        # as the next branch's value.
+        kind = case { o.status == "cancelled" => "dead", _ => (case { o.total >= 500.0 => "big", _ => "small" }) },
+
+        # `null` in a branch absorbs like coalesce — the result stays string.
+        name_or_nothing = case { o.status == "shipped" => "sent", _ => null },
+    })
+    & sort (o => [desc o.is_big])

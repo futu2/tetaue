@@ -1,0 +1,25 @@
+# acme — a library of schema definitions.
+#
+# This module imports `shared/columns` from ITS OWN manifest (../shared),
+# so the dependency is pinned to this vendored copy. Importers of acme see
+# only what is exported here.
+
+import "shared/columns"
+
+# users: the core customer table.
+export users: query {
+    id: int,
+    name: string,
+    age: int,
+    active: bool,
+} = table "users"
+
+# orders: one row per purchase.
+export orders: query {
+    id: int,
+    user_id: int,
+    total: float,
+} = table "orders"
+
+# user_summaries: the shared `compact` projection applied to users.
+export user_summaries = users & map (compact)

@@ -1,12 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { errors, render, buildDocument, services } from './helpers.ts';
 
-const USERS = `users = table "users" {
-    id = int,
-    name = string,
-    age = int,
-    active = bool,
-}`;
+const USERS = `users: query {
+    id: int,
+    name: string,
+    age: int,
+    active: bool,
+} = table "users"`;
 
 describe('semantic errors', () => {
     test('misspelled builtin is an unknown identifier', () => {
@@ -18,7 +18,7 @@ describe('semantic errors', () => {
     });
 
     test('duplicate binding name', () => {
-        expect(errors(`${USERS}\nusers = table "x" { a = int }`).join('\n')).toContain("duplicate binding name 'users'");
+        expect(errors(`${USERS}\nusers: query { a: int } = table "x"`).join('\n')).toContain("duplicate binding name 'users'");
     });
 
     test('unknown column', () => {
@@ -68,8 +68,8 @@ describe('semantic errors', () => {
         expect(errors(`${USERS}\nq = users & map (u => { a = u.id, a = u.age })`).join('\n')).toContain("duplicate map key 'a'");
     });
 
-    test('schema entry must be a type', () => {
-        expect(errors(`t = table "t" { a = 42 }`).join('\n')).toContain("schema entry 'a' must be a type");
+    test('table takes only a name', () => {
+        expect(errors(`t = table "t" { a = 42 }`).join('\n')).toContain('cannot apply a query');
     });
 
     test('table requires a name string', () => {
@@ -92,63 +92,79 @@ describe('semantic errors', () => {
         expect(errors(`${USERS}\nq = users & fold (u => { x = sum u.name })`).join('\n')).toContain('sum expects a numeric expression');
     });
 
-    test('join on must be a two-parameter lambda', () => {
+    test('join on must be a two-argument function', () => {
         const messages = errors(`
-            users = table "users" { id = int }
-            orders = table "orders" { user_id = int }
-            q = users & join orders (u => u.id == 1) "inner"
+            users: query { id: int } = table "users"
+            orders: query { user_id: int } = table "orders"
+            q = users & join inner orders (u => u.id == 1) (u => o => { uid = u.id })
         `);
-        expect(messages.join('\n')).toContain("join 'on' must be a two-parameter lambda");
+        expect(messages.join('\n')).toContain("join 'on' must be a two-argument function (curried)");
     });
 
     test('join kind must be inner/left/right/full', () => {
         const messages = errors(`
-            users = table "users" { id = int }
-            orders = table "orders" { user_id = int }
-            q = users & join orders (u, o) => u.id == o.user_id "outer"
+            users: query { id: int } = table "users"
+            orders: query { user_id: int } = table "orders"
+            q = users & join orders 42 (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
-        expect(messages.join('\n')).toContain('"inner", "left", "right" or "full"');
+        expect(messages.join('\n')).toContain('inner, left, right or full');
     });
 
-    test('join kind is required (three positional args)', () => {
+    test('join kind must be a bare identifier, not a string', () => {
         const messages = errors(`
-            users = table "users" { id = int }
-            orders = table "orders" { user_id = int }
-            q = users & join orders (u, o) => u.id == o.user_id
+            users: query { id: int } = table "users"
+            orders: query { user_id: int } = table "orders"
+            q = users & join orders "inner" (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
-        expect(messages.join('\n')).toContain('"inner", "left", "right" or "full"');
+        expect(messages.join('\n')).toContain('inner, left, right or full');
+    });
+
+    test('join merger must be a two-argument function', () => {
+        const messages = errors(`
+            users: query { id: int } = table "users"
+            orders: query { user_id: int } = table "orders"
+            q = users & join inner orders u => o => u.id == o.user_id (u => { uid = u.id })
+        `);
+        expect(messages.join('\n')).toContain("join 'merger' must be a two-argument function (curried)");
     });
 
     test('join right must be a query', () => {
         const messages = errors(`
-            users = table "users" { id = int }
-            q = users & join 42 (u, o) => u.id == o.user_id "inner"
+            users: query { id: int } = table "users"
+            q = users & join inner 42 (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
-        expect(messages.join('\n')).toContain('join expects a query as its first argument');
+        expect(messages.join('\n')).toContain('join expects a query as its second argument');
     });
 
     test('stepped right side of a join renders as a subquery', () => {
         const sql = render(`
-            users = table "users" { id = int }
-            orders = table "orders" { user_id = int, status = string }
+            users: query { id: int } = table "users"
+            orders: query { user_id: int, status: string } = table "orders"
             paid = orders & filter (o => o.status == "paid")
-            q = users & join paid (u, o) => u.id == o.user_id "inner"
+            q = users & join inner paid (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.user_id })
         `);
-        expect(sql).toContain('INNER JOIN (SELECT * FROM "orders" WHERE ("status" = \'paid\')) AS "orders" ON "users"."id" = "orders"."user_id"');
+        expect(sql).toContain([
+            'INNER JOIN (',
+            '    SELECT *',
+            '    FROM orders',
+            "    WHERE status = 'paid'",
+            ') AS paid',
+            '    ON users.id = paid.user_id',
+        ].join('\n'));
     });
 
     test('join on with a one-parameter $n expression is rejected', () => {
         const messages = errors(`
-            users = table "users" { id = int }
-            orders = table "orders" { user_id = int }
-            q = users & join orders ($1.id == 3) "inner"
+            users: query { id: int } = table "users"
+            orders: query { user_id: int } = table "orders"
+            q = users & join inner orders ($1.id == 3) { uid = $1.id }
         `);
-        expect(messages.join('\n')).toContain("join 'on' must be a two-parameter lambda");
+        expect(messages.join('\n')).toContain("join 'on' must be a two-argument function (curried)");
     });
 
     test('$n inside an explicit lambda body is an error', () => {
         const messages = errors(`
-            users = table "users" { id = int }
+            users: query { id: int } = table "users"
             q = users & filter (u => $1.active)
         `);
         expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");
@@ -156,7 +172,7 @@ describe('semantic errors', () => {
 
     test('unbound $n at the top level is an error', () => {
         const messages = errors(`
-            users = table "users" { id = int }
+            users: query { id: int } = table "users"
             q = $1 + 3
         `);
         expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");

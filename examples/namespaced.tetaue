@@ -1,0 +1,23 @@
+# Namespaced imports, exports, and re-exports.
+#
+# `import "tables.tetaue" as t` binds ONE name — the namespace `t` — and
+# bindings are reached qualified: `t.users`. Nothing leaks into the flat
+# scope. Only `export`ed bindings are visible through the namespace; a
+# missing export is an error ("module 't' has no exported binding ...").
+#
+# Re-exporting works by exporting a binding whose value is imported:
+# `export adult = p.adult` re-exports the helper under the same name.
+
+import "tables.tetaue" as t
+import "predicates.tetaue" as p
+
+# A private helper: visible inside this module, invisible to importers.
+active_users = t.users & filter (u => u.active)
+
+# Re-export a predicate for other modules to reuse.
+export adult = p.adult
+
+adults = active_users
+    & filter (p.adult)          # p.adult is a row-polymorphic predicate
+    & map (u => { id = u.id, name = u.name })
+    & take 10

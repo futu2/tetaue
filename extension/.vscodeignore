@@ -1,0 +1,8 @@
+# Files to exclude from the packaged .vsix
+src/**
+tsconfig.json
+**/*.map
+.vscode/**
+**/node_modules/.cache/**
+README.md
+.bun/

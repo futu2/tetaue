@@ -10,7 +10,9 @@ import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { URI, type AstNode, type ValidationAcceptor, type ValidationChecks } from 'langium';
 import type { Import, TetaueAstType, Model } from './generated/ast.js';
-import { analyzeProject, parseStringLiteral } from './interpreter.js';
+import { analyzeProject, parseStringLiteral, type Diagnostic } from './interpreter.js';
+import { inferProject, mergeDiagnostics } from './inference.js';
+import { resolveImport } from './resolve.js';
 import type { TetaueServices } from './tetaue-module.js';
 import { collectModuleTree, moduleOf } from './imports.js';
 import type { ProjectModule } from './imports.js';
@@ -31,11 +33,8 @@ export function checkModel(model: Model, accept: ValidationAcceptor): void {
     if (!services) return;
 
     const rootUri = model.$document?.uri.toString();
-    const { modules, diagnostics } = collectModuleTree({ model, uri: rootUri }, {
-        resolve: (importerUri, spec) => {
-            const base = importerUri ? path.dirname(URI.parse(importerUri).fsPath) : process.cwd();
-            return URI.file(path.resolve(base, spec)).toString();
-        },
+    const { modules, diagnostics, warnings } = collectModuleTree({ model, uri: rootUri, imports: [] }, {
+        resolve: (importerUri, spec) => resolveImport(importerUri, spec),
         read: (uri) => {
             try {
                 return readFileSync(URI.parse(uri).fsPath, 'utf8');
@@ -58,23 +57,48 @@ export function checkModel(model: Model, accept: ValidationAcceptor): void {
 
     // The root document is analyzed without the query requirement (imported
     // helper modules legitimately end in non-query bindings); the CLI enforces
-    // it for the root.
-    const result = analyzeProject(modules.map(m => m.model), { requireQuery: false });
+    // it for the root. The type-inference pass runs alongside the interpreter;
+    // the two are merged with exact (node, message) dedupe so each type error
+    // is reported exactly once.
+    const result = analyzeProject(modules, { requireQuery: false });
+    const { diagnostics: typeDiagnostics } = inferProject(modules);
+    const merged = mergeDiagnostics(modules, diagnostics, result.diagnostics, typeDiagnostics);
 
-    for (const diagnostic of [...diagnostics, ...result.diagnostics]) {
-        const node = diagnostic.node;
-        if (node && belongsTo(node, model)) {
-            accept('error', diagnostic.message, { node });
-        } else {
-            // The diagnostic lives in an imported module: fold it onto the
-            // `import` statement of THIS document that leads to that module.
-            const owner = moduleOf(node, modules);
-            const anchor = owner ? directImportNodeFor(owner, modules, model) : undefined;
-            if (anchor) {
-                const prefix = owner && owner.uri ? `in imported module '${basename(owner.uri)}': ` : '';
-                accept('error', prefix + diagnostic.message, { node: anchor });
-            }
-        }
+    for (const diagnostic of merged) acceptFolded(diagnostic, 'error', model, modules, accept);
+    for (const warning of warnings) acceptFolded(warning, 'warning', model, modules, accept);
+}
+
+/**
+ * Report a diagnostic on its node — or, when it lives in an imported module
+ * (or has no anchorable node), fold it onto the `import` statement of THIS
+ * document that leads to that module. Unanchorable nodes fall back to the
+ * root module so the error is never dropped.
+ */
+function acceptFolded(
+    diagnostic: Diagnostic,
+    severity: 'error' | 'warning',
+    model: Model,
+    modules: ProjectModule[],
+    accept: ValidationAcceptor,
+): void {
+    const node = diagnostic.node;
+    if (node && belongsTo(node, model)) {
+        accept(severity, diagnostic.message, { node });
+        return;
+    }
+    const root = modules[modules.length - 1];
+    const owner = node ? (moduleOf(node, modules) ?? root) : undefined;
+    const isRoot = owner === root;
+    const anchor = owner
+        ? (isRoot && node?.$cstNode ? node : directImportNodeFor(owner, modules, model))
+        : undefined;
+    if (anchor) {
+        const prefix = owner && owner.uri && !isRoot ? `in imported module '${basename(owner.uri)}': ` : '';
+        accept(severity, prefix + diagnostic.message, { node: anchor });
+    } else if (model.$cstNode) {
+        // Truly unanchorable (no node, or a synthetic placeholder):
+        // attach to the document root so the error is not dropped.
+        accept(severity, diagnostic.message, { node: model });
     }
 }
 

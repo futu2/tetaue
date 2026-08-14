@@ -1,0 +1,59 @@
+yesterday = date_add current_date "day" (-1)
+
+# Simple case: `case subject { value => result, ..., _ => fallback }` is sugar
+# for `case { subject == value => result, ... }` (SQL's CASE subject WHEN ...).
+# Here each branch compares the same `relationCode` with a literal — no need
+# to repeat `relationCode == ` twenty times.
+corporateCustomerRelationName: string -> string
+= relationCode => case relationCode {
+  "101" => "法定代表人",
+  "102" => "总经理",
+  "103" => "财务负责人",
+  "104" => "其它负责人员",
+  "105" => "单位联系人",
+  "106" => "董事长",
+  "107" => "国际业务负责人",
+  "108" => "股东",
+  "109" => "控股股东或实际控制人",
+  "110" => "授权办理人",
+  "111" => "直接或间接地控制其他企业或受其他企业控制",
+  "112" => "合营企业",
+  "113" => "联营企业",
+  "114" => "主要投资者个人、关键管理人员或与其关系密切的家庭成员",
+  "115" => "投资者个人、管理人员或与其关系密切的家庭成员直接控制的企业",
+  "116" => "党政军隶属",
+  "117" => "总分公司",
+  "118" => "供应链关联",
+  "119" => "担保关联",
+  "120" => "未知",
+  _ => relationCode,
+}
+
+custRelation =
+table "ecs.dcm_ecs_c_ecis_m_tb1150_sf_f"
+  & filter ($1.pt_dt == yesterday)
+  & filter ($1.rol_lifecycle == 1)
+  & map {
+    c_cino = $1.contextroleplayer,
+    p_cino = $1.roleplayer,
+    cp_relation = $1.par_to_par_rel_rol,
+  }
+  & map ($1 <> { relation_name = corporateCustomerRelationName $1.cp_relation })
+  & fold {
+    c_cino = group $1.c_cino,
+    p_cino = group $1.p_cino,
+    relation_names = list $1.relation_name,
+  }
+
+customerBirthday =
+table "ecs.dcm_ecs_p_ecis_m_tb1010_sf_f"
+  & filter ($1.pt_dt == yesterday)
+  & filter ($1.individual_stat == "000")
+  & map {
+    customer_number = $1.individualid,
+    birthday = $1.birthdate,
+  }
+
+corpBirthday = custRelation
+  & join left customerBirthday (u => v => u.p_cino == v.customer_number) merge # ($1 <> $2)
+  & filter (is_in $1.c_cino ["11114343"])

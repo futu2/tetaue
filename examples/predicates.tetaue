@@ -1,0 +1,8 @@
+# Row-polymorphic helpers — import this file to get `adult`.
+#
+# The lambda is typed ONCE against an open row and works on any table that
+# has an `age` column. Because it is exported as a scheme, the polymorphism
+# survives qualified access: `p.adult` instantiates fresh row variables at
+# every use.
+
+export adult = u => u.age >= 18

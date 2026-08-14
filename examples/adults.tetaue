@@ -1,22 +1,36 @@
-# tetaue — the classic "adults" query, written with the optics core.
+# tetaue — the classic "adults" query.
 #
 # A module is a list of bindings; the LAST binding is the module's query.
-# Bindings need no terminator — `table "users" { ... }` is table applied to
-# two arguments, and the next binding starts right after the closing brace.
+# Bindings need no terminator — `users: query { ... } = table "users"` is a
+# binding with a type annotation, and the next binding starts right after it.
+# `table` is an ordinary function (`table : string -> query r`); the query
+# type annotation IS the table's schema.
 #
-# The optics keep the single-focus steps lambda-free:
-#   mapped <<< name %~ upper            — transform a column across rows
-# Predicates and ordering keep their row lambda (as in Haskell's `filtered`).
+# Steps are plain functions over row lambdas: `filter` keeps rows, `map`
+# projects a record per row (the SELECT), `sort` orders, `take` limits.
+#
+# Types are inferred everywhere and checked before any SQL is produced.
+# Row polymorphism means `adult` is typed ONCE against an open row and works
+# on any table that has `active` and `age` columns. The annotation is a
+# signature: `{ active: bool, age: int | r }` says "at least these fields",
+# `r` is a row variable, and free variables in a signature are implicitly
+# `forall`-quantified. Nullability is written explicitly: `age: int` is a
+# non-null column; write `age: int?` for one that may be NULL.
 
-users = table "users" {
-    id = int,
-    name = string,
-    age = int,
-    active = bool,
-}
+users: query {
+    id: int,
+    name: string,
+    age: int,
+    active: bool,
+} = table "users"
 
+# adult: forall r. { active: bool, age: int | r } -> bool
+adult: { active: bool, age: int | r } -> bool = u => u.active && u.age >= 18
+
+# Bare-identifier arguments need no parens: `filter adult` is filter applied
+# to the `adult` predicate.
 adults = users
-    & filtered (u => u.active && u ^. age >= 18)
-    & mapped <<< name %~ upper
+    & filter adult
+    & map (u => { id = u.id, name = upper u.name, age = u.age, active = u.active })
     & sort (u => [asc u.name])
     & take 10

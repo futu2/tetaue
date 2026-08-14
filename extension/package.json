@@ -1,0 +1,90 @@
+{
+  "name": "tetaue-vscode",
+  "displayName": "Tetaue",
+  "description": "Language server and realtime SQL compilation for the tetaue query language.",
+  "version": "0.1.0",
+  "publisher": "tetaue",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:tetaue",
+    "onCommand:tetaue.renderToSql"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "tetaue",
+        "aliases": [
+          "Tetaue",
+          "tetaue"
+        ],
+        "extensions": [
+          ".tetaue"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "tetaue",
+        "scopeName": "source.tetaue",
+        "path": "./syntaxes/tetaue.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "tetaue.renderToSql",
+        "title": "Tetaue: Render to SQL",
+        "category": "Tetaue"
+      }
+    ],
+    "configuration": {
+      "title": "Tetaue",
+      "properties": {
+        "tetaue.dialect": {
+          "type": "string",
+          "enum": [
+            "sqlite",
+            "postgresql",
+            "mysql",
+            "trino",
+            "hive"
+          ],
+          "default": "sqlite",
+          "description": "SQL dialect used when rendering tetaue queries to SQL."
+        },
+        "tetaue.renderOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render the module to SQL in the Tetaue output panel whenever a .tetaue file is saved."
+        },
+        "tetaue.copyToClipboardOnRender": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also copy the rendered SQL to the clipboard whenever the module is rendered to SQL (command or render-on-save)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.9.0"
+  }
+}

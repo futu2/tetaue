@@ -1,18 +1,34 @@
 # Multi-file module: imports are resolved relative to this file.
 # `import "tables.tetaue"` brings `users` and `orders` into scope.
+#
+# A type annotation can ascribe a query type to any expression (`e : T` —
+# lowest precedence, erased at evaluation time). Here the report's shape is
+# pinned explicitly, and check/render verify the pipeline against it.
 
 import "tables.tetaue"
 
-adults = users & filtered (u => u.active && u ^. age >= 18)
+adults = users & filter (u => u.active && u.age >= 18)
 
-report = adults
-    & mapped %~ (u => { uid = u.id, name = u.name })
-    & join orders ($1.uid == $2.user_id) "inner"
+report: query {
+    user_id: int,
+    name: string,
+    order_count: int,
+    total_spent: float,
+} = adults
+# & map (u => { uid = u.id, name = u.name })
+    & map { uid = $1.id, name = $1.name }
+    & join inner orders
+    (l => r => l.uid == r.user_id)
+    (l => r => {
+        user_id = r.user_id,
+        name = l.name,
+        order_id = r.id,
+        total = r.total, })
     & fold (r => {
         user_id = group r.user_id,
         name = group r.name,
-        order_count = count r.id,
-        total_spent = sum r.total,
+        order_count = count r.order_id,
+        total_spent = sum $ 1.0 + r.total,
     })
-    & sort (r => [desc r.total_spent])
+    & sort [desc $1.total_spent]
     & take 20
