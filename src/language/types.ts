@@ -142,11 +142,10 @@ export class TypeUniverse {
     private bindings = new Map<number, Type>();
     private infos = new Map<number, VarInfo>();
     private nextId = 1;
-    private nextName = 1;
 
     fresh(kind: 'flex' | 'type' | 'row' = 'flex', name: string | null = null): Type {
         const id = this.nextId++;
-        this.infos.set(id, { kind, rigid: false, name });
+        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name });
         return { kind: 'var', id };
     }
 
@@ -154,6 +153,13 @@ export class TypeUniverse {
         const info = this.infos.get(id);
         if (!info) throw new Error(`unknown type variable ${id}`);
         return info;
+    }
+
+    /** Copy-on-write rigid flag update (VarInfo objects are never mutated). */
+    setVarRigid(id: number, rigid: boolean): void {
+        const info = this.infos.get(id);
+        if (!info) throw new Error(`unknown type variable ${id}`);
+        this.infos = new Map(this.infos).set(id, { ...info, rigid });
     }
 
     /** Follow variable bindings to the root type. */
@@ -225,31 +231,38 @@ export class TypeUniverse {
         if (this.freeVars(t).has(varId)) {
             throw new UnifyError({ kind: 'var', id: varId }, t);
         }
+        let thisKind = info.kind;
         if (r.kind === 'var') {
             // Var-to-var bind: propagate the restrictive (row) kind, and
             // reject an explicit row-vs-type conflict.
             const other = this.varInfo(r.id);
-            if (info.kind === 'row' && other.kind === 'type') {
+            if (thisKind === 'row' && other.kind === 'type') {
                 throw new UnifyError({ kind: 'var', id: varId }, t);
             }
-            if (info.kind === 'type' && other.kind === 'row') {
+            if (thisKind === 'type' && other.kind === 'row') {
                 throw new UnifyError({ kind: 'var', id: varId }, t);
             }
-            if (info.kind === 'row') other.kind = 'row';
-            else if (other.kind === 'row') info.kind = 'row';
+            if (thisKind === 'row') {
+                this.infos = new Map(this.infos).set(r.id, { ...other, kind: 'row' });
+            } else if (other.kind === 'row') {
+                thisKind = 'row';
+            }
         } else {
             // Kind discipline against concrete types: a row-pinned variable
             // can only bind to rows, and a type-pinned variable only to
             // non-rows. First binding pins a flexible variable's kind.
-            if (info.kind === 'flex') {
-                info.kind = r.kind === 'row' ? 'row' : 'type';
-            } else if (info.kind === 'row' && r.kind !== 'row') {
+            if (thisKind === 'flex') {
+                thisKind = r.kind === 'row' ? 'row' : 'type';
+            } else if (thisKind === 'row' && r.kind !== 'row') {
                 throw new UnifyError({ kind: 'var', id: varId }, t);
-            } else if (info.kind === 'type' && r.kind === 'row') {
+            } else if (thisKind === 'type' && r.kind === 'row') {
                 throw new UnifyError({ kind: 'var', id: varId }, t);
             }
         }
-        this.bindings.set(varId, t);
+        if (thisKind !== info.kind) {
+            this.infos = new Map(this.infos).set(varId, { ...info, kind: thisKind });
+        }
+        this.bindings = new Map(this.bindings).set(varId, t);
     }
 
     /**
@@ -266,20 +279,15 @@ export class TypeUniverse {
         }
     }
 
-    private snapshot(): { bindings: Map<number, Type>; infos: Map<number, VarInfo>; nextId: number; nextName: number } {
-        return {
-            bindings: new Map(this.bindings),
-            infos: new Map([...this.infos].map(([id, info]) => [id, { ...info }])),
-            nextId: this.nextId,
-            nextName: this.nextName,
-        };
+    /** O(1) transaction markers: maps are copy-on-write, so old states stay valid. */
+    private snapshot(): { bindings: Map<number, Type>; infos: Map<number, VarInfo>; nextId: number } {
+        return { bindings: this.bindings, infos: this.infos, nextId: this.nextId };
     }
 
-    private restore(snapshot: { bindings: Map<number, Type>; infos: Map<number, VarInfo>; nextId: number; nextName: number }): void {
+    private restore(snapshot: { bindings: Map<number, Type>; infos: Map<number, VarInfo>; nextId: number }): void {
         this.bindings = snapshot.bindings;
         this.infos = snapshot.infos;
         this.nextId = snapshot.nextId;
-        this.nextName = snapshot.nextName;
     }
 
     /** Unify two types (with `?` absorption). Returns the unified type. Throws UnifyError. */
@@ -481,8 +489,26 @@ export class TypeUniverse {
         }
     }
 
-    /** Field type of a (possibly open) row for `e.l`; null if the row is closed without `l`. */
+    /**
+     * Read-only field lookup for hover/completion and other non-inference
+     * consumers. Never extends or binds the row.
+     */
+    lookupField(row: Type, label: string): { type: Type; open: boolean } | null {
+        const r = this.resolve(row);
+        if (r.kind !== 'row') return null;
+        const resolved = this.resolveRow(r);
+        const f = resolved.fields.get(label);
+        return f ? { type: f, open: true } : null;
+    }
+
+    /**
+     * Field access during inference: reads the field when present, and when
+     * the row is open/unconstrained, intentionally extends it with the field.
+     * Null only when the row is closed without `l`.
+     */
     fieldOf(row: Type, label: string): { type: Type; open: boolean } | null {
+        const known = this.lookupField(row, label);
+        if (known) return known;
         const r = this.resolve(row);
         if (r.kind === 'var') {
             // An unconstrained variable becomes an open row with the field.
@@ -493,8 +519,6 @@ export class TypeUniverse {
         }
         if (r.kind !== 'row') return null;
         const resolved = this.resolveRow(r);
-        const f = resolved.fields.get(label);
-        if (f) return { type: f, open: true };
         if (resolved.tail) {
             // Open row: extend the tail with the fresh field. The returned
             // type must BE the type stored in the row, so later constraints
@@ -547,14 +571,13 @@ export class TypeUniverse {
         const vars = [...this.freeVars(t)];
         const prev = new Map<number, boolean>();
         for (const id of vars) {
-            const info = this.infos.get(id)!;
-            prev.set(id, info.rigid);
-            info.rigid = true;
+            prev.set(id, this.varInfo(id).rigid);
+            this.setVarRigid(id, true);
         }
         return {
             type: t,
             restore: () => {
-                for (const [id, rigid] of prev) this.infos.get(id)!.rigid = rigid;
+                for (const [id, rigid] of prev) this.setVarRigid(id, rigid);
             },
         };
     }
@@ -641,14 +664,4 @@ export class TypeUniverse {
         if (r.kind !== 'row') return [];
         return [...this.resolveRow(r).fields.keys()].sort();
     }
-}
-
-/** Convenience: fresh-var-creating helpers used by inference. */
-export function isNumericType(t: Type): boolean {
-    const r = t.kind === 'var' ? t : t; // resolved by caller
-    return r.kind === 'prim' && (r.name === 'int' || r.name === 'float');
-}
-
-export function isPrim(t: Type, name: PrimName): boolean {
-    return t.kind === 'prim' && t.name === name;
 }

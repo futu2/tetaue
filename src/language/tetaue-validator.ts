@@ -12,29 +12,24 @@ import { URI, type AstNode, type ValidationAcceptor, type ValidationChecks } fro
 import type { Import, TetaueAstType, Model } from './generated/ast.js';
 import { analyzeProject, parseStringLiteral, type Diagnostic } from './interpreter.js';
 import { inferProject, mergeDiagnostics } from './inference.js';
-import { resolveImport } from './resolve.js';
+import { createImportResolver } from './resolve.js';
 import type { TetaueServices } from './tetaue-module.js';
 import { collectModuleTree, moduleOf } from './imports.js';
 import type { ProjectModule } from './imports.js';
 
-let validationServices: TetaueServices | undefined;
-
 export function registerValidationChecks(services: TetaueServices): void {
-    validationServices = services;
     const registry = services.validation.ValidationRegistry;
+    // Capture the service in a closure instead of a module-level singleton.
     const checks: ValidationChecks<TetaueAstType> = {
-        Model: checkModel,
+        Model: (model, accept) => checkModel(model, accept, services),
     };
     registry.register(checks);
 }
 
-export function checkModel(model: Model, accept: ValidationAcceptor): void {
-    const services = validationServices;
-    if (!services) return;
-
+export function checkModel(model: Model, accept: ValidationAcceptor, services: TetaueServices): void {
     const rootUri = model.$document?.uri.toString();
-    const { modules, diagnostics, warnings } = collectModuleTree({ model, uri: rootUri, imports: [] }, {
-        resolve: (importerUri, spec) => resolveImport(importerUri, spec),
+    const { modules, importsByModule, diagnostics, warnings } = collectModuleTree({ model, uri: rootUri, imports: [] }, {
+        resolve: createImportResolver(),
         read: (uri) => {
             try {
                 return readFileSync(URI.parse(uri).fsPath, 'utf8');
@@ -60,8 +55,8 @@ export function checkModel(model: Model, accept: ValidationAcceptor): void {
     // it for the root. The type-inference pass runs alongside the interpreter;
     // the two are merged with exact (node, message) dedupe so each type error
     // is reported exactly once.
-    const result = analyzeProject(modules, { requireQuery: false });
-    const { diagnostics: typeDiagnostics } = inferProject(modules);
+    const result = analyzeProject(modules, { requireQuery: false, importsByModule });
+    const { diagnostics: typeDiagnostics } = inferProject(modules, importsByModule);
     const merged = mergeDiagnostics(modules, diagnostics, result.diagnostics, typeDiagnostics);
 
     for (const diagnostic of merged) acceptFolded(diagnostic, 'error', model, modules, accept);
@@ -78,7 +73,7 @@ function acceptFolded(
     diagnostic: Diagnostic,
     severity: 'error' | 'warning',
     model: Model,
-    modules: ProjectModule[],
+    modules: readonly ProjectModule[],
     accept: ValidationAcceptor,
 ): void {
     const node = diagnostic.node;
@@ -103,7 +98,7 @@ function acceptFolded(
 }
 
 /** The `import` statement of `model` whose subtree contains `module`. */
-function directImportNodeFor(module: ProjectModule, modules: ProjectModule[], model: Model): Import | undefined {
+function directImportNodeFor(module: ProjectModule, modules: readonly ProjectModule[], model: Model): Import | undefined {
     if (!module.uri) return undefined;
     for (const imp of model.imports) {
         const spec = parseStringLiteral(imp.path);

@@ -35,6 +35,7 @@ import {
 export type BuiltinCategory =
     | 'query-root'      // table
     | 'query-step'      // filter, map, sort, take, distinct, fold, join
+    | 'set'              // union, union_all, intersect, except
     | 'join-kind'       // inner, left, right, full
     | 'aggregate'       // count, sum, avg, min, max, list
     | 'group'           // group
@@ -98,6 +99,12 @@ export const BUILTIN_SPECS = [
         const merger = fun(r, fun(s, t));           // l => r => row t
         return fun(jkindType(), fun(queryOf(s), fun(on, fun(merger, fun(queryOf(r), queryOf(t))))));
     }) },
+
+    // --- set operations (pure query -> query functions) -----------------
+    { name: 'union', category: 'set', doc: 'UNION (distinct set union)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
+    { name: 'union_all', category: 'set', doc: 'UNION ALL', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
+    { name: 'intersect', category: 'set', doc: 'INTERSECT (distinct set intersection)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
+    { name: 'except', category: 'set', doc: 'EXCEPT (distinct set difference)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
 
     // --- join kinds (a dedicated type, not strings) ----------------------
     { name: 'inner', category: 'join-kind', doc: 'INNER JOIN', scheme: () => mono(jkindType()) },
@@ -218,3 +225,17 @@ export const BUILTIN_NAMES = [
     ...BUILTIN_SPECS.map(s => s.name),
     ...Object.keys(BUILTIN_ALIASES),
 ];
+
+// ---------------------------------------------------------------------------
+// Shared argument-shape metadata (used by both interpreter and inference)
+// ---------------------------------------------------------------------------
+
+/** Min/max element counts of the list-argument builtins. */
+export const LIST_ARITY = {
+    concat: [2, Infinity], greatest: [2, Infinity], least: [2, Infinity],
+    round: [1, 2], substring: [2, 3], lpad: [2, 3], rpad: [2, 3],
+    regex_extract: [2, 3], lag: [1, 3], lead: [1, 3],
+} as Readonly<Record<string, readonly [number, number]>>;
+
+/** Target type names accepted by cast/try_cast. */
+export const CAST_TYPES = ['int', 'float', 'string', 'bool', 'date', 'timestamp'] as const;

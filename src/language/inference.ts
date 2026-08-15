@@ -29,10 +29,12 @@ import {
     builtinOf, fun, listOf, nullable, prim, queryOf, rowOf,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
-import type { ProjectModule } from './imports.js';
+import type { ProjectModule, ResolvedImportEdge } from './imports.js';
 import { moduleOf } from './imports.js';
+import { resolveImportScope } from './project-scope.js';
 import { parseStringLiteral } from './interpreter.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
+import { CAST_TYPES, LIST_ARITY } from './builtin.js';
 
 export interface InferDiagnostic {
     node: AstNode | undefined;
@@ -45,16 +47,7 @@ const LIST_BUILTINS = new Set(['concat', 'greatest', 'least', 'round', 'substrin
 /** Date/time builtins whose value arguments must be date or timestamp. */
 const DATE_VALUE_ARGUMENTS = new Set(['extract', 'year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second', 'date_add', 'date_diff', 'date_trunc', 'date_format', 'to_unixtime']);
 
-const CAST_TYPES = ['int', 'float', 'string', 'bool', 'date', 'timestamp'] as const;
 type CastType = (typeof CAST_TYPES)[number];
-
-
-/** Min/max element count of the list-argument builtins (checked statically). */
-const LIST_ARITY: Record<string, [number, number]> = {
-    concat: [2, Infinity], greatest: [2, Infinity], least: [2, Infinity],
-    round: [1, 2], substring: [2, 3], lpad: [2, 3], rpad: [2, 3],
-    regex_extract: [2, 3], lag: [1, 3], lead: [1, 3],
-};
 
 /**
  * Result of a project inference pass: diagnostics plus the static type
@@ -200,49 +193,17 @@ class Inferencer {
      * diagnostics dedupe. Only `export`ed bindings are recorded for
      * importers, as schemes (so qualified access stays polymorphic).
      */
-    inferProject(modules: ProjectModule[]): void {
+    inferProject(modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map()): void {
         this.prelude();
         const exportsByModule = new Map<ProjectModule, Map<string, Scheme>>();
         for (const module of modules) {
             this.env = new Map(this.preludeEnv);
             this.modules = new Map<string, Map<string, Scheme>>();
-            const scope = new Map<string, string>(); // name -> label (mirrors the interpreter)
-            for (const { alias, target, importNode } of module.imports) {
-                const targetSchemes = exportsByModule.get(target);
-                if (!targetSchemes) continue; // cyclic/missing target — already diagnosed
-                const spec = parseStringLiteral(importNode.path);
-                // Selective name lists mirror the interpreter: only listed
-                // exports are visible; unlisted names are not exported.
-                let selected = targetSchemes;
-                if (importNode.names && importNode.names.length > 0) {
-                    for (const n of importNode.names) {
-                        if (!targetSchemes.has(n)) {
-                            const keys = [...targetSchemes.keys()];
-                            this.diag(importNode, `'${n}' is not exported by '${spec}' — exported: ${keys.length > 0 ? keys.join(', ') : '(none)'}`);
-                        }
-                    }
-                    selected = new Map(
-                        importNode.names.filter(n => targetSchemes.has(n)).map(n => [n, targetSchemes.get(n)!]),
-                    );
-                }
-                if (alias !== undefined) {
-                    if (scope.has(alias)) {
-                        this.diag(importNode, conflictMessage(alias, scope.get(alias)!, 'import alias'));
-                        continue;
-                    }
-                    scope.set(alias, `import alias '${alias}'`);
-                    this.modules.set(alias, selected);
-                } else {
-                    for (const [name, scheme] of selected) {
-                        if (scope.has(name)) {
-                            this.diag(importNode, conflictMessage(name, scope.get(name)!, `imported from '${spec}'`));
-                            continue;
-                        }
-                        scope.set(name, `'${name}' imported from '${spec}'`);
-                        this.env.set(name, scheme);
-                    }
-                }
-            }
+            const imported = resolveImportScope(module, importsByModule.get(module) ?? module.imports ?? [], exportsByModule);
+            for (const d of imported.diagnostics) this.diag(d.node, d.message);
+            for (const [name, scheme] of imported.flat) this.env.set(name, scheme);
+            for (const [alias, selected] of imported.namespaces) this.modules.set(alias, new Map(selected));
+            const scope = new Map(imported.scope);
             const exported = new Map<string, Scheme>();
             for (const binding of module.model.bindings) {
                 if (scope.has(binding.name)) {
@@ -419,7 +380,17 @@ class Inferencer {
             for (const entry of e.entries) {
                 fields.push([entry.key, this.inferExpr(entry.value, env)]);
             }
-            return rowOf(fields);
+            const updated = rowOf(fields);
+            if (!e.receiver) return updated;
+            // `{ receiver | k = v }` is record-update sugar for
+            // `merge receiver { k = v }`.
+            const base = this.inferExpr(e.receiver, env);
+            const r = this.u.peel(base);
+            if (r.kind !== 'row' && r.kind !== 'var') {
+                this.diag(e.receiver, `record update expects a record before '|', got type ${this.u.pretty(base)}`);
+                return updated;
+            }
+            return this.inferMerge(base, updated, e);
         }
         if (isLambda(e)) return this.inferLambda(e, env);
         if (isIdentifier(e)) {
@@ -464,7 +435,7 @@ class Inferencer {
         const body = this.inferExpr(e.body as unknown as UnaryExpression, newEnv);
         // Release the rigidity of annotated params: the body must only use the
         // annotated fields, but at USE the row must still absorb extra fields.
-        for (const id of rigidVars) this.u.varInfo(id).rigid = false;
+        for (const id of rigidVars) this.u.setVarRigid(id, false);
         return fun(paramType, body);
     }
 
@@ -1278,15 +1249,17 @@ class Inferencer {
                 } else if (ret.kind === 'var') {
                     const sk = this.u.skolemize(ret);
                     try {
-                        this.u.unify(ret, { kind: 'order' });
-                    } catch {
                         try {
-                            this.u.unify(ret, listOf({ kind: 'order' }));
+                            this.u.unify(ret, { kind: 'order' });
                         } catch {
-                            this.diag(node, `sort expects order items like asc u.name or a list of them, got an expression of type ${this.u.pretty(ret)}`);
-                        } finally {
-                            sk.restore();
+                            try {
+                                this.u.unify(ret, listOf({ kind: 'order' }));
+                            } catch {
+                                this.diag(node, `sort expects order items like asc u.name or a list of them, got an expression of type ${this.u.pretty(ret)}`);
+                            }
                         }
+                    } finally {
+                        sk.restore();
                     }
                 }
             }
@@ -1353,7 +1326,7 @@ class Inferencer {
         if (existing) return existing;
         const fresh = this.u.fresh(kind === 'row' ? 'row' : 'flex', name);
         if (fresh.kind === 'var' && rigid) {
-            this.u.varInfo(fresh.id).rigid = true;
+            this.u.setVarRigid(fresh.id, true);
             rigidVars.push(fresh.id);
         }
         names.set(name, fresh);
@@ -1374,7 +1347,7 @@ class Inferencer {
         while (r.kind === 'nullable') r = this.u.peel(r.of);
         if (r.kind !== 'row') return undefined;
         return this.u.rowLabels(r).map(name => {
-            const field = this.u.fieldOf(r, name);
+            const field = this.u.lookupField(r, name);
             return { name, type: field ? this.u.pretty(this.u.peel(field.type), true, true) : '?' };
         });
     }
@@ -1419,9 +1392,9 @@ class Inferencer {
 }
 
 /** Infer a project: modules in import order (imports first, root last). */
-export function inferProject(modules: ProjectModule[]): InferProjectResult {
+export function inferProject(modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map()): InferProjectResult {
     const inferencer = new Inferencer();
-    inferencer.inferProject(modules);
+    inferencer.inferProject(modules, importsByModule);
     return {
         diagnostics: inferencer.diagnostics,
         nodeTypes: inferencer.nodeTypes,
@@ -1432,7 +1405,7 @@ export function inferProject(modules: ProjectModule[]): InferProjectResult {
 
 /** Infer a single module (no imports). */
 export function infer(model: Model): { diagnostics: InferDiagnostic[] } {
-    return inferProject([{ model, uri: undefined, imports: [] }]);
+    return inferProject([{ model, uri: undefined, imports: [] }], new Map());
 }
 
 /**
@@ -1444,8 +1417,8 @@ export function infer(model: Model): { diagnostics: InferDiagnostic[] } {
  * the CLI/LSP render path, where parsed nodes carry no `$document`).
  */
 export function mergeDiagnostics<T extends { node: AstNode | undefined; message: string }>(
-    modules: ProjectModule[],
-    ...lists: T[][]
+    modules: readonly ProjectModule[],
+    ...lists: readonly (readonly T[])[]
 ): T[] {
     const seen = new Set<string>();
     const out: T[] = [];

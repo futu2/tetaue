@@ -139,11 +139,11 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
         const receiver = accessNode.receiver;
         if (!receiver) return undefined;
 
-        const { modules } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
+        const { modules, importsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
 
         // Module-qualified access `t.` — the receiver is a bare identifier
         // naming an imported namespace; suggest its EXPORTED bindings.
-        const moduleExports = moduleAliasExports(receiver, modules);
+        const moduleExports = moduleAliasExports(receiver, modules, importsByModule);
         if (moduleExports) {
             const replaceStart = document.textDocument.positionAt(dotPos + 1);
             const items = moduleExports
@@ -156,7 +156,7 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
             return CompletionList.create(items, false);
         }
 
-        const inferred = inferProject(modules);
+        const inferred = inferProject(modules, importsByModule);
         let typed: AstNode | undefined = receiver;
         while (typed && !inferred.nodeTypes.has(typed)) typed = typed.$container;
         if (!typed) return undefined;
@@ -181,11 +181,11 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
  * of `t.` parses as an Application of a bare identifier. Undefined when the
  * receiver is not a module alias (then normal field completion applies).
  */
-function moduleAliasExports(receiver: AstNode | undefined, modules: ProjectModule[]): string[] | undefined {
+function moduleAliasExports(receiver: AstNode | undefined, modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly import('../imports.js').ResolvedImportEdge[]> = new Map()): string[] | undefined {
     if (!isApplication(receiver) || receiver.arguments.length > 0 || !isIdentifier(receiver.func)) return undefined;
     const alias = receiver.func.name;
     const root = modules[modules.length - 1];
-    const edge = root?.imports.find(e => e.alias === alias);
+    const edge = (root ? importsByModule.get(root) ?? root.imports ?? [] : []).find(e => e.alias === alias);
     if (!edge) return undefined;
     return edge.target.model.bindings.filter(b => b.export).map(b => b.name);
 }

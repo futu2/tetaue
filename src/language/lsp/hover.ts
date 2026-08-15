@@ -30,8 +30,8 @@ export class TetaueHoverProvider implements HoverProvider {
         const node = leaf?.astNode;
         if (!node) return undefined;
 
-        const { modules } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
-        const result = inferProject(modules);
+        const { modules, importsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
+        const result = inferProject(modules, importsByModule);
 
         // Walk up to the nearest node with a recorded type (leaf terminals
         // belong to their owning AST node, which is already recorded).
@@ -51,7 +51,7 @@ export class TetaueHoverProvider implements HoverProvider {
     /** Doc comment for the hovered node: its own binding, or the binding a bare identifier names. */
     private documentation(
         document: LangiumDocument,
-        modules: ProjectModule[],
+        modules: readonly ProjectModule[],
         node: AstNode,
         typed: AstNode,
     ): string | undefined {

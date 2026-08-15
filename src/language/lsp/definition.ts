@@ -34,7 +34,7 @@ export class TetaueDefinitionProvider implements DefinitionProvider {
         const node = leaf?.astNode;
         if (!node) return undefined;
 
-        const { modules } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
+        const { modules, importsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
 
         // 1. `import "path"` (clicked on the keyword or the string).
         const imp = importOf(node);
@@ -45,7 +45,7 @@ export class TetaueDefinitionProvider implements DefinitionProvider {
 
         // 2. `t.binding` — the export in the lib.
         if (isAccessExpression(node)) {
-            const binding = moduleQualifiedBinding(node, modules);
+            const binding = moduleQualifiedBinding(node, modules, importsByModule);
             if (binding) return [linkOf(binding, moduleOf(binding, modules)?.uri)!];
             return undefined;
         }
@@ -54,7 +54,7 @@ export class TetaueDefinitionProvider implements DefinitionProvider {
         if (isIdentifier(node)) {
             const alias = node.name;
             const root = modules[modules.length - 1];
-            const edge = root?.imports.find(imp => imp.alias === alias);
+            const edge = (root ? importsByModule.get(root) ?? root.imports ?? [] : []).find(imp => imp.alias === alias);
             if (edge?.target.uri) return [link(edge.target.uri, RangeZero)];
 
             // 4. Otherwise the binding in the same module.

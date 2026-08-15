@@ -18,11 +18,12 @@ import { URI } from 'langium';
 import type { TetaueServices } from './tetaue-module.js';
 import { analyzeProject, type Diagnostic } from './interpreter.js';
 import { inferProject, mergeDiagnostics } from './inference.js';
-import { renderQuery, DIALECTS, isDialect } from './render.js';
+import { renderQuery, renderQueryWithCtes, DIALECTS, isDialect } from './render.js';
 import type { RenderFormat } from './render.js';
 import { collectModuleTree, moduleOf } from './imports.js';
+import type { ResolvedImportEdge } from './imports.js';
 import type { ProjectModule } from './imports.js';
-import { resolveImport } from './resolve.js';
+import { createImportResolver } from './resolve.js';
 import type { Model } from './generated/ast.js';
 
 export interface CompileDiagnostic {
@@ -41,6 +42,8 @@ export type CompileOutcome =
 export interface CompileOptions {
     dialect?: string;
     format?: RenderFormat;
+    /** Emit named intermediate queries as WITH ... AS CTEs. */
+    cte?: boolean;
     /**
      * Require the root module's last binding to be a query (default true).
      * `build` disables it so library modules (no query) compile cleanly and
@@ -76,14 +79,14 @@ function readModule(uri: string): string | undefined {
  * imported module from disk. Shared by the CLI, the language server's
  * `tetaue/render`, hover, and completion so they all see the same tree.
  */
-export function projectTreeFor(root: ProjectModule, services: TetaueServices): { modules: ProjectModule[]; diagnostics: Diagnostic[]; warnings: Diagnostic[] } {
+export function projectTreeFor(root: ProjectModule, services: TetaueServices): { modules: readonly ProjectModule[]; importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>; diagnostics: readonly Diagnostic[]; warnings: readonly Diagnostic[] } {
     // Relative imports first, then tetaue.toml dependencies — see resolve.ts.
     const tree = collectModuleTree(root, {
-        resolve: (importerUri, spec) => resolveImport(importerUri, spec),
+        resolve: createImportResolver(),
         read: readModule,
         parse: (text, uri) => parseModel(text, uri, services),
     });
-    return { modules: tree.modules, diagnostics: tree.diagnostics, warnings: tree.warnings };
+    return { modules: tree.modules, importsByModule: tree.importsByModule, diagnostics: tree.diagnostics, warnings: tree.warnings };
 }
 
 function diagnostic(d: { node?: { $cstNode?: { range: { start: { line: number; character: number } } } | null } | null; message: string }, uri: string): CompileDiagnostic {
@@ -110,7 +113,7 @@ export function compileModuleText(
     services: TetaueServices,
     options?: CompileOptions,
 ): CompileOutcome {
-    const { dialect = 'sqlite', format = 'pretty', requireQuery = true } = options ?? {};
+    const { dialect = 'sqlite', format = 'pretty', requireQuery = true, cte = false } = options ?? {};
     if (!isDialect(dialect)) {
         return {
             ok: false,
@@ -133,9 +136,9 @@ export function compileModuleText(
         };
     }
 
-    const { modules, diagnostics: treeDiagnostics, warnings: treeWarnings } = projectTreeFor(main, services);
-    const { value, diagnostics } = analyzeProject(modules, { requireQuery });
-    const { diagnostics: typeDiagnostics } = inferProject(modules);
+    const { modules, importsByModule, diagnostics: treeDiagnostics, warnings: treeWarnings } = projectTreeFor(main, services);
+    const { value, diagnostics } = analyzeProject(modules, { requireQuery, importsByModule });
+    const { diagnostics: typeDiagnostics } = inferProject(modules, importsByModule);
     // Interpreter + inference merged with exact (node, message) dedupe.
     const merged = mergeDiagnostics(modules, diagnostics, typeDiagnostics);
 
@@ -153,7 +156,7 @@ export function compileModuleText(
         return { ok: false, diagnostics: [] };
     }
     const spec = DIALECTS[dialect]!;
-    const rendered = renderQuery(value.query, spec, format);
+    const rendered = cte ? renderQueryWithCtes(value.query, spec, format) : renderQuery(value.query, spec, format);
     if (!rendered.ok) {
         return {
             ok: false,

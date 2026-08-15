@@ -8,7 +8,7 @@
  ******************************************************************************/
 import { isApplication, isIdentifier } from '../generated/ast.js';
 import type { AccessExpression, Binding } from '../generated/ast.js';
-import type { ProjectModule } from '../imports.js';
+import type { ProjectModule, ResolvedImportEdge } from '../imports.js';
 
 /** The namespace alias the access receiver names, or undefined. */
 export function moduleQualifiedReceiver(e: AccessExpression): string | undefined {
@@ -20,11 +20,11 @@ export function moduleQualifiedReceiver(e: AccessExpression): string | undefined
 }
 
 /** The exported binding `e.property` resolves to in the root module's tree, or undefined. */
-export function moduleQualifiedBinding(e: AccessExpression, modules: ProjectModule[]): Binding | undefined {
+export function moduleQualifiedBinding(e: AccessExpression, modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map()): Binding | undefined {
     const alias = moduleQualifiedReceiver(e);
     if (!alias) return undefined;
     const root = modules[modules.length - 1];
-    const edge = root?.imports.find(imp => imp.alias === alias);
+    const edge = (root ? importsByModule.get(root) ?? root.imports ?? [] : []).find(imp => imp.alias === alias);
     if (!edge) return undefined;
     return edge.target.model.bindings.find(b => b.name === e.property);
 }

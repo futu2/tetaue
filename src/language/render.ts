@@ -77,7 +77,7 @@ function quoteMysql(value: string): string {
     return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
 }
 
-export const DIALECTS: Record<string, DialectSpec> = {
+export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
     sqlite: {
         name: 'sqlite',
         quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
@@ -201,6 +201,12 @@ function renderPredicateClause(kw: string, conds: SqlNode[], ctx: RenderCtx, pre
 interface RenderCtx {
     dialect: DialectSpec;
     qualify: boolean;
+    readonly diagnostics: RenderDiagnostic[];
+}
+
+function renderFailure(ctx: RenderCtx, node: SqlNode, message: string): string {
+    ctx.diagnostics.push({ message, node });
+    return 'NULL';
 }
 
 function countTables(q: Query): number {
@@ -395,7 +401,7 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
             return `INSTR(${x()}, ${x(1)})`; // sqlite, hive
         }
         case 'reverse':
-            if (d === 'sqlite') throw new Error(`reverse is not supported for the sqlite dialect`);
+            if (d === 'sqlite') return renderFailure(ctx, node, `reverse is not supported for the sqlite dialect`);
             return `REVERSE(${x()})`;
         case 'left_substring':
             return d === 'sqlite' ? `SUBSTR(${x()}, 1, ${x(1)})` : `LEFT(${x()}, ${x(1)})`;
@@ -403,7 +409,7 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
             return d === 'sqlite' ? `SUBSTR(${x()}, -${x(1)})` : `RIGHT(${x()}, ${x(1)})`;
         case 'lpad': case 'rpad':
             // sqlite has no LPAD/RPAD.
-            if (d === 'sqlite') throw new Error(`${node.name} is not supported for the sqlite dialect`);
+            if (d === 'sqlite') return renderFailure(ctx, node, `${node.name} is not supported for the sqlite dialect`);
             if (node.args.length === 2) {
                 // MySQL/Trino/Hive require the pad string; PostgreSQL defaults
                 // to a space. Make the default explicit for a uniform lowering.
@@ -411,32 +417,32 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
             }
             return null;
         case 'regex_like': {
-            if (d === 'sqlite') throw new Error(`regex_like is not supported for the sqlite dialect`);
+            if (d === 'sqlite') return renderFailure(ctx, node, `regex_like is not supported for the sqlite dialect`);
             if (d === 'postgresql') return `${x()} ~ ${x(1)}`;
             if (d === 'hive') return `${x()} RLIKE ${x(1)}`;
             return `REGEXP_LIKE(${x()}, ${x(1)})`; // mysql, trino
         }
         case 'regex_replace': {
-            if (d === 'sqlite') throw new Error(`regex_replace is not supported for the sqlite dialect`);
+            if (d === 'sqlite') return renderFailure(ctx, node, `regex_replace is not supported for the sqlite dialect`);
             return `REGEXP_REPLACE(${x()}, ${x(1)}, ${x(2)})`; // pg, mysql, trino, hive
         }
         case 'regex_extract': {
-            if (d === 'mysql' || d === 'sqlite') throw new Error(`regex_extract is not supported for the ${d} dialect`);
+            if (d === 'mysql' || d === 'sqlite') return renderFailure(ctx, node, `regex_extract is not supported for the ${d} dialect`);
             const groupNode = node.args[2];
             if (d === 'postgresql') {
-                if (groupNode) throw new Error(`regex_extract group argument is not supported for the postgresql dialect`);
+                if (groupNode) return renderFailure(ctx, node, `regex_extract group argument is not supported for the postgresql dialect`);
                 return `REGEXP_SUBSTR(${x()}, ${x(1)})`;
             }
             if (d === 'hive') {
-                if (groupNode) throw new Error(`regex_extract group argument is not supported for the hive dialect`);
+                if (groupNode) return renderFailure(ctx, node, `regex_extract group argument is not supported for the hive dialect`);
                 return `REGEXP_EXTRACT(${x()}, ${x(1)})`;
             }
             if (d === 'trino') return groupNode ? `REGEXP_EXTRACT(${x()}, ${x(1)}, ${x(2)})` : `REGEXP_EXTRACT(${x()}, ${x(1)})`;
             return null;
         }
         case 'cast': case 'try_cast': {
-            if (node.name === 'try_cast' && d !== 'trino') throw new Error(`try_cast is not supported for the ${d} dialect`);
-            const type = node.args[1]?.kind === 'lit' ? sqlTypeName(String(node.args[1]!.value), d) : 'INTEGER';
+            if (node.name === 'try_cast' && d !== 'trino') return renderFailure(ctx, node, `try_cast is not supported for the ${d} dialect`);
+            const type = node.args[1]?.kind === 'lit' ? sqlTypeName(String(node.args[1]!.value), d, ctx, node) : 'INTEGER';
             return `${node.name === 'cast' ? 'CAST' : 'TRY_CAST'}(${x()} AS ${type})`;
         }
     }
@@ -444,13 +450,13 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
 }
 
 /** tetaue scalar type name → per-dialect SQL cast type. */
-function sqlTypeName(t: string, d: string): string {
+function sqlTypeName(t: string, d: string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
     switch (t) {
         case 'int': return d === 'hive' ? 'INT' : d === 'mysql' ? 'SIGNED' : 'INTEGER';
         case 'float': return d === 'sqlite' ? 'REAL' : d === 'postgresql' ? 'DOUBLE PRECISION' : 'DOUBLE';
         case 'string': return d === 'mysql' ? 'CHAR' : d === 'hive' ? 'STRING' : d === 'sqlite' ? 'TEXT' : 'VARCHAR';
         case 'bool':
-            if (d === 'sqlite') throw new Error(`casting to bool is not supported for the sqlite dialect`);
+            if (d === 'sqlite') return renderFailure(ctx, node, `casting to bool is not supported for the sqlite dialect`);
             return 'BOOLEAN';
         case 'date': return 'DATE';
         case 'timestamp': return 'TIMESTAMP';
@@ -475,15 +481,15 @@ function renderDateFunction(node: Extract<SqlNode, { kind: 'call' }>, ctx: Rende
         case 'hour': case 'minute': case 'second':
             return renderDatePart(d, node.name, x());
 
-        case 'date_add': return renderDateAdd(d, x(), unit(), third!, arg, num);
-        case 'date_diff': return renderDateDiff(d, x(), unit(), arg());
-        case 'date_trunc': return renderDateTrunc(d, x(), unit());
+        case 'date_add': return renderDateAdd(d, x(), unit(), third!, arg, num, ctx, node);
+        case 'date_diff': return renderDateDiff(d, x(), unit(), arg(), ctx, node);
+        case 'date_trunc': return renderDateTrunc(d, x(), unit(), ctx, node);
         case 'date_format': return renderDateFormat(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral);
-        case 'date_parse': return renderDateParse(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral);
+        case 'date_parse': return renderDateParse(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral, ctx, node);
         case 'to_unixtime': return renderToUnixtime(d, x());
         case 'from_unixtime': return renderFromUnixtime(d, x());
     }
-    throw new Error(`unknown date function '${node.name}'`);
+    return renderFailure(ctx, node, `unknown date function '${node.name}'`);
 }
 
 /** EXTRACT / date-part lowering for the given field over a rendered value. */
@@ -514,7 +520,7 @@ function renderDatePart(d: string, field: string, x: string): string {
 }
 
 /** `date_add value unit amount` — unit is interpreter-validated. */
-function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, renderAmount: () => string, num: (n?: SqlNode) => number | null): string {
+function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, renderAmount: () => string, num: (n?: SqlNode) => number | null, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
     const a = renderAmount();
     switch (d) {
         case 'postgresql':
@@ -526,7 +532,7 @@ function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, rend
         }
         case 'sqlite': {
             const amt = num(amount);
-            if (amt === null) throw new Error(`date_add with a non-literal amount is not supported for the sqlite dialect`);
+            if (amt === null) return renderFailure(ctx, node, `date_add with a non-literal amount is not supported for the sqlite dialect`);
             const mod = unit === 'week' ? `${amt * 7} days` : `${amt} ${unit}s`;
             return `DATETIME(${x}, '${amt >= 0 ? '+' : ''}${mod}')`;
         }
@@ -543,7 +549,7 @@ function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, rend
 }
 
 /** `date_diff value unit other` — calendar-ish diff (other - value) in units. */
-function renderDateDiff(d: string, x: string, unit: string, other: string): string {
+function renderDateDiff(d: string, x: string, unit: string, other: string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
     switch (d) {
         case 'postgresql':
             if (unit === 'week') return `EXTRACT(DAY FROM (${other} - ${x})) / 7`;
@@ -552,14 +558,14 @@ function renderDateDiff(d: string, x: string, unit: string, other: string): stri
             return `TIMESTAMPDIFF(${DATE_UNIT_SQL[unit] ?? unit.toUpperCase()}, ${x}, ${other})`;
         case 'sqlite': {
             const factor: Record<string, number> = { day: 1, hour: 24, minute: 1440, second: 86400 };
-            if (factor[unit] === undefined) throw new Error(`date_diff unit '${unit}' is not supported for the sqlite dialect — supported: day, hour, minute, second`);
+            if (factor[unit] === undefined) return renderFailure(ctx, node, `date_diff unit '${unit}' is not supported for the sqlite dialect — supported: day, hour, minute, second`);
             const diff = `(JULIANDAY(${other}) - JULIANDAY(${x}))`;
             return factor[unit] === 1 ? `CAST(${diff} AS INTEGER)` : `CAST(${diff} * ${factor[unit]} AS INTEGER)`;
         }
         case 'trino':
             return `DATE_DIFF('${unit}', ${x}, ${other})`;
         case 'hive':
-            if (unit !== 'day') throw new Error(`date_diff unit '${unit}' is not supported for the hive dialect — supported: day`);
+            if (unit !== 'day') return renderFailure(ctx, node, `date_diff unit '${unit}' is not supported for the hive dialect — supported: day`);
             return `DATEDIFF(${other}, ${x})`;
         default:
             return `DATE_DIFF('${unit}', ${x}, ${other})`;
@@ -567,22 +573,22 @@ function renderDateDiff(d: string, x: string, unit: string, other: string): stri
 }
 
 /** `date_trunc value unit`. */
-function renderDateTrunc(d: string, x: string, unit: string): string {
+function renderDateTrunc(d: string, x: string, unit: string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
     switch (d) {
         case 'postgresql':
         case 'trino':
             return `DATE_TRUNC('${unit}', ${x})`;
         case 'mysql':
-            throw new Error(`date_trunc is not supported for the mysql dialect`);
+            return renderFailure(ctx, node, `date_trunc is not supported for the mysql dialect`);
         case 'sqlite': {
             if (unit === 'day') return `DATE(${x})`;
             const f: Record<string, string> = { year: '%Y-01-01', month: '%Y-%m-01' };
             if (f[unit] !== undefined) return `STRFTIME('${f[unit]}', ${x})`;
-            throw new Error(`date_trunc unit '${unit}' is not supported for the sqlite dialect — supported: year, month, day`);
+            return renderFailure(ctx, node, `date_trunc unit '${unit}' is not supported for the sqlite dialect — supported: year, month, day`);
         }
         case 'hive': {
             const f: Record<string, string> = { year: 'YYYY', month: 'MM', week: 'WEEK', day: 'DD' };
-            if (f[unit] === undefined) throw new Error(`date_trunc unit '${unit}' is not supported for the hive dialect — supported: year, month, week, day`);
+            if (f[unit] === undefined) return renderFailure(ctx, node, `date_trunc unit '${unit}' is not supported for the hive dialect — supported: year, month, week, day`);
             return `TRUNC(${x}, '${f[unit]}')`;
         }
         default:
@@ -606,7 +612,7 @@ function renderDateFormat(d: string, x: string, format: string, quote: (v: strin
 }
 
 /** `date_parse value format` — dialect-native format string. */
-function renderDateParse(d: string, x: string, format: string, quote: (v: string) => string): string {
+function renderDateParse(d: string, x: string, format: string, quote: (v: string) => string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
     const f = quote(format);
     switch (d) {
         case 'postgresql':
@@ -618,7 +624,7 @@ function renderDateParse(d: string, x: string, format: string, quote: (v: string
         case 'trino':
             return `DATE_PARSE(${x}, ${f})`;
         case 'hive':
-            throw new Error(`date_parse is not supported for the hive dialect — use date_format with to_unixtime/from_unixtime instead`);
+            return renderFailure(ctx, node, `date_parse is not supported for the hive dialect — use date_format with to_unixtime/from_unixtime instead`);
         default:
             return `DATE_PARSE(${x}, ${f})`;
     }
@@ -656,10 +662,39 @@ function renderFromUnixtime(d: string, x: string): string {
     }
 }
 
+// --- set-operation rendering ------------------------------------------------
+
+type CteMap = ReadonlyMap<Query, string>;
+const NO_CTES: CteMap = new Map();
+
+function renderSetQuery(q: Query, dialect: DialectSpec, format: RenderFormat, diagnostics: RenderDiagnostic[], ctes: CteMap): string {
+    const index = q.steps.findIndex(s => s.kind === 'set');
+    const step = q.steps[index]!;
+    if (step.kind !== 'set') {
+        diagnostics.push({ message: 'internal: set step expected', node: step });
+        return 'SELECT * FROM (SELECT NULL) AS "render_error"';
+    }
+    const left: Query = { ...q, steps: q.steps.slice(0, index) };
+    const right = step.right;
+    const innerFormat: RenderFormat = format === 'pretty' ? 'pretty' : 'compact';
+    const leftSql = renderQueryWithDiagnostics(left, dialect, innerFormat, diagnostics, ctes);
+    const rightSql = renderQueryWithDiagnostics(right, dialect, innerFormat, diagnostics, ctes);
+    const wrap = (sql: string): string => format === 'pretty'
+        ? `SELECT * FROM (\n${indentLines(sql, INDENT)}\n)`
+        : `SELECT * FROM (${sql})`;
+    const leftOp = wrap(leftSql);
+    const rightOp = wrap(rightSql);
+    return format === 'pretty' ? `${leftOp}\n${step.op}\n${rightOp}` : `${leftOp} ${step.op} ${rightOp}`;
+}
+
 // --- query rendering -------------------------------------------------------
 
-function renderQueryUnsafe(q: Query, dialect: DialectSpec, format: RenderFormat = "pretty"): string {
-    const ctx: RenderCtx = { dialect, qualify: countTables(q) > 1 };
+function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: RenderFormat, diagnostics: RenderDiagnostic[], ctes: CteMap = NO_CTES): string {
+    // A set step is a complete relational operation, not a clause in the
+    // surrounding SELECT: render it as operand-wrapped UNION/INTERSECT/EXCEPT.
+    if (q.steps.some(s => s.kind === 'set')) return renderSetQuery(q, dialect, format, diagnostics, ctes);
+
+    const ctx: RenderCtx = { dialect, qualify: countTables(q) > 1, diagnostics };
     const pretty = format === 'pretty';
     const clauses: string[] = [];
 
@@ -688,10 +723,15 @@ function renderQueryUnsafe(q: Query, dialect: DialectSpec, format: RenderFormat 
     // A derived-table root (a fold wrapped by a later map/join) renders as a
     // subquery with its own alias.
     if (q.root.from) {
-        const derivedAlias = q.aliases[0] ?? q.root.name;
-        clauses.push(pretty
-            ? `FROM (\n${indentLines(renderQueryUnsafe(q.root.from, dialect, 'pretty'), INDENT)}\n) AS ${dialect.quoteIdentifier(derivedAlias)}`
-            : `FROM (${renderQueryUnsafe(q.root.from, dialect, 'compact')}) AS ${dialect.quoteIdentifier(derivedAlias)}`);
+        const cteName = ctes.get(q.root.from);
+        if (cteName !== undefined) {
+            clauses.push(`FROM ${dialect.quoteIdentifier(cteName)}`);
+        } else {
+            const derivedAlias = q.aliases[0] ?? q.root.name;
+            clauses.push(pretty
+                ? `FROM (\n${indentLines(renderQueryWithDiagnostics(q.root.from, dialect, 'pretty', ctx.diagnostics, ctes), INDENT)}\n) AS ${dialect.quoteIdentifier(derivedAlias)}`
+                : `FROM (${renderQueryWithDiagnostics(q.root.from, dialect, 'compact', ctx.diagnostics, ctes)}) AS ${dialect.quoteIdentifier(derivedAlias)}`);
+        }
     } else {
         const rootAlias = q.aliases[0] ?? q.root.name;
         const rootAliasClause = ctx.qualify && rootAlias !== q.root.name
@@ -716,9 +756,12 @@ function renderQueryUnsafe(q: Query, dialect: DialectSpec, format: RenderFormat 
             } else {
                 // stepped or derived right side: render as a subquery so
                 // joins compose
-                rightSql = pretty
-                    ? `(\n${indentLines(renderQueryUnsafe(right, dialect, 'pretty'), INDENT)}\n) AS ${dialect.quoteIdentifier(rightAlias)}`
-                    : `(${renderQueryUnsafe(right, dialect, 'compact')}) AS ${dialect.quoteIdentifier(rightAlias)}`;
+                const cteName = ctes.get(right);
+                rightSql = cteName !== undefined
+                    ? dialect.quoteIdentifier(cteName)
+                    : pretty
+                        ? `(\n${indentLines(renderQueryWithDiagnostics(right, dialect, 'pretty', ctx.diagnostics, ctes), INDENT)}\n) AS ${dialect.quoteIdentifier(rightAlias)}`
+                        : `(${renderQueryWithDiagnostics(right, dialect, 'compact', ctx.diagnostics, ctes)}) AS ${dialect.quoteIdentifier(rightAlias)}`;
             }
             const onClause = `ON ${renderExpr(step.on, ctx)}`;
             // In pretty mode a subquery join is laid out vertically so the
@@ -783,13 +826,65 @@ export type RenderResult =
     | { ok: false; diagnostics: RenderDiagnostic[] };
 
 /**
+ * Collect named, non-trivial subqueries in `q` in dependency order so they
+ * can be emitted as CTEs. The top-level query is never a CTE.
+ */
+function collectCtes(top: Query, dialect: DialectSpec): CteMap {
+    const ctes = new Map<Query, string>();
+    const used = new Map<string, number>();
+    const claim = (name: string): string => {
+        const n = used.get(name) ?? 0;
+        used.set(name, n + 1);
+        return n === 0 ? name : `${name}_${n}`;
+    };
+
+    const visit = (q: Query, parent: Query | null): void => {
+        if (q.root.from) visit(q.root.from, q);
+        for (const step of q.steps) {
+            if (step.kind === 'join' || step.kind === 'set') visit(step.right, q);
+        }
+        if (parent !== null && q.name && (q.steps.length > 0 || q.distinct || q.root.from)) {
+            ctes.set(q, claim(q.name));
+        }
+    };
+
+    visit(top, null);
+    return ctes;
+}
+
+/** Render with named intermediates emitted as `WITH name AS (...)` CTEs. */
+export function renderQueryWithCtes(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
+    const diagnostics: RenderDiagnostic[] = [];
+    try {
+        const ctes = collectCtes(q, dialect);
+        const bodies = [...ctes].map(([query, name]) => {
+            const sql = renderQueryWithDiagnostics(query, dialect, format === 'pretty' ? 'compact' : 'compact', diagnostics, ctes);
+            return { name, sql };
+        });
+        const body = renderQueryWithDiagnostics(q, dialect, format, diagnostics, ctes);
+        if (diagnostics.length > 0) return { ok: false, diagnostics };
+        const withClause = bodies.length > 0
+            ? `WITH ${bodies.map((b, i) => `${dialect.quoteIdentifier(b.name)} AS (\n${indentLines(b.sql, INDENT)}\n)${i < bodies.length - 1 ? ',' : ''}`).join('\n')}\n`
+            : '';
+        return { ok: true, sql: withClause + body };
+    } catch (err) {
+        return {
+            ok: false,
+            diagnostics: [{ message: err instanceof Error ? err.message : String(err), node: undefined }],
+        };
+    }
+}
+
+/**
  * Pure renderer entry point: lowering errors are data, not exceptions.
- * `renderQueryUnsafe` may still throw internally while the dialect tables are
- * being made total; the public API converts every failure to a diagnostic.
+ * Capability errors are accumulated on the render context; the only catch
+ * is for unexpected programmer errors, which are still reported as data.
  */
 export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
+    const diagnostics: RenderDiagnostic[] = [];
     try {
-        return { ok: true, sql: renderQueryUnsafe(q, dialect, format) };
+        const sql = renderQueryWithDiagnostics(q, dialect, format, diagnostics);
+        return diagnostics.length > 0 ? { ok: false, diagnostics } : { ok: true, sql };
     } catch (err) {
         return {
             ok: false,

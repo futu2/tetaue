@@ -70,6 +70,7 @@ tetaue lsp [--stdio | --node-ipc | --socket=<port> | --pipe=<name>]
 ```
 
 - `render` validates the module (and its imports) and prints the rendered SQL.
+  `--cte` emits named intermediate queries as `WITH ... AS` clauses.
 - `check` prints diagnostics (or `OK`). `parse` dumps the AST as JSON.
 - `format` (alias `fmt`) runs the same token-stream formatter the editor uses:
   files are rewritten in place (default 4-space indent; `--tabs` / `--tab-width
@@ -170,6 +171,18 @@ The VS Code extension is built two ways:
   shell) and commit both files.
 - The flake pins its own `nixpkgs-unstable` input, so the host NixOS channel
   does not matter.
+
+## Set operations and record update
+
+Queries compose with the pure set combinators `union`, `union_all`,
+`intersect`, and `except` exactly like any other pipeline step:
+
+    active_or_archived = active_users & union_all archived_users
+
+Both operands are complete relational expressions; a later `sort`/`take`
+runs on the combined result. Record update is merge sugar: `{ u | active =
+u.age >= 18 }` is `merge u { active = u.age >= 18 }`, so projections can
+extend a row without repeating every column.
 
 ## Modules
 

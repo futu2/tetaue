@@ -18,8 +18,11 @@ import {
     isTypeParen, isTypeVar, isUnaryMinus,
     type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
 } from './generated/ast.js';
-import type { ProjectModule } from './imports.js';
-import type { BuiltinName } from './builtin.js';
+import type { ProjectModule, ResolvedImportEdge } from './imports.js';
+import { resolveImportScope } from './project-scope.js';
+import { parseStringLiteral } from './strings.js';
+export { parseStringLiteral };
+import { CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
 
 // ---------------------------------------------------------------------------
 // SQL model
@@ -62,6 +65,7 @@ export interface RowNode {
 }
 
 export type JoinKind = 'inner' | 'left' | 'right' | 'full';
+export type SetOp = 'UNION' | 'UNION ALL' | 'INTERSECT' | 'EXCEPT';
 
 export type QueryStep =
     | { readonly kind: 'filter'; readonly cond: SqlNode; readonly having: boolean }
@@ -69,7 +73,8 @@ export type QueryStep =
     | { readonly kind: 'sort'; readonly items: readonly { node: SqlNode; dir: 'ASC' | 'DESC' }[] }
     | { readonly kind: 'take'; readonly n: number }
     | { readonly kind: 'fold'; readonly proj: RowNode }
-    | { readonly kind: 'join'; readonly joinKind: JoinKind; readonly right: Query; readonly on: SqlNode; readonly proj: RowNode };
+    | { readonly kind: 'join'; readonly joinKind: JoinKind; readonly right: Query; readonly on: SqlNode; readonly proj: RowNode }
+    | { readonly kind: 'set'; readonly op: SetOp; readonly right: Query };
 
 export interface Query {
     /**
@@ -151,6 +156,13 @@ export interface Ctx {
     /** Names bound anywhere in the module (for forward-reference hints). */
     moduleBindings: Set<string>;
 }
+
+/** The public, pure evaluation result: diagnostics are returned, never hidden. */
+export type EvalResult<T> =
+    | { ok: true; value: T; diagnostics: Diagnostic[] }
+    | { ok: false; diagnostics: Diagnostic[] };
+
+const EMPTY_BINDINGS: ReadonlySet<string> = new Set();
 
 const ERROR: Value = { kind: 'error' };
 
@@ -234,29 +246,6 @@ function numberValue(v: Value): number | null {
     return null;
 }
 
-/** Unescape a STRING terminal value, including the surrounding quotes. */
-export function parseStringLiteral(raw: string): string {
-    const inner = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
-    let out = '';
-    for (let i = 0; i < inner.length; i++) {
-        const ch = inner[i]!;
-        if (ch === '\\' && i + 1 < inner.length) {
-            const next = inner[i + 1]!;
-            i++;
-            switch (next) {
-                case 'n': out += '\n'; break;
-                case 't': out += '\t'; break;
-                case 'r': out += '\r'; break;
-                case '"': out += '"'; break;
-                case '\\': out += '\\'; break;
-                default: out += '\\' + next; // unknown escapes are preserved verbatim
-            }
-        } else {
-            out += ch;
-        }
-    }
-    return out;
-}
 
 function lambdaParam(l: Lambda): string {
     return l.param?.name ?? '';
@@ -335,7 +324,7 @@ export function querySchema(q: Query): Schema {
     let schema: Schema = new Map(q.root.schema);
     for (const step of q.steps) {
         switch (step.kind) {
-            case 'filter': case 'sort': case 'take': break;
+            case 'filter': case 'sort': case 'take': case 'set': break;
             case 'map': case 'fold': schema = rowNodeSchema(step.proj); break;
             // The join's merger lambda projects the result row (like map).
             case 'join': schema = rowNodeSchema(step.proj); break;
@@ -358,6 +347,10 @@ function hasFoldStep(q: Query): boolean {
 
 function hasTakeStep(q: Query): boolean {
     return q.steps.some(s => s.kind === 'take');
+}
+
+function hasSetStep(q: Query): boolean {
+    return q.steps.some(s => s.kind === 'set');
 }
 
 /** True when the query's last projection contains a window function. */
@@ -439,6 +432,7 @@ function wrapAsDerived(q: Query): Query {
 function prepareQueryForStep(q: Query, stepName: string): Query {
     const needsBoundary = q.distinct
         || hasWindowProjection(q)
+        || hasSetStep(q)
         || (hasTakeStep(q) && stepName !== 'take');
     return needsBoundary ? wrapAsDerived(q) : q;
 }
@@ -447,7 +441,7 @@ function prepareQueryForStep(q: Query, stepName: string): Query {
 // Application
 // ---------------------------------------------------------------------------
 
-export function apply(f: Value, arg: Value, at: AstNode | undefined, ctx: Ctx): Value {
+export function applyWith(f: Value, arg: Value, at: AstNode | undefined, ctx: Ctx): Value {
     if (isError(f) || isError(arg)) return ERROR;
     switch (f.kind) {
         case 'fn':
@@ -466,7 +460,7 @@ export function apply(f: Value, arg: Value, at: AstNode | undefined, ctx: Ctx): 
             const env = new Map(f.closure);
             env.set(f.params[0]!, arg);
             if (remaining.length === 0) {
-                return evalExpr(f.body, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
+                return evalExprWith(f.body, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
             }
             return { kind: 'lambda', params: remaining, body: f.body, closure: env, ast: f.ast };
         }
@@ -474,6 +468,21 @@ export function apply(f: Value, arg: Value, at: AstNode | undefined, ctx: Ctx): 
             ctx.diagnostics.push({ node: at ?? fallbackNode(ctx), message: `cannot apply ${describe(f)}` });
             return ERROR;
     }
+}
+
+
+/** Pure public entry point: evaluate with an immutable environment and return diagnostics. */
+export function evalExpr(e: Expr, env: ReadonlyMap<string, Value>, moduleBindings: ReadonlySet<string> = EMPTY_BINDINGS): EvalResult<Value> {
+    const diagnostics: Diagnostic[] = [];
+    const value = evalExprWith(e, { env: new Map(env), diagnostics, moduleBindings: new Set(moduleBindings) });
+    return isError(value) ? { ok: false, diagnostics } : { ok: true, value, diagnostics };
+}
+
+/** Pure public entry point for applying a first-class function/step value. */
+export function apply(f: Value, arg: Value, at: AstNode | undefined, env: ReadonlyMap<string, Value>, moduleBindings: ReadonlySet<string> = EMPTY_BINDINGS): EvalResult<Value> {
+    const diagnostics: Diagnostic[] = [];
+    const value = applyWith(f, arg, at, { env: new Map(env), diagnostics, moduleBindings: new Set(moduleBindings) });
+    return isError(value) ? { ok: false, diagnostics } : { ok: true, value, diagnostics };
 }
 
 function astOf(v: Value): AstNode | undefined {
@@ -614,8 +623,8 @@ function composeValues(l: Value, r: Value, op: '>>>' | '<<<', at: AstNode, ctx: 
         return fn(`(${lName} ${op} ${rName})`, (x, at2, ctx2) => {
             const first = op === '<<<' ? r : l;
             const second = op === '<<<' ? l : r;
-            const v = apply(first, x, at2, ctx2);
-            return isError(v) ? ERROR : apply(second, v, at2, ctx2);
+            const v = applyWith(first, x, at2, ctx2);
+            return isError(v) ? ERROR : applyWith(second, v, at2, ctx2);
         });
     }
     ctx.diagnostics.push({ node: at, message: `cannot compose ${describe(l)} with ${describe(r)} — both must be functions` });
@@ -633,7 +642,7 @@ function mapStepFromTransformer(q: Query, f: Value, at: AstNode | undefined, ctx
         afterFold = true;
     }
     const row = rowRecord(q, at);
-    const v = apply(f, row, at, ctx);
+    const v = applyWith(f, row, at, ctx);
     if (isError(v)) return null;
     const proj = rowFromRecord(v, at, ctx, 'projection', afterFold);
     if (!proj) return null;
@@ -755,7 +764,7 @@ function access(recv: Value, prop: string, at: AstNode, ctx: Ctx): Value {
  * Highest $n index in `node` that is NOT bound in `env` and not hidden inside
  * an explicit lambda body (explicit lambdas are their own scope).
  */
-function dollarArity(node: AstNode, env: Map<string, Value>): number {
+function dollarArity(node: AstNode, env: ReadonlyMap<string, Value>): number {
     let arity = 0;
     for (const n of AstUtils.streamAst(node)) {
         if (!isDollarParam(n) || env.has(n.value)) continue;
@@ -791,11 +800,11 @@ function dollarLambda(body: Expr, arity: number, ctx: Ctx): Value {
     return { kind: 'lambda', params, body, closure: new Map(ctx.env), ast: body };
 }
 
-export function evalExpr(e: Expr, ctx: Ctx): Value {
+export function evalExprWith(e: Expr, ctx: Ctx): Value {
     if (isLetExpression(e) || isLambdaLetExpression(e)) {
         // `let x = value in body` — a pure lexical binding. Evaluation
         // extends the environment immutably; the value is not mutable state.
-        let v = evalExpr(e.value as Expr, ctx);
+        let v = evalExprWith(e.value as Expr, ctx);
         if (isError(v)) return ERROR;
         // A query-type annotation on a local bare table defines the schema,
         // exactly like a top-level binding annotation.
@@ -819,9 +828,9 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         }
         const env = new Map(ctx.env);
         env.set(e.name ?? '', v);
-        return evalExpr(e.body as Expr, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
+        return evalExprWith(e.body as Expr, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
     }
-    if (isAscription(e)) return evalExpr(e.operand!, ctx); // type annotations are erased
+    if (isAscription(e)) return evalExprWith(e.operand!, ctx); // type annotations are erased
     if (isUnaryMinus(e)) return evalUnary(e, ctx);
     if (isBinaryExpression(e) || isLambdaBinaryExpression(e)) {
         // (LambdaBinaryExpression is the `&`/`$`-free chain used for lambda
@@ -830,13 +839,13 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
             // pipeline: `left & right` ⇔ apply right to left
             const left = evalUnary(e.left, ctx);
             const right = evalUnary(e.right, ctx);
-            return apply(right, left, e, ctx);
+            return applyWith(right, left, e, ctx);
         }
         if (e.operator === '$') {
             // application: `left $ right` ⇔ apply left to right (right-assoc)
             const left = evalUnary(e.left, ctx);
             const right = evalArg(e.right as Expr, ctx);
-            return apply(left, right, e, ctx);
+            return applyWith(left, right, e, ctx);
         }
         if (e.operator === '>>>' || e.operator === '<<<') {
             // PureScript function composition: `f <<< g` = `x => f (g x)`,
@@ -852,7 +861,7 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         return evalBinary(e.operator, l, r, e, ctx);
     }
     if (isAccessExpression(e)) {
-        const recv = evalExpr(e.receiver, ctx);
+        const recv = evalExprWith(e.receiver, ctx);
         if (isError(recv)) return ERROR;
         return access(recv, e.property, e, ctx);
     }
@@ -860,14 +869,14 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         // All builtins are ordinary curried functions — including the
         // list-argument ones (`concat [a, b]`, `substring [s, 1, 3]`, ...),
         // which take a single list argument like any other value.
-        let f = evalExpr(e.func, ctx);
+        let f = evalExprWith(e.func, ctx);
         for (const argExpr of e.arguments) {
             if (isError(f)) {
                 evalArg(argExpr, ctx); // keep collecting diagnostics
                 continue;
             }
             const arg = evalArg(argExpr, ctx);
-            f = apply(f, arg, argExpr, ctx);
+            f = applyWith(f, arg, argExpr, ctx);
         }
         return f;
     }
@@ -888,19 +897,36 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         return evalCase(e, ctx);
     }
     if (isListLiteral(e)) {
-        const items = e.elements.map(el => evalExpr(el, ctx));
+        const items = e.elements.map(el => evalExprWith(el, ctx));
         if (items.some(isError)) return ERROR;
         return { kind: 'list', items, ast: e };
     }
     if (isMapLiteral(e)) {
-        const fields: { key: string; value: Value }[] = [];
-        const seen = new Set<string>();
+        // `{ receiver | k = v, ... }` is pure record-update sugar for
+        // `merge receiver { k = v, ... }`; the explicit entries win.
+        let fields: { key: string; value: Value }[];
+        if (e.receiver) {
+            const receiver = evalExprWith(e.receiver, ctx);
+            if (isError(receiver)) return ERROR;
+            if (receiver.kind !== 'record') {
+                const receiverNode = exprNode(receiver);
+                ctx.diagnostics.push({ node: e.receiver, message: `record update expects a record before '|', got ${receiverNode ? `type ${typeName(receiverNode.type)}` : describe(receiver)}` });
+                return ERROR;
+            }
+            const base = recordFields(receiver, e.receiver, ctx);
+            if (base === null) return ERROR;
+            fields = [...base];
+        } else {
+            fields = [];
+        }
+        const literalKeys = new Set<string>();
         for (const entry of e.entries) {
-            if (seen.has(entry.key)) {
+            if (literalKeys.has(entry.key)) {
                 ctx.diagnostics.push({ node: entry, message: `duplicate map key '${entry.key}'` });
             }
-            seen.add(entry.key);
-            fields.push({ key: entry.key, value: evalExpr(entry.value, ctx) });
+            literalKeys.add(entry.key);
+            const entryValue = evalExprWith(entry.value, ctx);
+            fields = [...fields.filter(f => f.key !== entry.key), { key: entry.key, value: entryValue }];
         }
         return recordValue(fields, e);
     }
@@ -944,7 +970,7 @@ function evalUnary(u: UnaryExpression, ctx: Ctx): Value {
         }
         return mkExpr({ kind: 'bin', op: '-', left: lit(0, node.type), right: node, type: node.type }, u);
     }
-    return evalExpr(u, ctx);
+    return evalExprWith(u, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1005,10 @@ function evalCase(e: CaseExpression, ctx: Ctx): Value {
     const branches: { cond: SqlNode; value: SqlNode }[] = [];
     let elseValue: SqlNode | null = null;
     let resultType: SqlType | null = null;
+    // Simple case: evaluate the subject ONCE, then compare every branch with
+    // the same immutable value.
+    const subjectValue = e.subject ? evalExprWith(e.subject, ctx) : null;
+    if (subjectValue !== null && isError(subjectValue)) return ERROR;
 
     const valueNode = (branch: import('./generated/ast.js').CaseBranch, value: Value): SqlNode | null => {
         const node = exprNode(value);
@@ -999,7 +1029,7 @@ function evalCase(e: CaseExpression, ctx: Ctx): Value {
 
     for (let i = 0; i < e.branches.length; i++) {
         const b = e.branches[i]!;
-        const value = evalExpr(b.value!, ctx);
+        const value = evalExprWith(b.value!, ctx);
         if (isError(value)) return ERROR;
         if (b.fallback) {
             if (i !== e.branches.length - 1) {
@@ -1012,18 +1042,16 @@ function evalCase(e: CaseExpression, ctx: Ctx): Value {
             continue;
         }
         let condValue: Value;
-        if (e.subject) {
-            // Simple case: `case subject { c1 => v1, ..., _ => v }` is sugar for
-            // the searched form with `subject == c1` conditions. Reuse evalBinary
-            // so `== null` becomes IS NULL and type checks match the operator.
-            const subject = evalExpr(e.subject, ctx);
-            if (isError(subject)) return ERROR;
-            const condExpr = evalExpr(b.cond!, ctx);
+        if (subjectValue !== null) {
+            // The searched form with `subject == c1` conditions. Reuse
+            // evalBinary so `== null` becomes IS NULL and type checks match
+            // the operator.
+            const condExpr = evalExprWith(b.cond!, ctx);
             if (isError(condExpr)) return ERROR;
-            condValue = evalBinary('==', subject, condExpr, b.cond ?? e, ctx);
+            condValue = evalBinary('==', subjectValue, condExpr, b.cond ?? e, ctx);
             if (isError(condValue)) return ERROR;
         } else {
-            condValue = evalExpr(b.cond!, ctx);
+            condValue = evalExprWith(b.cond!, ctx);
             if (isError(condValue)) return ERROR;
         }
         const cond = exprNode(condValue);
@@ -1062,11 +1090,29 @@ function joinKindOf(v: Value): JoinKind | null {
     return v.kind === 'jkind' ? (JOIN_KINDS[v.name] ?? null) : null;
 }
 
+/** A set operation: `left & union right`, `intersect`, `except`, `union_all`. */
+function setOpBuiltin(name: string, op: SetOp): () => Value {
+    return () => fn(name, (right, at, ctx) => {
+        if (right.kind !== 'query') {
+            ctx.diagnostics.push({ node: at ?? right.ast, message: `${name} expects a query as its argument, got ${describe(right)} — use it in a pipeline: query & ${name} right` });
+            return ERROR;
+        }
+        return step(name, (q, at2, ctx2) => {
+            // Set operands are complete relational expressions. Any step
+            // applied AFTER the set will wrap the combined result as a
+            // derived table via prepareQueryForStep/hasSetStep.
+            const left = prepareQueryForStep(q, name);
+            const rightQuery = prepareQueryForStep(right.query, name);
+            return addStep(left, { kind: 'set', op, right: rightQuery });
+        });
+    });
+}
+
 const AGG_TYPES: Record<string, SqlType> = {
     count: 'int', sum: 'int', avg: 'float', min: 'int', max: 'int', list: 'array',
 };
 
-export const BUILTINS: Record<BuiltinName, () => Value> = {
+export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     // --- join kinds (bare identifiers, usable as `join`'s first argument) ---
     inner: () => ({ kind: 'jkind', name: 'inner' }),
     left: () => ({ kind: 'jkind', name: 'left' }),
@@ -1116,7 +1162,7 @@ export const BUILTINS: Record<BuiltinName, () => Value> = {
         }
         return step('sort', (q, at2, ctx2) => {
             const row = rowRecord(q, at2);
-            const v = apply(sel, row, at2, ctx2);
+            const v = applyWith(sel, row, at2, ctx2);
             // Ordering by an aggregate is allowed after a fold (ORDER BY
             // SUM(...)) and after a nested-aggregate map (the derived table's
             // columns are aggregate expressions).
@@ -1161,6 +1207,16 @@ export const BUILTINS: Record<BuiltinName, () => Value> = {
         return { kind: 'query', query: { ...q, distinct: true }, ast: at };
     }),
 
+    // --- set operations (pure query -> query combinators) -------------
+    // left & union right, left & union_all right, left & intersect right,
+    // and left & except right render as SQL set operations. Both operands
+    // are complete relational expressions; later steps wrap the combined
+    // result as a derived table.
+    union: setOpBuiltin('union', 'UNION'),
+    union_all: setOpBuiltin('union_all', 'UNION ALL'),
+    intersect: setOpBuiltin('intersect', 'INTERSECT'),
+    except: setOpBuiltin('except', 'EXCEPT'),
+
     // --- records -------------------------------------------------------
     // `merge l r` combines two records; the right record's fields win on
     // overlap (JS/Nix object-spread style). Used in projections to extend a
@@ -1196,7 +1252,7 @@ export const BUILTINS: Record<BuiltinName, () => Value> = {
                 q = { ...q, steps: q.steps.filter(s => s.kind !== 'sort') };
             }
             if (hasFoldStep(q)) q = wrapAsDerived(q);
-            const v = apply(sel, rowRecord(q, at2), at2, ctx2);
+            const v = applyWith(sel, rowRecord(q, at2), at2, ctx2);
             if (v.kind !== 'record') {
                 ctx2.diagnostics.push({ node: at2 ?? sel.ast, message: `fold expects a projection record, got ${describe(v)}` });
                 return null;
@@ -1289,13 +1345,13 @@ export const BUILTINS: Record<BuiltinName, () => Value> = {
                         const leftRow = rowRecord(q, at5);
                         // The ON condition: both rows in scope, must be boolean.
                         // Functions are curried: apply once per row.
-                        const on1 = apply(on, leftRow, at5, ctx5);
+                        const on1 = applyWith(on, leftRow, at5, ctx5);
                         if (isError(on1)) return null;
                         if (!isApplicable(on1)) {
                             ctx5.diagnostics.push({ node: at5 ?? on.ast, message: `join 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got a one-argument function` });
                             return null;
                         }
-                        const onVal = apply(on1, rightRow, at5, ctx5);
+                        const onVal = applyWith(on1, rightRow, at5, ctx5);
                         const node = exprNode(onVal);
                         if (!node || (node.type !== 'bool' && node.type !== 'unknown')) {
                             ctx5.diagnostics.push({ node: at5 ?? on.ast, message: `join 'on' condition must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(onVal)}` });
@@ -1304,13 +1360,13 @@ export const BUILTINS: Record<BuiltinName, () => Value> = {
                         if (forbid(node, ['agg', 'group', 'order', 'window'], 'the join condition', at5 ?? on.ast, ctx5)) return null;
                         // The merger: projects the result row (like `map`),
                         // applied curried to both rows (a plain `merge` works).
-                        const m1 = apply(merge, leftRow, at5, ctx5);
+                        const m1 = applyWith(merge, leftRow, at5, ctx5);
                         if (isError(m1)) return null;
                         if (!isApplicable(m1)) {
                             ctx5.diagnostics.push({ node: at5 ?? merge.ast, message: `join 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got a one-argument function` });
                             return null;
                         }
-                        const mv = apply(m1, rightRow, at5, ctx5);
+                        const mv = applyWith(m1, rightRow, at5, ctx5);
                         if (isError(mv)) return null;
                         const proj = rowFromRecord(mv, at5, ctx5, 'join merger');
                         if (!proj) return null;
@@ -1712,7 +1768,7 @@ function filterBuiltin(name: string): () => Value {
             // result) has no GROUP BY but its columns are aggregate
             // expressions, so predicates over them still belong in HAVING.
             const having = hasFoldStep(q) || schemaHasAggregates(q);
-            const v = apply(pred, rowRecord(q, at2), at2, ctx2);
+            const v = applyWith(pred, rowRecord(q, at2), at2, ctx2);
             const node = exprNode(v);
             if (!node || (node.type !== 'bool' && node.type !== 'unknown')) {
                 ctx2.diagnostics.push({ node: at2 ?? pred.ast, message: `${name} predicate must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(v)}` });
@@ -1965,8 +2021,6 @@ function numericBinaryBuiltin(name: string, result: 'float' | 'first'): () => Va
     });
 }
 
-const CAST_TYPES = ['int', 'float', 'string', 'bool', 'date', 'timestamp'] as const;
-
 /** `cast x "int"` / `try_cast x "float"` — target type as a string literal. */
 function castBuiltin(name: 'cast' | 'try_cast'): () => Value {
     return () => fn(name, (arg, at, ctx) => {
@@ -2056,9 +2110,9 @@ function exprArgs(
     return nodes;
 }
 
-const LIST_BUILTINS: Record<string, { min: number; max: number; apply: (args: Value[], at: AstNode | undefined, ctx: Ctx) => Value }> = {
+const LIST_BUILTINS: Readonly<Record<string, { min: number; max: number; apply: (args: Value[], at: AstNode | undefined, ctx: Ctx) => Value }>> = {
     concat: {
-        min: 2, max: Infinity,
+        min: LIST_ARITY.concat![0], max: LIST_ARITY.concat![1],
         apply: (args, at, ctx) => {
             const nodes = exprArgs(args, 'concat', 'string', at, ctx);
             if (nodes === null) return ERROR;
@@ -2066,15 +2120,15 @@ const LIST_BUILTINS: Record<string, { min: number; max: number; apply: (args: Va
         },
     },
     greatest: {
-        min: 2, max: Infinity,
+        min: LIST_ARITY.greatest![0], max: LIST_ARITY.greatest![1],
         apply: (args, at, ctx) => listExtremum('greatest', args, at, ctx),
     },
     least: {
-        min: 2, max: Infinity,
+        min: LIST_ARITY.least![0], max: LIST_ARITY.least![1],
         apply: (args, at, ctx) => listExtremum('least', args, at, ctx),
     },
     round: {
-        min: 1, max: 2,
+        min: LIST_ARITY.round![0], max: LIST_ARITY.round![1],
         apply: (args, at, ctx) => {
             const nodes = exprArgs(args, 'round', 'numeric', at, ctx);
             if (nodes === null) return ERROR;
@@ -2082,7 +2136,7 @@ const LIST_BUILTINS: Record<string, { min: number; max: number; apply: (args: Va
         },
     },
     substring: {
-        min: 2, max: 3,
+        min: LIST_ARITY.substring![0], max: LIST_ARITY.substring![1],
         apply: (args, at, ctx) => {
             const value = exprArgs([args[0]!], 'substring', 'string', at, ctx);
             if (value === null) return ERROR;
@@ -2095,15 +2149,15 @@ const LIST_BUILTINS: Record<string, { min: number; max: number; apply: (args: Va
         },
     },
     lpad: {
-        min: 2, max: 3,
+        min: LIST_ARITY.lpad![0], max: LIST_ARITY.lpad![1],
         apply: (args, at, ctx) => listPad('lpad', args, at, ctx),
     },
     rpad: {
-        min: 2, max: 3,
+        min: LIST_ARITY.rpad![0], max: LIST_ARITY.rpad![1],
         apply: (args, at, ctx) => listPad('rpad', args, at, ctx),
     },
     regex_extract: {
-        min: 2, max: 3,
+        min: LIST_ARITY.regex_extract![0], max: LIST_ARITY.regex_extract![1],
         apply: (args, at, ctx) => {
             const value = exprArgs([args[0]!], 'regex_extract', 'string', at, ctx);
             if (value === null) return ERROR;
@@ -2116,11 +2170,11 @@ const LIST_BUILTINS: Record<string, { min: number; max: number; apply: (args: Va
         },
     },
     lag: {
-        min: 1, max: 3,
+        min: LIST_ARITY.lag![0], max: LIST_ARITY.lag![1],
         apply: (args, at, ctx) => listLagLead('lag', args, at, ctx),
     },
     lead: {
-        min: 1, max: 3,
+        min: LIST_ARITY.lead![0], max: LIST_ARITY.lead![1],
         apply: (args, at, ctx) => listLagLead('lead', args, at, ctx),
     },
 };
@@ -2434,6 +2488,8 @@ export interface AnalysisResult {
 export interface ProjectAnalysisOptions {
     /** Require the last module's last binding to be a query (default true). */
     requireQuery?: boolean;
+    /** Resolved import edges from `collectModuleTree` (pure tree). */
+    importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
 }
 
 /**
@@ -2444,12 +2500,9 @@ export interface ProjectAnalysisOptions {
  * Only `export`ed bindings are visible to importers (flat or qualified).
  * The ROOT module's last binding is the project's query.
  */
-export function analyzeProject(modules: ProjectModule[], options: ProjectAnalysisOptions = {}): AnalysisResult {
-    const { requireQuery = true } = options;
+export function analyzeProject(modules: readonly ProjectModule[], options: ProjectAnalysisOptions = {}): AnalysisResult {
+    const { requireQuery = true, importsByModule = new Map() } = options;
     const diagnostics: Diagnostic[] = [];
-    // Forward-reference hints are filled per module below: a name from a
-    // sibling module is simply unknown, not "defined later".
-    const ctx: Ctx = { env: new Map(), diagnostics, moduleBindings: new Set<string>() };
 
     // Exported bindings per module, keyed by module identity (diamond dedup
     // means every importer references the SAME target object). Filled as each
@@ -2458,72 +2511,48 @@ export function analyzeProject(modules: ProjectModule[], options: ProjectAnalysi
 
     let value: Value = ERROR;
     for (const module of modules) {
-        const env = new Map<string, Value>();
+        // Each module gets its OWN immutable scope: prelude, imports, then
+        // local bindings. The environment is threaded through the binding
+        // fold; nothing is reassigned on a shared context object.
+        let env = new Map<string, Value>();
         for (const [name, factory] of Object.entries(BUILTINS)) {
             env.set(name, factory());
         }
-        ctx.env = env;
-        ctx.moduleBindings = new Set(module.model.bindings.map(b => b.name));
+        const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
+        const moduleDiagnostics: Diagnostic[] = [];
+        const ctx: Ctx = { env, diagnostics: moduleDiagnostics, moduleBindings };
 
         // --- imports: flat bindings + namespace aliases ------------------
-        // `scope` tracks every name this module has bound (imports, aliases,
-        // then local bindings) so collisions are errors, never silent
-        // shadowing. Prelude names are NOT tracked — imports and local
-        // bindings may shadow builtins, exactly as before. Values are labels
-        // describing the existing binding, for conflict messages.
-        const scope = new Map<string, string>();
-        for (const { alias, target, importNode } of module.imports) {
-            const targetExports = exportsByModule.get(target);
-            if (!targetExports) continue; // cyclic/missing target — already diagnosed
-            const spec = parseStringLiteral(importNode.path);
-            // A selective name list `(users, orders)` restricts what is
-            // visible to exactly those exports; every listed name must be
-            // exported by the target.
-            let selected = targetExports;
-            if (importNode.names && importNode.names.length > 0) {
-                for (const n of importNode.names) {
-                    if (!targetExports.has(n)) {
-                        const keys = [...targetExports.keys()];
-                        diagnostics.push({ node: importNode, message: `'${n}' is not exported by '${spec}' — exported: ${keys.length > 0 ? keys.join(', ') : '(none)'}` });
-                    }
-                }
-                selected = new Map(
-                    importNode.names.filter(n => targetExports.has(n)).map(n => [n, targetExports.get(n)!]),
-                );
-            }
-            if (alias !== undefined) {
-                if (scope.has(alias)) {
-                    diagnostics.push({ node: importNode, message: conflictMessage(alias, scope.get(alias)!, 'import alias') });
-                    continue;
-                }
-                scope.set(alias, `import alias '${alias}'`);
-                env.set(alias, { kind: 'module', name: alias, exports: selected, ast: importNode });
-            } else {
-                for (const [name, v] of selected) {
-                    if (scope.has(name)) {
-                        diagnostics.push({ node: importNode, message: conflictMessage(name, scope.get(name)!, `imported from '${spec}'`) });
-                        continue;
-                    }
-                    scope.set(name, `'${name}' imported from '${spec}'`);
-                    env.set(name, v);
-                }
-            }
+        // Shared with inference (project-scope.ts): collision detection and
+        // selective-import validation happen exactly once, with one wording.
+        const moduleImports: readonly ResolvedImportEdge[] = importsByModule.get(module) ?? module.imports ?? [];
+        const imported = resolveImportScope(module, moduleImports, exportsByModule);
+        moduleDiagnostics.push(...imported.diagnostics);
+        for (const [name, v] of imported.flat) env.set(name, v);
+        for (const [alias, selected] of imported.namespaces) {
+            env.set(alias, { kind: 'module', name: alias, exports: new Map(selected), ast: module.model.imports.find(imp => imp.alias === alias) });
         }
+        const scope = new Map(imported.scope);
 
         // --- local bindings (in order) ------------------------------------
         const exports = new Map<string, Value>();
-        const seen = new Set<string>(); // within-module duplicate detection (checkBinding)
+        let seen = new Set<string>(); // within-module duplicate detection (immutably updated)
         for (const binding of module.model.bindings) {
             if (scope.has(binding.name)) {
                 // The program is invalid either way; keep evaluating so
                 // downstream errors still surface, but report the conflict.
-                diagnostics.push({ node: binding, message: conflictMessage(binding.name, scope.get(binding.name)!, 'a local binding') });
+                moduleDiagnostics.push({ node: binding, message: conflictMessage(binding.name, scope.get(binding.name)!, 'a local binding') });
             }
             scope.set(binding.name, `local binding '${binding.name}'`);
-            value = checkBinding(binding, ctx, seen);
+            const result = checkBinding(binding, env, moduleBindings, seen);
+            moduleDiagnostics.push(...result.diagnostics);
+            env = result.env;
+            seen = result.seen;
+            value = result.value;
             if (binding.export) exports.set(binding.name, value);
         }
         exportsByModule.set(module, exports);
+        diagnostics.push(...moduleDiagnostics);
     }
 
     const root = modules[modules.length - 1];
@@ -2552,15 +2581,25 @@ function conflictMessage(name: string, existing: string, newcomer: string): stri
 
 /** Evaluate a single module (no imports). */
 export function analyze(model: Model): AnalysisResult {
-    return analyzeProject([{ model, uri: undefined, imports: [] }]);
+    return analyzeProject([{ model, uri: undefined, imports: [] }], { importsByModule: new Map() });
 }
 
-function checkBinding(binding: Binding, ctx: Ctx, seen: Set<string>): Value {
-    if (seen.has(binding.name)) {
-        ctx.diagnostics.push({ node: binding, message: `duplicate binding name '${binding.name}'` });
+interface BindingResult {
+    value: Value;
+    env: Map<string, Value>;
+    seen: Set<string>;
+    diagnostics: Diagnostic[];
+}
+
+function checkBinding(binding: Binding, env: Map<string, Value>, moduleBindings: ReadonlySet<string>, seen: ReadonlySet<string>): BindingResult {
+    const diagnostics: Diagnostic[] = [];
+    const nextSeen = new Set(seen);
+    if (nextSeen.has(binding.name)) {
+        diagnostics.push({ node: binding, message: `duplicate binding name '${binding.name}'` });
     }
-    seen.add(binding.name);
-    let v = evalExpr(binding.value, ctx);
+    nextSeen.add(binding.name);
+    const ctx: Ctx = { env, diagnostics, moduleBindings: new Set(moduleBindings) };
+    let v = evalExprWith(binding.value, ctx);
     // A query-type binding annotation is the schema of a plain table:
     //   users: query { id: int, name: string } = table "users"
     // (Only join-free queries: stamping joined columns with the root table
@@ -2596,8 +2635,9 @@ function checkBinding(binding: Binding, ctx: Ctx, seen: Set<string>): Value {
     if (v.kind === 'query') {
         v = { kind: 'query', query: { ...v.query, name: binding.name }, ast: v.ast };
     }
-    ctx.env.set(binding.name, v);
-    return v;
+    const nextEnv = new Map(env);
+    nextEnv.set(binding.name, v);
+    return { value: v, env: nextEnv, seen: nextSeen, diagnostics };
 }
 
 // re-export for the validator

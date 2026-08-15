@@ -128,9 +128,8 @@ type ManifestLoad =
     | { kind: 'parse-error'; dir: string; message: string }
     | { kind: 'none'; dir: string };
 
-// In-process cache keyed by manifest path; a changed mtime re-reads the file,
-// so edits to tetaue.toml take effect on the next resolution (LSP included).
-const manifestCache = new Map<string, { mtimeMs: number; load: ManifestLoad }>();
+/** Per-project manifest cache; a changed mtime re-reads the file. */
+export type ManifestCache = Map<string, { mtimeMs: number; load: ManifestLoad }>;
 
 function isFile(p: string): boolean {
     try {
@@ -157,7 +156,7 @@ export function findManifestDir(fromDir: string): string | undefined {
     }
 }
 
-function loadManifest(manifestDir: string): ManifestLoad {
+function loadManifest(manifestDir: string, cache: ManifestCache): ManifestLoad {
     const file = path.join(manifestDir, MANIFEST_NAME);
     let stat;
     try {
@@ -165,7 +164,7 @@ function loadManifest(manifestDir: string): ManifestLoad {
     } catch {
         return { kind: 'none', dir: manifestDir };
     }
-    const cached = manifestCache.get(file);
+    const cached = cache.get(file);
     if (cached && cached.mtimeMs === stat.mtimeMs) return cached.load;
     let load: ManifestLoad;
     try {
@@ -177,7 +176,7 @@ function loadManifest(manifestDir: string): ManifestLoad {
             message: err instanceof TomlError ? err.message : err instanceof Error ? err.message : String(err),
         };
     }
-    manifestCache.set(file, { mtimeMs: stat.mtimeMs, load });
+    cache.set(file, { mtimeMs: stat.mtimeMs, load });
     return load;
 }
 
@@ -188,8 +187,15 @@ function loadManifest(manifestDir: string): ManifestLoad {
  * file ONLY. Everything else is tried relative to the importer first, then
  * as `name/rest` against the dependencies.
  */
-export function resolveImport(importerUri: string | undefined, spec: string): ResolvedImport {
-    const importerDir = importerUri ? path.dirname(URI.parse(importerUri).fsPath) : process.cwd();
+export interface ImportResolverOptions {
+    /** Per-project manifest cache (fresh by default; pass one for cross-call caching). */
+    cache?: ManifestCache;
+    /** Directory used when `importerUri` is undefined. Defaults to process.cwd(). */
+    cwd?: string;
+}
+
+function resolveImportWith(importerUri: string | undefined, spec: string, cache: ManifestCache, cwd: string): ResolvedImport {
+    const importerDir = importerUri ? path.dirname(URI.parse(importerUri).fsPath) : cwd;
     const searched: string[] = [importerDir];
     const isPath = spec.startsWith('.') || path.isAbsolute(spec);
     const slash = spec.indexOf('/');
@@ -203,7 +209,7 @@ export function resolveImport(importerUri: string | undefined, spec: string): Re
             // lib) — surface it.
             if (!isPath) {
                 const manifestDir = findManifestDir(importerDir);
-                const load = manifestDir ? loadManifest(manifestDir) : undefined;
+                const load = manifestDir ? loadManifest(manifestDir, cache) : undefined;
                 if (load?.kind === 'ok' && load.manifest.dependencies.has(name)) {
                     return {
                         uri: URI.file(candidate).toString(),
@@ -224,7 +230,7 @@ export function resolveImport(importerUri: string | undefined, spec: string): Re
     if (!manifestDir) {
         return { uri: undefined, searched, error: `cannot resolve import '${spec}' — no ${MANIFEST_NAME} found (searched: ${searched.join(', ')})` };
     }
-    const load = loadManifest(manifestDir);
+    const load = loadManifest(manifestDir, cache);
     if (load.kind === 'parse-error') {
         return { uri: undefined, searched, error: `error in ${MANIFEST_NAME}: ${load.message}` };
     }
@@ -278,6 +284,21 @@ export function resolveImport(importerUri: string | undefined, spec: string): Re
         searched,
         error: `no file '${rest.length > 0 ? rest : '<index>'}' in dependency '${name}' (${depRoot})`,
     };
+}
+
+/**
+ * Resolve an import specifier. A fresh manifest cache is used per call; use
+ * `createImportResolver` when many resolutions should share a cache.
+ */
+export function resolveImport(importerUri: string | undefined, spec: string, options: ImportResolverOptions = {}): ResolvedImport {
+    return resolveImportWith(importerUri, spec, options.cache ?? new Map(), options.cwd ?? process.cwd());
+}
+
+/** Build a reusable resolver (e.g. for the CLI/LSP), optionally sharing a cache. */
+export function createImportResolver(options: ImportResolverOptions = {}): (importerUri: string | undefined, spec: string) => ResolvedImport {
+    const cache = options.cache ?? new Map();
+    const cwd = options.cwd ?? process.cwd();
+    return (importerUri, spec) => resolveImportWith(importerUri, spec, cache, cwd);
 }
 
 /**

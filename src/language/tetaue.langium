@@ -165,7 +165,7 @@ Argument infers Expr:
     | {infer BooleanLiteral} value=('true' | 'false')
     | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
-    | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
+    | {infer MapLiteral} '{' (receiver=Expression '|')? (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
     | {infer Lambda} param=LambdaParam '=>' body=LambdaBody
     | {infer CaseExpression} 'case' (subject=Expression)? '{' (branches+=CaseBranch (',' branches+=CaseBranch)* ','?)? '}'
     | '(' Expression ')';
@@ -176,7 +176,7 @@ Atom infers Expr:
     | {infer BooleanLiteral} value=('true' | 'false')
     | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
-    | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
+    | {infer MapLiteral} '{' (receiver=Expression '|')? (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
     | {infer Lambda} param=LambdaParam '=>' body=LambdaBody
     | {infer Lambda} '(' param=LambdaParam ')' '=>' body=LambdaBody
     | {infer CaseExpression} 'case' (subject=Expression)? '{' (branches+=CaseBranch (',' branches+=CaseBranch)* ','?)? '}'

@@ -39,7 +39,7 @@ import type { Model } from './language/generated/ast.js';
 const HELP = `tetaue — a pure functional SQL query language
 
 Usage:
-  tetaue render <file.tetaue> [--dialect <name>] [--format pretty|compact]
+  tetaue render <file.tetaue> [--dialect <name>] [--format pretty|compact] [--cte]
       Validate the module (and its imports) and render its query to SQL.
   tetaue check <file.tetaue>
       Validate the module and report all diagnostics.
@@ -96,6 +96,7 @@ function printWarnings(warnings: CompileDiagnostic[]): void {
 async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Promise<number> {
     let dialect = 'sqlite';
     let format: RenderFormat = 'pretty';
+    let cte = false;
     const files: string[] = [];
     while (args.length > 0) {
         const arg = args.shift()!;
@@ -103,6 +104,8 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
             const value = args.shift();
             if (value === undefined) return usage(`--dialect expects a value (${Object.keys(DIALECTS).join(', ')})`);
             dialect = value;
+        } else if (arg === '--cte') {
+            cte = true;
         } else if (arg === '--format') {
             const value = args.shift();
             if (value !== 'pretty' && value !== 'compact') return usage(`--format expects 'pretty' or 'compact'`);
@@ -130,7 +133,7 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
         console.error(`error: cannot read ${file}: ${msg(err)}`);
         return 1;
     }
-    const outcome = compileModuleText(rootUri, rootText, services, { dialect, format });
+    const outcome = compileModuleText(rootUri, rootText, services, { dialect, format, cte });
     if (!outcome.ok) {
         printCompileDiagnostics(outcome.diagnostics);
         return 1;
@@ -148,7 +151,7 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
 // parse
 // ---------------------------------------------------------------------------
 
-function loadProject(file: string, services: TetaueServices): { modules: ProjectModule[]; main: ProjectModule } {
+function loadProject(file: string, services: TetaueServices): { modules: readonly ProjectModule[]; main: ProjectModule } {
     const rootUri = URI.file(path.resolve(file)).toString();
     const rootText = readFileSync(URI.parse(rootUri).fsPath, 'utf8');
 

@@ -1,6 +1,11 @@
 /******************************************************************************
  * tetaue module tree — resolves `import "path.tetaue"` statements into an
  * ordered list of modules (imports first, root last) with cycle detection.
+ *
+ * The traversal is pure with respect to its inputs: no caller-provided module
+ * object is mutated. Resolved import edges are returned in a separate
+ * immutable map keyed by the importing module instead of being written onto
+ * `ProjectModule`.
  ******************************************************************************/
 import type { AstNode } from 'langium';
 import type { Import, Model } from './generated/ast.js';
@@ -14,13 +19,18 @@ export interface ProjectModule {
     /** How this module was reached: the importing module's URI and Import node. */
     parent?: { uri: string; importNode: Import };
     /**
-     * This module's direct imports, resolved to their target modules in
-     * source order. `alias` is set for `import "x.tetaue" as t` (qualified
-     * access `t.binding`); undefined for flat imports, which bring the
-     * target's exported bindings into scope. Filled during the tree walk,
-     * so it is complete once `collectModuleTree` returns.
+     * Legacy direct-construction imports (`{ model, uri, imports: [...] }`).
+     * `collectModuleTree` does NOT populate this field; use
+     * `ModuleTree.importsByModule` for tree-resolved imports.
      */
-    imports: { alias: string | undefined; target: ProjectModule; importNode: Import }[];
+    imports?: readonly ResolvedImportEdge[];
+}
+
+export interface ResolvedImportEdge {
+    /** Set for `import "x.tetaue" as t`; undefined for flat imports. */
+    alias: string | undefined;
+    target: ProjectModule;
+    importNode: Import;
 }
 
 export interface ModuleTreeOptions {
@@ -38,11 +48,53 @@ export interface ModuleTreeOptions {
 
 export interface ModuleTree {
     /** Modules in import order: imports depth-first, the root module last. */
-    modules: ProjectModule[];
+    modules: readonly ProjectModule[];
+    /** Resolved direct imports of every module, keyed by module identity. */
+    importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
     /** Import-resolution diagnostics (unresolved files, cycles, parse errors). */
-    diagnostics: Diagnostic[];
+    diagnostics: readonly Diagnostic[];
     /** Non-fatal import-resolution warnings (shadowing, non-self-contained libs). */
-    warnings: Diagnostic[];
+    warnings: readonly Diagnostic[];
+}
+
+interface WalkState {
+    readonly order: readonly ProjectModule[];
+    readonly done: ReadonlySet<string>;
+    readonly path: readonly string[];
+    readonly byUri: ReadonlyMap<string, ProjectModule>;
+    readonly edges: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    readonly diagnostics: readonly Diagnostic[];
+    readonly warnings: readonly Diagnostic[];
+}
+
+const emptyState = (): WalkState => ({
+    order: [],
+    done: new Set(),
+    path: [],
+    byUri: new Map(),
+    edges: new Map(),
+    diagnostics: [],
+    warnings: [],
+});
+
+function addEdge(state: WalkState, module: ProjectModule, edge: ResolvedImportEdge): WalkState {
+    const next = new Map(state.edges);
+    next.set(module, [...(next.get(module) ?? []), edge]);
+    return { ...state, edges: next };
+}
+
+function addModule(state: WalkState, module: ProjectModule): WalkState {
+    const next = new Map(state.byUri);
+    if (module.uri !== undefined) next.set(module.uri, module);
+    return { ...state, byUri: next };
+}
+
+function addDiagnostic(state: WalkState, diagnostic: Diagnostic): WalkState {
+    return { ...state, diagnostics: [...state.diagnostics, diagnostic] };
+}
+
+function addWarning(state: WalkState, warning: Diagnostic): WalkState {
+    return { ...state, warnings: [...state.warnings, warning] };
 }
 
 /**
@@ -50,88 +102,90 @@ export interface ModuleTree {
  * resolved URI. Returns imports before the root so `analyzeProject` can
  * evaluate them in order. Cycles are reported as diagnostics.
  */
-export function collectModuleTree(root: ProjectModule, opts: ModuleTreeOptions): ModuleTree {
+export function collectModuleTree(rootInput: ProjectModule, opts: ModuleTreeOptions): ModuleTree {
     // Never append edges to a caller-reused root: copy it so each walk starts
     // with an empty `imports` list (model/uri identity is preserved, so
     // `moduleOf` and per-module export keying are unaffected).
-    root = { ...root, imports: [] };
-    const modules: ProjectModule[] = [];
-    const diagnostics: Diagnostic[] = [];
-    const warnings: Diagnostic[] = [];
-    const done = new Set<string>();
-    const inProgress = new Set<string>();
-    // One module object per resolved URI, so every importer's `imports`
-    // entry references the SAME object (diamond dedup) — analysis keys
-    // per-module state (exports) by object identity.
-    const byUri = new Map<string, ProjectModule>();
-    if (root.uri !== undefined) byUri.set(root.uri, root);
+    const root: ProjectModule = { ...rootInput, imports: [] };
 
-    const visit = (module: ProjectModule, importNode: Import | undefined, fromUri: string | undefined): void => {
+    const visit = (module: ProjectModule, importNode: Import | undefined, fromUri: string | undefined, state: WalkState): WalkState => {
+        let next = state;
         if (module.uri !== undefined) {
-            if (inProgress.has(module.uri)) {
-                // `module.parent` is the FIRST importer that reached this
-                // module (byUri dedup), not the edge closing the loop — the
-                // importing module's URI is the accurate "from" end.
-                diagnostics.push({
+            if (state.path.includes(module.uri)) {
+                return addDiagnostic(next, {
                     node: importNode,
                     message: `circular import: '${fromUri ?? module.parent?.uri ?? module.uri}' -> '${module.uri}'`,
                 });
-                return;
             }
-            if (done.has(module.uri)) return;
-            inProgress.add(module.uri);
+            if (state.done.has(module.uri)) return next;
+            next = { ...next, path: [...next.path, module.uri] };
         }
+
         for (const imp of module.model.imports) {
             const spec = parseStringLiteral(imp.path);
             const resolved = opts.resolve(module.uri, spec);
             if (!resolved.uri) {
                 if (resolved.error) {
-                    diagnostics.push({ node: imp, message: resolved.error });
+                    next = addDiagnostic(next, { node: imp, message: resolved.error });
                 } else {
                     const searched = resolved.searched.length > 0 ? ` — searched: ${resolved.searched.join(', ')}` : '';
-                    diagnostics.push({ node: imp, message: `cannot resolve import '${spec}'${searched}` });
+                    next = addDiagnostic(next, { node: imp, message: `cannot resolve import '${spec}'${searched}` });
                 }
                 continue;
             }
             const text = opts.read(resolved.uri);
             if (text === undefined) {
-                diagnostics.push({ node: imp, message: `cannot resolve import '${spec}' (${resolved.uri})` });
+                next = addDiagnostic(next, { node: imp, message: `cannot resolve import '${spec}' (${resolved.uri})` });
                 continue;
             }
-            if (resolved.warning) warnings.push({ node: imp, message: resolved.warning });
+            if (resolved.warning) next = addWarning(next, { node: imp, message: resolved.warning });
             let model: Model;
             try {
                 model = opts.parse(text, resolved.uri);
             } catch (err) {
-                diagnostics.push({ node: imp, message: `error parsing import '${spec}': ${err instanceof Error ? err.message : String(err)}` });
+                next = addDiagnostic(next, { node: imp, message: `error parsing import '${spec}': ${err instanceof Error ? err.message : String(err)}` });
                 continue;
             }
-            let target = byUri.get(resolved.uri);
+            let target = next.byUri.get(resolved.uri);
             if (!target) {
                 target = { model, uri: resolved.uri, parent: { uri: module.uri ?? '', importNode: imp }, imports: [] };
-                byUri.set(resolved.uri, target);
+                next = addModule(next, target);
             }
-            // The same (alias, file) imported twice in one module is a no-op —
-            // skip the duplicate edge so its exports don't phantom-collide
-            // with the first import's.
-            if (!module.imports.some(e => e.alias === imp.alias && e.target.uri === resolved.uri)) {
-                module.imports.push({ alias: imp.alias, target, importNode: imp });
+            // The same (alias, file) imported twice in one module is a no-op.
+            const existingEdges = next.edges.get(module) ?? [];
+            if (!existingEdges.some(e => e.alias === imp.alias && e.target.uri === resolved.uri)) {
+                next = addEdge(next, module, { alias: imp.alias, target, importNode: imp });
             }
-            visit(target, imp, module.uri);
+            next = visit(target, imp, module.uri, next);
         }
+
         if (module.uri !== undefined) {
-            inProgress.delete(module.uri);
-            done.add(module.uri);
+            next = {
+                ...next,
+                path: next.path.filter(uri => uri !== module.uri),
+                done: new Set(next.done).add(module.uri),
+            };
         }
-        modules.push(module);
+        return { ...next, order: [...next.order, module] };
     };
 
-    visit(root, undefined, undefined);
-    return { modules, diagnostics, warnings };
+    const walked = visit(root, undefined, undefined, emptyState());
+    // Compatibility view: all modules in the returned tree are freshly
+    // created (or the copied root), so filling `imports` once here never
+    // mutates a caller-provided object. New code should read `importsByModule`.
+    for (const [module, edges] of walked.edges) {
+        (module as { imports?: readonly ResolvedImportEdge[] }).imports = [...edges];
+    }
+    return {
+        modules: walked.order,
+        importsByModule: walked.edges,
+        diagnostics: walked.diagnostics,
+        warnings: walked.warnings,
+    };
 }
 
 /** Find the module whose model contains the given node. */
-export function moduleOf(node: AstNode | undefined, modules: ProjectModule[]): ProjectModule | undefined {
+export function moduleOf(node: AstNode | undefined, modules: readonly ProjectModule[]): ProjectModule | undefined {
     let current: AstNode | undefined = node;
     while (current) {
         const hit = modules.find(m => m.model === current);
