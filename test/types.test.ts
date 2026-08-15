@@ -495,3 +495,60 @@ describe('imports', () => {
         expect(diagnostics.map(d => d.message).join('\n')).toContain("module 'h' has no exported binding 'adult'");
     });
 });
+
+// ---------------------------------------------------------------------------
+// DSL modes are types: jkind, order, aggregate/group (B)
+// ---------------------------------------------------------------------------
+
+describe('DSL modes are static types', () => {
+    test('join kinds are a dedicated type — a string kind is a type error', () => {
+        const src = `${USERS}\norders: query { user_id: int } = table "orders"\nq = users & join "inner" orders (l => r => l.id == r.user_id) (l => r => { uid = l.id })`;
+        const messages = allErrors(src);
+        expect(messages.join('\n')).toContain('join expects a join kind as its first argument: inner, left, right or full');
+        expect(messages.length).toBe(1); // interpreter + inference dedupe on (node, message)
+    });
+
+    test('join with a bare kind still type-checks', () => {
+        expect(typeErrors(`${USERS}\norders: query { user_id: int } = table "orders"\nq = users & join inner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id })`)).toEqual([]);
+    });
+
+    test('sort requires order items, not a plain column', () => {
+        const messages = typeErrors(`${USERS}\nq = users & sort (u => u.name)`);
+        expect(messages.join('\n')).toContain('sort expects order items like asc u.name or a list of them');
+    });
+
+    test('sort accepts a single order item and a list of them', () => {
+        expect(typeErrors(`${USERS}\nq = users & sort (u => asc u.name)`)).toEqual([]);
+        expect(typeErrors(`${USERS}\nq = users & sort (u => [asc u.name, desc u.age])`)).toEqual([]);
+    });
+
+    test('fold entries must be aggregate or group mode', () => {
+        const messages = allErrors(`${USERS}\nq = users & fold (o => { x = o.age })`);
+        expect(messages.join('\n')).toContain("fold entry 'x' must be wrapped in an aggregate (count, sum, ...) or group");
+    });
+
+    test('fold without any aggregate is a static error', () => {
+        const messages = typeErrors(`${USERS}\nq = users & fold (o => { x = group o.age })`);
+        expect(messages.join('\n')).toContain('fold must contain at least one aggregate (count, sum, ...)');
+    });
+
+    test('map projections reject group keys and order items', () => {
+        expect(typeErrors(`${USERS}\nq = users & map (u => { g = group u.age })`).join('\n')).toContain("projection entry 'g' cannot contain group");
+        expect(typeErrors(`${USERS}\nq = users & map (u => { o = asc u.age })`).join('\n')).toContain("projection entry 'o' cannot contain order items (asc/desc)");
+    });
+
+    test('a fold result row is plain: HAVING filters and ORDER BY on aggregate columns work', () => {
+        const src = `${USERS}\norders: query { user_id: int, total: float } = table "orders"\nq = users\n    & join inner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, total = r.total })\n    & fold (r => { uid = group r.uid, total = sum r.total })\n    & filter (r => r.total > 100.0)\n    & sort (r => [desc r.total])`;
+        expect(typeErrors(src)).toEqual([]);
+    });
+
+    test('map after a fold may re-aggregate (nested aggregation)', () => {
+        const src = `${USERS}\norders: query { user_id: int, total: float } = table "orders"\nq = orders\n    & fold (o => { user_id = group o.user_id, total = sum o.total })\n    & map (r => { grand = sum r.total })`;
+        expect(typeErrors(src)).toEqual([]);
+    });
+
+    test('aggregates type as agg mode; windowed aggregates keep their value type', () => {
+        expect(typeErrors(`${USERS}\nq = users & map (u => { ws = over (sum u.age) { partition = [u.id] } })`)).toEqual([]);
+        expect(typeErrors(`${USERS}\nq = users & map (u => { x = sum u.age })`)).not.toContain('cannot compare');
+    });
+});

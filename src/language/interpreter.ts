@@ -117,7 +117,7 @@ export interface Diagnostic {
 
 export type Value =
     | { kind: 'query'; query: Query; ast?: AstNode }
-    | { kind: 'fn'; name: string; apply: (arg: Value, at: AstNode | undefined, ctx: Ctx) => Value; ast?: AstNode; variadic?: boolean }
+    | { kind: 'fn'; name: string; apply: (arg: Value, at: AstNode | undefined, ctx: Ctx) => Value; ast?: AstNode }
     | { kind: 'step'; name: string; apply: (q: Query, at: AstNode | undefined, ctx: Ctx) => Query | null; ast?: AstNode }
     | { kind: 'lambda'; params: string[]; body: Expr; closure: Map<string, Value>; ast?: AstNode }
     | { kind: 'jkind'; name: JoinKind; ast?: AstNode }
@@ -785,27 +785,9 @@ export function evalExpr(e: Expr, ctx: Ctx): Value {
         return access(recv, e.property, e, ctx);
     }
     if (isApplication(e)) {
-        // Variadic builtins (concat, greatest, least, round, substring,
-        // lpad/rpad, regex_extract) take ALL their arguments at once from the
-        // application spine — they cannot be curried. Resolve through the
-        // environment so user bindings may shadow them like any builtin.
-        const head = isIdentifier(e.func) ? ctx.env.get(e.func.name) : undefined;
-        // A bare identifier (`greatest` alone) parses as a 0-argument
-        // Application — that is the function VALUE, not a variadic call.
-        if (head?.kind === 'fn' && head.variadic && e.arguments.length > 0) {
-            const spec = VARIADIC[head.name]!; // variadic fns are only created for registered names
-            const args: Value[] = [];
-            for (const argExpr of e.arguments) {
-                const arg = evalArg(argExpr, ctx);
-                if (isError(arg)) return ERROR;
-                args.push(arg);
-            }
-            if (args.length < spec.min || args.length > spec.max) {
-                ctx.diagnostics.push({ node: e, message: `${head.name} expects ${spec.min}${spec.max === Infinity ? ' or more' : ` to ${spec.max}`} arguments, got ${args.length}` });
-                return ERROR;
-            }
-            return spec.apply(args, e, ctx);
-        }
+        // All builtins are ordinary curried functions — including the
+        // list-argument ones (`concat [a, b]`, `substring [s, 1, 3]`, ...),
+        // which take a single list argument like any other value.
         let f = evalExpr(e.func, ctx);
         for (const argExpr of e.arguments) {
             if (isError(f)) {
@@ -1140,7 +1122,7 @@ export const BUILTINS: Record<string, () => Value> = {
                 row.fields.push({ key, node });
             }
             if (aggregates === 0) {
-                ctx2.diagnostics.push({ node: at2 ?? sel.ast, message: `fold must contain at least one aggregate (count, sum, ...)` });
+                ctx2.diagnostics.push({ node: sel.ast ?? at2, message: `fold must contain at least one aggregate (count, sum, ...)` });
                 return null;
             }
             return addStep(q, { kind: 'fold', proj: row });
@@ -1565,15 +1547,20 @@ export const BUILTINS: Record<string, () => Value> = {
     cast: castBuiltin('cast'),
     try_cast: castBuiltin('try_cast'),
 
-    // --- variadic builtins (take all arguments at once) -------------------
-    concat: variadicFn('concat'),
-    greatest: variadicFn('greatest'),
-    least: variadicFn('least'),
-    round: variadicFn('round'),
-    substring: variadicFn('substring'),
-    lpad: variadicFn('lpad'),
-    rpad: variadicFn('rpad'),
-    regex_extract: variadicFn('regex_extract'),
+    // --- list-argument builtins (take a single list argument) ------------
+    // concat [a, b], greatest [a, b], round [x, 2], substring [s, 1, 3],
+    // lpad [s, 8, "0"], regex_extract [s, "pat", 1], lag [x, 1, 0], ...
+    // A single list argument keeps them ordinary curried functions — they
+    // compose, bind and partial-apply like everything else. LIST_BUILTINS
+    // owns the element-kind and arity validation.
+    concat: listBuiltin('concat'),
+    greatest: listBuiltin('greatest'),
+    least: listBuiltin('least'),
+    round: listBuiltin('round'),
+    substring: listBuiltin('substring'),
+    lpad: listBuiltin('lpad'),
+    rpad: listBuiltin('rpad'),
+    regex_extract: listBuiltin('regex_extract'),
 
     // --- window functions ------------------------------------------------
     // Window-only functions must be wrapped in `over (...)` — a bare
@@ -1585,11 +1572,11 @@ export const BUILTINS: Record<string, () => Value> = {
         // ranking/offset functions — never plain scalar calls like upper.
         const ok = fnNode !== null && (fnNode.kind === 'agg' || (fnNode.kind === 'call' && WINDOW_ONLY.has(fnNode.name)));
         if (!ok) {
-            // A bare `over lag u.salary 1 0 {...}` flattens the arguments into
-            // the application, so the first argument arrives as a function —
-            // hint at wrapping multi-argument window functions in parens.
+            // A bare `over lag [u.salary, 1, 0] {...}` — the application
+            // flattens, so the first argument arrives as a function — hint at
+            // wrapping multi-argument window functions in parens.
             const hint = fnArg.kind === 'fn'
-                ? ` — wrap it in parens when it takes arguments, e.g. over (${fnArg.name} u.x 1 0) { partition = [u.dept], order = [desc u.salary] }`
+                ? ` — wrap it in parens when it takes arguments, e.g. over (${fnArg.name} [u.x, 1, 0]) { partition = [u.dept], order = [desc u.salary] }`
                 : '';
             ctx.diagnostics.push({ node: at ?? fnArg.ast, message: `over expects a window function (row_number, rank, sum, lag, ...), got ${fnNode ? `an expression of type ${typeName(fnNode.type)}` : describe(fnArg)}${hint}` });
             return ERROR;
@@ -1614,8 +1601,8 @@ export const BUILTINS: Record<string, () => Value> = {
         if (forbid(node, ['agg', 'group', 'order', 'window'], 'ntile', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'call', name: 'ntile', args: [node], type: 'int' }, at);
     }),
-    lag: variadicFn('lag'),
-    lead: variadicFn('lead'),
+    lag: listBuiltin('lag'),
+    lead: listBuiltin('lead'),
 };
 
 function filterBuiltin(name: string): () => Value {
@@ -1906,38 +1893,43 @@ function castBuiltin(name: 'cast' | 'try_cast'): () => Value {
 }
 
 // ---------------------------------------------------------------------------
-// Variadic builtins — the interpreter collects all application arguments at
-// once (an `Application` node's `arguments` list) instead of currying. See
-// evalExpr's Application case; render.ts lowers the resulting call nodes.
+// List-argument builtins — concat, greatest, least, round, substring,
+// lpad/rpad, regex_extract, lag/lead take a SINGLE list argument
+// (`concat [a, b]`), so they are ordinary curried functions: composable,
+// bindable and partially applicable like everything else. LIST_BUILTINS owns
+// the element-kind and arity validation; render.ts lowers the call nodes.
 // ---------------------------------------------------------------------------
 
-/** A variadic builtin's env value — applying it as a curried function is an error. */
-function variadicFn(name: string): () => Value {
-    return () => ({
-        kind: 'fn',
-        name,
-        variadic: true,
-        apply: (_arg, at, ctx) => {
-            ctx.diagnostics.push({ node: at, message: `${name} is variadic — apply all arguments directly, e.g. ${variadicExample(name)}` });
+/** A list-argument builtin's env value: apply the one list argument. */
+function listBuiltin(name: string): () => Value {
+    return () => fn(name, (arg, at, ctx) => {
+        if (arg.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects a list argument, e.g. ${listExample(name)}` });
             return ERROR;
-        },
+        }
+        const spec = LIST_BUILTINS[name]!;
+        if (arg.items.length < spec.min || arg.items.length > spec.max) {
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects ${spec.min}${spec.max === Infinity ? ' or more' : ` to ${spec.max}`} arguments, got ${arg.items.length}` });
+            return ERROR;
+        }
+        return spec.apply(arg.items, at, ctx);
     });
 }
 
-function variadicExample(name: string): string {
+function listExample(name: string): string {
     switch (name) {
-        case 'concat': return 'concat u.first u.last';
-        case 'greatest': return 'greatest u.a u.b';
-        case 'least': return 'least u.a u.b';
-        case 'round': return 'round u.x 2';
-        case 'substring': return 'substring u.name 1 3';
-        case 'lpad': return 'lpad u.code 8 "0"';
-        case 'rpad': return 'rpad u.code 8 "0"';
-        case 'regex_extract': return 'regex_extract u.name "([0-9]+)" 1';
-        case 'lag': return 'lag u.salary 1 0';
-        case 'lead': return 'lead u.salary 1';
+        case 'concat': return 'concat [u.first, u.last]';
+        case 'greatest': return 'greatest [u.a, u.b]';
+        case 'least': return 'least [u.a, u.b]';
+        case 'round': return 'round [u.x, 2]';
+        case 'substring': return 'substring [u.name, 1, 3]';
+        case 'lpad': return 'lpad [u.code, 8, "0"]';
+        case 'rpad': return 'rpad [u.code, 8, "0"]';
+        case 'regex_extract': return 'regex_extract [u.name, "([0-9]+)", 1]';
+        case 'lag': return 'lag [u.salary, 1, 0]';
+        case 'lead': return 'lead [u.salary, 1]';
     }
-    return `${name} a b`;
+    return `${name} [a, b]`;
 }
 
 /** All args must be expression nodes of the given kind — else diagnostic + null. */
@@ -1969,7 +1961,7 @@ function exprArgs(
     return nodes;
 }
 
-const VARIADIC: Record<string, { min: number; max: number; apply: (args: Value[], at: AstNode | undefined, ctx: Ctx) => Value }> = {
+const LIST_BUILTINS: Record<string, { min: number; max: number; apply: (args: Value[], at: AstNode | undefined, ctx: Ctx) => Value }> = {
     concat: {
         min: 2, max: Infinity,
         apply: (args, at, ctx) => {
@@ -1980,11 +1972,11 @@ const VARIADIC: Record<string, { min: number; max: number; apply: (args: Value[]
     },
     greatest: {
         min: 2, max: Infinity,
-        apply: (args, at, ctx) => variadicExtremum('greatest', args, at, ctx),
+        apply: (args, at, ctx) => listExtremum('greatest', args, at, ctx),
     },
     least: {
         min: 2, max: Infinity,
-        apply: (args, at, ctx) => variadicExtremum('least', args, at, ctx),
+        apply: (args, at, ctx) => listExtremum('least', args, at, ctx),
     },
     round: {
         min: 1, max: 2,
@@ -2009,11 +2001,11 @@ const VARIADIC: Record<string, { min: number; max: number; apply: (args: Value[]
     },
     lpad: {
         min: 2, max: 3,
-        apply: (args, at, ctx) => variadicPad('lpad', args, at, ctx),
+        apply: (args, at, ctx) => listPad('lpad', args, at, ctx),
     },
     rpad: {
         min: 2, max: 3,
-        apply: (args, at, ctx) => variadicPad('rpad', args, at, ctx),
+        apply: (args, at, ctx) => listPad('rpad', args, at, ctx),
     },
     regex_extract: {
         min: 2, max: 3,
@@ -2030,16 +2022,16 @@ const VARIADIC: Record<string, { min: number; max: number; apply: (args: Value[]
     },
     lag: {
         min: 1, max: 3,
-        apply: (args, at, ctx) => variadicLagLead('lag', args, at, ctx),
+        apply: (args, at, ctx) => listLagLead('lag', args, at, ctx),
     },
     lead: {
         min: 1, max: 3,
-        apply: (args, at, ctx) => variadicLagLead('lead', args, at, ctx),
+        apply: (args, at, ctx) => listLagLead('lead', args, at, ctx),
     },
 };
 
 /** greatest/least — all arguments must share a comparable type. */
-function variadicExtremum(name: 'greatest' | 'least', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
+function listExtremum(name: 'greatest' | 'least', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
     const nodes = exprArgs(args, name, 'any', at, ctx);
     if (nodes === null) return ERROR;
     const base = nodes[0]!;
@@ -2054,7 +2046,7 @@ function variadicExtremum(name: 'greatest' | 'least', args: Value[], at: AstNode
 }
 
 /** lpad/rpad — value, length, optional padding. */
-function variadicPad(name: 'lpad' | 'rpad', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
+function listPad(name: 'lpad' | 'rpad', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
     const value = exprArgs([args[0]!], name, 'string', at, ctx);
     if (value === null) return ERROR;
     const length = exprArgs([args[1]!], name, 'numeric', at, ctx);
@@ -2065,7 +2057,7 @@ function variadicPad(name: 'lpad' | 'rpad', args: Value[], at: AstNode | undefin
 }
 
 /** lag/lead — value, optional offset (int), optional default (any type). */
-function variadicLagLead(name: 'lag' | 'lead', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
+function listLagLead(name: 'lag' | 'lead', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
     const value = exprNode(args[0]!);
     if (!value) {
         ctx.diagnostics.push({ node: at ?? args[0]!.ast, message: `${name} expects an expression to look up, e.g. ${name} u.salary 1 0` });

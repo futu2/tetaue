@@ -12,14 +12,22 @@ the dialect lacks the function, so rendering throws a capability error (a
 compile diagnostic, exactly like teta's "throws an explicit error" behavior
 for unsupported features).
 
-## Variadic and optional arguments
+## Optional and many-argument functions: one list argument
 
 `concat` / `greatest` / `least` take any number of arguments; `round`
-(1–2), `substring` (2–3), `lpad`/`rpad` (2–3) and `regex_extract` (2–3) have
-optional arguments. These builtins are marked `variadic` in the interpreter:
-all application arguments are collected from the `Application` node at once
-(no currying), with min/max arity and per-argument-kind checks. A bare
-reference (`f = greatest`) is the function value, not a call.
+(1–2), `substring` (2–3), `lpad`/`rpad` (2–3), `regex_extract` (2–3) and
+`lag`/`lead` (1–3) have optional arguments. These builtins take a **single
+list argument** — `concat [a, b]`, `round [u.x, 2]`, `lag [u.salary, 1, 0]` —
+so they are ordinary curried functions: they compose with `<<<`/`>>>`, bind
+as values (`f = greatest`), and partial-apply like everything else (there is
+no variadic special case in the evaluator). `LIST_BUILTINS` in the
+interpreter validates the element kinds and arity (min/max) at runtime; the
+inference pass checks every element's static kind and the arity
+(`checkListBuiltin` in `inference.ts`), with matching messages so the merged
+diagnostics dedupe. The element type is the list's first element; a
+heterogeneous list is tolerated at the list itself and checked per element.
+
+A bare reference (`f = greatest`) is the function value, not a call.
 
 ## Records
 
@@ -207,17 +215,20 @@ inlining the `OVER` expression would be invalid SQL.
 ## Implementation
 
 - `interpreter.ts` — `BUILTINS` entries with argument validation
-  (`dateLikeError`, `exprArgs`, kind checks, aggregate forbidding); variadic
-  builtins via a `variadic` fn marker + the `VARIADIC` table, hooked into
-  `evalExpr`'s Application case (0-argument Applications are bare function
+  (`dateLikeError`, `exprArgs`, kind checks, aggregate forbidding);
+  list-argument builtins (`concat [a, b]`, `round [x, 2]`, `lag [x, 1, 0]`,
+  …) via `listBuiltin` + the `LIST_BUILTINS` table — ordinary curried
+  functions over one list argument (0-argument Applications are bare function
   values).
 - `render.ts` — `renderCall` dispatch (`SPECIAL_CALLS` + `DATE_FUNCTIONS`)
   returns the per-dialect SQL or `null` to fall through to plain `NAME(args)`;
   `sqlTypeName` maps cast targets per dialect; `dialect.functions` handles
   simple renames (sqlite `ceil` → `CEILING`).
-- `inference.ts` — prelude schemes; `VARIADIC_BUILTINS` intercepted in
-  `inferApplication` with per-name argument-kind checks in `inferVariadic`;
-  `pow`/`mod` use independent type variables so operands never unify with
-  each other.
+- `inference.ts` — the prelude is built from the builtin catalog
+  (`catalog.ts`, the single source of truth for every scheme);
+  `LIST_BUILTINS` applications get per-element kind and arity checks in
+  `checkListBuiltin`; `pow`/`mod` use independent type variables so operands
+  never unify with each other; the query DSL's modes (`join kind`, `agg`,
+  `group`, `order`) are types enforced by the fold/map/sort checks.
 - `compile.ts` — render-time capability errors surface as compile
   diagnostics.

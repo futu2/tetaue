@@ -31,6 +31,7 @@ import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule } from './imports.js';
 import { moduleOf } from './imports.js';
 import { parseStringLiteral } from './interpreter.js';
+import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
 
 export interface InferDiagnostic {
     node: AstNode | undefined;
@@ -38,7 +39,14 @@ export interface InferDiagnostic {
 }
 
 /** Builtins whose application takes ALL arguments at once (no currying). */
-const VARIADIC_BUILTINS = new Set(['concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'regex_extract', 'lag', 'lead']);
+const LIST_BUILTINS = new Set(['concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'regex_extract', 'lag', 'lead']);
+
+/** Min/max element count of the list-argument builtins (checked statically). */
+const LIST_ARITY: Record<string, [number, number]> = {
+    concat: [2, Infinity], greatest: [2, Infinity], least: [2, Infinity],
+    round: [1, 2], substring: [2, 3], lpad: [2, 3], rpad: [2, 3],
+    regex_extract: [2, 3], lag: [1, 3], lead: [1, 3],
+};
 
 /**
  * Result of a project inference pass: diagnostics plus the static type
@@ -106,120 +114,22 @@ class Inferencer {
     // Prelude
     // -----------------------------------------------------------------------
 
-    /** Build a polymorphic scheme: named free variables, generalized. */
-    private poly(vars: [string, VarKind][], build: (...types: Type[]) => Type): Scheme {
-        const types: Type[] = [];
-        for (const [name, kind] of vars) {
-            types.push(this.u.fresh(kind === 'row' ? 'row' : 'flex', name));
-        }
-        return this.u.generalize([], build(...types));
-    }
-
+    /**
+     * Build the prelude environment from the builtin catalog — the single
+     * source of truth for every scheme (see catalog.ts). The join kinds are
+     * a dedicated `jkind` type, aggregates return `agg t`, `group` returns
+     * `group t`, and the list-argument builtins take one list argument, so
+     * `join "inner"`, plain fold entries and non-order sort lambdas are all
+     * STATIC type errors, not runtime checks.
+     */
     private prelude(): void {
-        const p = (n: PrimName) => prim(n);
-
-        this.env.set('table', this.poly([['r', 'row']], r => fun(p('string'), queryOf(r))));        const filterScheme = this.poly([['r', 'row']], r => fun(fun(r, p('bool')), fun(queryOf(r), queryOf(r))));
-        this.env.set('filter', filterScheme);
-        this.env.set('filtered', filterScheme);
-        const projectionScheme = this.poly([['r', 'row'], ['s', 'row']], (r, s) =>
-            fun(fun(r, rowOf([], s)), fun(queryOf(r), queryOf(rowOf([], s)))));
-        this.env.set('map', projectionScheme);
-        this.env.set('fold', projectionScheme);
-        this.env.set('sort', this.poly([['r', 'row'], ['t', 'type']], (r, t) =>
-            fun(fun(r, t), fun(queryOf(r), queryOf(r)))));
-        this.env.set('take', this.poly([['r', 'row']], r => fun(p('int'), fun(queryOf(r), queryOf(r)))));
-        this.env.set('distinct', this.poly([['r', 'row']], r => fun(queryOf(r), queryOf(r))));
-        // merge l r — the result row is the union of both rows (right wins on
-        // overlap); inferMerge computes that union directly, this scheme only
-        // types bare references and partial applications.
-        this.env.set('merge', this.poly([['a', 'row'], ['b', 'row']], (a, b) => fun(a, fun(b, this.u.fresh('row')))));
-        // join <kind> <right> <on> <merger> — kind is a string-typed constant
-        // (inner/left/right/full), the merger projects the result row.
-        this.env.set('join', this.poly([['r', 'row'], ['s', 'row'], ['t', 'row']], (r, s, t) => {
-            const on = fun(r, fun(s, p('bool')));       // (l, r) => bool
-            const merger = fun(r, fun(s, t));           // (l, r) => row t
-            return fun(p('string'), fun(queryOf(s), fun(on, fun(merger, fun(queryOf(r), queryOf(t))))));
-        }));
-        this.env.set('inner', { vars: [], type: p('string') });
-        this.env.set('left', { vars: [], type: p('string') });
-        this.env.set('right', { vars: [], type: p('string') });
-        this.env.set('full', { vars: [], type: p('string') });
-        this.env.set('asc', this.poly([['t', 'type']], t => fun(nullable(t), { kind: 'order' })));
-        this.env.set('desc', this.poly([['t', 'type']], t => fun(nullable(t), { kind: 'order' })));
-        this.env.set('group', this.poly([['t', 'type']], t => fun(nullable(t), nullable(t))));
-        this.env.set('count', this.poly([['t', 'type']], t => fun(nullable(t), p('int'))));
-        this.env.set('sum', this.poly([['t', 'type']], t => fun(nullable(t), nullable(t))));
-        this.env.set('avg', this.poly([['t', 'type']], t => fun(nullable(t), nullable(p('float')))));
-        this.env.set('min', this.poly([['t', 'type']], t => fun(nullable(t), nullable(t))));
-        this.env.set('max', this.poly([['t', 'type']], t => fun(nullable(t), nullable(t))));
-        this.env.set('list', this.poly([['t', 'type']], t => fun(nullable(t), listOf(nullable(t)))));
-        this.env.set('not', { vars: [], type: fun(p('bool'), p('bool')) });
-        this.env.set('abs', this.poly([['t', 'type']], t => fun(nullable(t), nullable(t))));
-        this.env.set('upper', { vars: [], type: fun(nullable(p('string')), nullable(p('string'))) });
-        this.env.set('lower', { vars: [], type: fun(nullable(p('string')), nullable(p('string'))) });
-        this.env.set('length', { vars: [], type: fun(nullable(p('string')), nullable(p('int'))) });
-        this.env.set('is_in', this.poly([['t', 'type']], t => fun(nullable(t), fun(listOf(nullable(t)), p('bool')))));
-        this.env.set('is_not_in', this.env.get('is_in')!);
-        this.env.set('coalesce', this.poly([['t', 'type']], t => fun(nullable(t), fun(nullable(t), nullable(t)))));
-        // Date & time — inference stays loose on the value argument (any
-        // nullable type unifies); the interpreter owns the date/timestamp
-        // runtime checks and unit/format literal validation.
-        this.env.set('current_date', { vars: [], type: p('date') });
-        this.env.set('current_timestamp', { vars: [], type: p('timestamp') });
-        this.env.set('extract', this.poly([['t', 'type']], t => fun(nullable(t), fun(p('string'), p('int')))));
-        for (const part of ['year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second'] as const) {
-            this.env.set(part, this.poly([['t', 'type']], t => fun(nullable(t), p('int'))));
+        for (const spec of BUILTIN_SPECS) {
+            this.env.set(spec.name, spec.scheme(this.u));
         }
-        this.env.set('date_add', this.poly([['t', 'type']], t => fun(nullable(t), fun(p('string'), fun(p('int'), nullable(t))))));
-        this.env.set('date_diff', this.poly([['t', 'type']], t => fun(nullable(t), fun(p('string'), fun(nullable(t), p('int'))))));
-        this.env.set('date_trunc', this.poly([['t', 'type']], t => fun(nullable(t), fun(p('string'), p('timestamp')))));
-        this.env.set('date_format', this.poly([['t', 'type']], t => fun(nullable(t), fun(p('string'), nullable(p('string'))))));
-        this.env.set('date_parse', { vars: [], type: fun(nullable(p('string')), fun(p('string'), p('date'))) });
-        this.env.set('to_unixtime', this.poly([['t', 'type']], t => fun(nullable(t), p('int'))));
-        this.env.set('from_unixtime', this.poly([['t', 'type']], t => fun(nullable(p('int')), p('timestamp'))));
-        // Scalar functions — math. add/sub/mul/div/mod are operators.
-        for (const n of ['ceil', 'floor', 'sqrt'] as const) {
-            this.env.set(n, this.poly([['t', 'type']], t => fun(nullable(t), nullable(t))));
+        for (const [name, target] of Object.entries(BUILTIN_ALIASES)) {
+            const scheme = this.env.get(target);
+            if (scheme) this.env.set(name, scheme);
         }
-        this.env.set('pow', this.poly([['a', 'type'], ['b', 'type']], (a, b) => fun(nullable(a), fun(nullable(b), nullable(p('float'))))));
-        this.env.set('mod', this.poly([['a', 'type'], ['b', 'type']], (a, b) => fun(nullable(a), fun(nullable(b), nullable(a)))));
-        // Scalar functions — strings.
-        this.env.set('trim', { vars: [], type: fun(nullable(p('string')), nullable(p('string'))) });
-        this.env.set('position', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('string')), p('int'))) });
-        this.env.set('replace', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('string')), fun(nullable(p('string')), nullable(p('string'))))) });
-        this.env.set('left_substring', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('int')), nullable(p('string')))) });
-        this.env.set('right_substring', this.env.get('left_substring')!);
-        this.env.set('regex_like', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('string')), p('bool'))) });
-        this.env.set('regex_replace', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('string')), fun(nullable(p('string')), nullable(p('string'))))) });
-        // Scalar functions — logical & null handling.
-        this.env.set('like', this.env.get('regex_like')!);
-        this.env.set('null_if', this.poly([['t', 'type']], t => fun(nullable(t), fun(nullable(t), nullable(t)))));
-        this.env.set('is_null', this.poly([['t', 'type']], t => fun(nullable(t), p('bool'))));
-        this.env.set('is_not_null', this.env.get('is_null')!);
-        // Scalar functions — casts. The result type comes from the target
-        // type literal, which unification cannot express — stay loose.
-        this.env.set('cast', this.poly([['t', 'type']], t => fun(nullable(t), fun(p('string'), this.u.fresh()))));
-        this.env.set('try_cast', this.env.get('cast')!);
-        // Variadic builtins — the first-argument scheme is enough for bare
-        // references; inferApplication intercepts them for the full checks.
-        this.env.set('concat', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('string')), nullable(p('string')))) });
-        this.env.set('greatest', this.poly([['t', 'type']], t => fun(nullable(t), fun(nullable(t), nullable(t)))));
-        this.env.set('least', this.env.get('greatest')!);
-        this.env.set('round', this.poly([['t', 'type']], t => fun(nullable(t), nullable(t))));
-        this.env.set('substring', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('int')), nullable(p('string')))) });
-        this.env.set('lpad', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('int')), nullable(p('string')))) });
-        this.env.set('rpad', this.env.get('lpad')!);
-        this.env.set('regex_extract', { vars: [], type: fun(nullable(p('string')), fun(nullable(p('string')), nullable(p('string')))) });
-        // Window functions. `over` returns its window function's type; the
-        // window-only fns are int; lag/lead keep their value's type (the
-        // interpreter owns the arg checks).
-        this.env.set('over', this.poly([['a', 'type'], ['b', 'type']], (a, b) => fun(a, fun(b, a))));
-        for (const n of ['row_number', 'rank', 'dense_rank', 'percent_rank'] as const) {
-            this.env.set(n, { vars: [], type: p('int') });
-        }
-        this.env.set('ntile', { vars: [], type: fun(nullable(p('int')), p('int')) });
-        this.env.set('lag', this.poly([['t', 'type']], t => fun(nullable(t), nullable(t))));
-        this.env.set('lead', this.env.get('lag')!);
         // The prelude is cloned into every module's env (see inferProject).
         this.preludeEnv = new Map(this.env);
     }
@@ -393,7 +303,20 @@ class Inferencer {
                 if (item === null) {
                     item = t;
                 } else {
-                    try { this.u.unify(item, t); } catch { /* heterogeneous lists are checked at is_in (§11) */ }
+                    // Check compatibility WITHOUT binding the first element's
+                    // type: heterogeneous lists are tolerated here (is_in and
+                    // the list-argument builtins check elements themselves),
+                    // but unification must not pin column variables to a later
+                    // element's type — `[u.balance, 2]` must not pin balance
+                    // to int. Skolemizing makes the check read-only.
+                    const sk = this.u.skolemize(item);
+                    try {
+                        this.u.unify(item, t);
+                    } catch {
+                        /* heterogeneous lists are checked downstream (§11) */
+                    } finally {
+                        sk.restore();
+                    }
                 }
             }
             return listOf(item ?? this.u.fresh());
@@ -618,14 +541,11 @@ class Inferencer {
 
     private inferApplication(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
         const funcName = isIdentifier(e.func) ? e.func.name : null;
-        // Variadic builtins (concat, greatest, least, round, substring,
-        // lpad/rpad, regex_extract) take all arguments at once. A bare
-        // identifier parses as a 0-argument Application — the function value,
-        // handled by the generic path below.
-        if (funcName && VARIADIC_BUILTINS.has(funcName) && e.arguments.length > 0) {
-            const argTypes = e.arguments.map(a => this.inferArg(a, env));
-            return this.inferVariadic(funcName, e.arguments, argTypes, e);
-        }
+        // `fold`/`map` — the DSL's mode checks: fold entries must be
+        // aggregate/group mode (a plain column is a type error), and the
+        // result row strips the modes so downstream sees plain columns.
+        if (funcName === 'fold' && e.arguments.length === 1) return this.inferFold(e, env);
+        if (funcName === 'map' && e.arguments.length === 1) return this.inferMap(e, env);
         // `merge l r` — the result row is the union of both rows (the right
         // record wins on overlapping fields), which the generic fun-type
         // application path cannot express; compute the union directly.
@@ -668,78 +588,177 @@ class Inferencer {
         if (funcName === 'is_in' || funcName === 'is_not_in') {
             this.checkInList(e, env, argTypes);
         }
+        if (funcName && LIST_BUILTINS.has(funcName) && e.arguments.length > 0) {
+            this.checkListBuiltin(funcName, e, env);
+        }
         return f;
     }
 
     /**
-     * Variadic builtins: check every argument against the function's expected
-     * kind and return the result type. Loose where the interpreter owns the
-     * runtime checks (unit/format literals, exact comparability).
+     * `fold (o => { k = group o.k, s = sum o.v })` — the DSL's aggregate-mode
+     * check. The lambda's result must be a record whose fields are ALL in
+     * aggregate or group mode (`agg t` / `group t`), with at least one
+     * aggregate — a plain column or computed expression is a static type
+     * error, no longer deferred to the runtime step application. The result
+     * row strips the modes, so downstream steps see plain columns
+     * (`query { user_id: int, total: float }`), matching the interpreter's
+     * derived-table semantics.
      */
-    private inferVariadic(name: string, args: Expr[], argTypes: Type[], node: AstNode): Type {
-        if (args.length === 0) return this.u.fresh();
-        const expect = (index: number, kind: 'string' | 'int' | 'numeric'): void => {
+    private inferFold(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
+        const argExpr = e.arguments[0]!;
+        const argType = this.inferArg(argExpr, env);
+        const r = this.u.resolve(argType);
+        if (r.kind !== 'fun') {
+            this.argError('fold', 0, argExpr, argType, undefined, undefined);
+            return this.u.fresh();
+        }
+        const ret = this.u.resolve(r.to);
+        if (ret.kind === 'var') {
+            // An unconstrained projection (e.g. mid-typing `fold (o => o._x)`):
+            // bind it to the open result row like the generic scheme, so the
+            // surrounding `&` still resolves the row's fields. The interpreter
+            // reports a non-record projection at runtime.
+            const s = this.u.fresh('row');
+            try { this.u.bind(ret.id, rowOf([], s)); } catch { /* leave open */ }
+            return fun(queryOf(r.from), queryOf(rowOf([], s)));
+        }
+        if (ret.kind !== 'row') {
+            this.argError('fold', 0, argExpr, argType, undefined, undefined);
+            return this.u.fresh();
+        }
+        const res = this.u.resolveRow(ret);
+        const entryNodes = this.entryNodesOf(argExpr);
+        const out: [string, Type][] = [];
+        let aggregates = 0;
+        for (const [key, ft] of res.fields) {
+            const raw = this.u.resolve(ft);
+            if (raw.kind === 'agg') {
+                aggregates++;
+                out.push([key, raw.of]);
+            } else if (raw.kind === 'group') {
+                out.push([key, raw.of]);
+            } else {
+                this.diag(entryNodes?.get(key) ?? argExpr, `fold entry '${key}' must be wrapped in an aggregate (count, sum, ...) or group`);
+                out.push([key, ft]);
+            }
+        }
+        if (aggregates === 0) {
+            this.diag(argExpr, `fold must contain at least one aggregate (count, sum, ...)`);
+        }
+        return fun(queryOf(r.from), queryOf(rowOf(out, res.tail)));
+    }
+
+    /**
+     * `map (u => { ... })` — projection mode check: the result row must not
+     * contain `group` keys or `order` items (SQL cannot select a GROUP BY key
+     * or an ORDER BY item as a value), mirroring the interpreter's
+     * rowFromRecord. Aggregate fields are allowed — after a fold the map runs
+     * on the aggregated result (nested aggregation), which the interpreter
+     * validates positionally. The result row strips modes so downstream
+     * columns are plain.
+     */
+    private inferMap(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
+        const argExpr = e.arguments[0]!;
+        const argType = this.inferArg(argExpr, env);
+        const r = this.u.resolve(argType);
+        if (r.kind !== 'fun') {
+            this.argError('map', 0, argExpr, argType, undefined, undefined);
+            return this.u.fresh();
+        }
+        const ret = this.u.resolve(r.to);
+        if (ret.kind === 'var') {
+            // An unconstrained projection (e.g. mid-typing `map (u => u._x)`):
+            // bind it to the open result row like the generic scheme, so the
+            // surrounding `&` still resolves the row's fields. A non-record
+            // projection (a scalar, like `map (u => u.age)`) still errors.
+            const s = this.u.fresh('row');
+            try { this.u.bind(ret.id, rowOf([], s)); } catch { /* leave open */ }
+            return fun(queryOf(r.from), queryOf(rowOf([], s)));
+        }
+        if (ret.kind !== 'row') {
+            this.argError('map', 0, argExpr, argType, undefined, undefined);
+            return this.u.fresh();
+        }
+        const res = this.u.resolveRow(ret);
+        const entryNodes = this.entryNodesOf(argExpr);
+        const out: [string, Type][] = [];
+        for (const [key, ft] of res.fields) {
+            const raw = this.u.resolve(ft);
+            if (raw.kind === 'group') {
+                this.diag(entryNodes?.get(key) ?? argExpr, `projection entry '${key}' cannot contain group`);
+            } else if (raw.kind === 'order') {
+                this.diag(entryNodes?.get(key) ?? argExpr, `projection entry '${key}' cannot contain order items (asc/desc)`);
+            }
+            out.push([key, raw.kind === 'agg' ? raw.of : ft]);
+        }
+        return fun(queryOf(r.from), queryOf(rowOf(out, res.tail)));
+    }
+
+    /** The map-literal entry VALUE nodes of a lambda body, for anchored messages. */
+    private entryNodesOf(argExpr: Expr): Map<string, AstNode> | null {
+        let node: Expr | null = argExpr;
+        // `(o => { ... })` parses as a 0-argument Application wrapping the
+        // lambda, and `{ k = v }` as a lambda body likewise wraps the map
+        // literal — unwrap both before reading the entries.
+        while (node && isApplication(node) && node.arguments.length === 0) node = node.func;
+        if (!node) return null;
+        let body: Expr | null = isLambda(node) ? (node.body as unknown as Expr) : node;
+        while (body && isApplication(body) && body.arguments.length === 0) body = body.func;
+        if (!body || !isMapLiteral(body)) return null;
+        return new Map(body.entries.map(en => [en.key, en.value]));
+    }
+
+    /**
+     * List-argument builtins (`concat [a, b]`, `substring [s, 1, 3]`, ...):
+     * the scheme types the FIRST element; this checks every element's static
+     * kind and the arity, mirroring the interpreter's runtime checks with
+     * matching messages (so the merged diagnostics dedupe).
+     */
+    private checkListBuiltin(name: string, e: import('./generated/ast.js').Application, env: Map<string, Scheme>): void {
+        const listExpr = e.arguments[0];
+        if (!listExpr || !isListLiteral(listExpr)) return;
+        const elements = listExpr.elements;
+        const [min, max] = LIST_ARITY[name] ?? [0, Infinity];
+        if (elements.length < min || elements.length > max) {
+            this.diag(listExpr, `${name} expects ${min}${max === Infinity ? ' or more' : ` to ${max}`} arguments, got ${elements.length}`);
+        }
+        const expect = (i: number, kind: 'string' | 'int' | 'numeric'): void => {
+            if (i >= elements.length) return;
+            const t = this.inferExpr(elements[i]!, env);
             if (kind === 'numeric') {
-                const r = this.u.resolve(argTypes[index]!);
+                const r = this.u.resolve(t);
                 if (r.kind === 'prim' && !isNumericPrim(r)) {
-                    this.diag(args[index]!, `${name} expects a numeric expression, got type ${this.u.pretty(argTypes[index]!)}`);
+                    this.diag(elements[i]!, `${name} expects numeric expressions, got type ${this.u.pretty(t)}`);
                 }
                 return;
             }
             try {
-                this.u.unify(nullable(kind === 'string' ? prim('string') : prim('int')), argTypes[index]!);
+                this.u.unify(nullable(kind === 'string' ? prim('string') : prim('int')), t);
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    this.diag(args[index]!, `${name} expects ${kind === 'string' ? 'a string expression' : 'an integer'}, got type ${this.u.pretty(argTypes[index]!)}`);
+                    this.diag(elements[i]!, `${name} expects ${kind === 'string' ? 'string' : 'numeric'} expressions, got type ${this.u.pretty(t)}`);
                 } else {
                     throw err;
                 }
             }
         };
         switch (name) {
-            case 'concat':
-                args.forEach((_, i) => expect(i, 'string'));
-                return nullable(prim('string'));
-            case 'greatest': case 'least': {
-                const base = argTypes[0]!;
-                for (let i = 1; i < args.length; i++) {
-                    try {
-                        this.u.unify(nullable(base), argTypes[i]!);
-                    } catch (err) {
-                        if (err instanceof UnifyError) {
-                            this.diag(args[i]!, `${name} requires matching types, got ${this.u.pretty(base)} and ${this.u.pretty(argTypes[i]!)}`);
-                        } else {
-                            throw err;
-                        }
+            case 'concat': elements.forEach((_, i) => expect(i, 'string')); break;
+            case 'greatest': case 'least': break; // element comparability is the interpreter's call (mixed numerics are legal)
+            case 'round': expect(0, 'numeric'); expect(1, 'int'); break;
+            case 'substring': expect(0, 'string'); expect(1, 'int'); expect(2, 'int'); break;
+            case 'lpad': case 'rpad': expect(0, 'string'); expect(1, 'int'); expect(2, 'string'); break;
+            case 'regex_extract': expect(0, 'string'); expect(1, 'string'); expect(2, 'int'); break;
+            case 'lag': case 'lead':
+                if (elements.length >= 2) {
+                    const offset = this.inferExpr(elements[1]!, env);
+                    const r = this.u.resolve(offset);
+                    if (r.kind === 'prim' && !isNumericPrim(r)) {
+                        this.diag(elements[1]!, `${name} expects a numeric offset, got type ${this.u.pretty(offset)}`);
                     }
                 }
-                return base;
-            }
-            case 'round':
-                expect(0, 'numeric');
-                if (args.length === 2) expect(1, 'int');
-                return argTypes[0]!;
-            case 'substring':
-                expect(0, 'string');
-                expect(1, 'int');
-                if (args.length === 3) expect(2, 'int');
-                return nullable(prim('string'));
-            case 'lpad': case 'rpad':
-                expect(0, 'string');
-                expect(1, 'int');
-                if (args.length === 3) expect(2, 'string');
-                return nullable(prim('string'));
-            case 'regex_extract':
-                expect(0, 'string');
-                expect(1, 'string');
-                if (args.length === 3) expect(2, 'int');
-                return nullable(prim('string'));
-            case 'lag': case 'lead':
-                // value of any type; optional int offset; optional default
-                if (args.length >= 2) expect(1, 'int');
-                return argTypes[0]!;
+                break;
         }
-        return this.u.fresh();
     }
 
     /**
@@ -918,7 +937,7 @@ class Inferencer {
                 break;
             }
             case 'join':
-                if (index === 0) this.diag(node, `join expects a join kind as its first argument: inner, left, right or full (a bare identifier), got an expression of type ${p(argType)}`);
+                if (index === 0) this.diag(node, `join expects a join kind as its first argument: inner, left, right or full (a bare identifier, e.g. inner), got an expression of type ${p(argType)}`);
                 else if (index === 1) this.diag(node, `join expects a query as its second argument, got an expression of type ${p(argType)} — bind a table or pipeline first, e.g. join inner orders (l => r => ...)`);
                 else if (index === 2) this.diag(node, `join 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got an expression of type ${p(argType)}`);
                 else if (index === 3) this.diag(node, `join 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got an expression of type ${p(argType)}`);
@@ -973,9 +992,27 @@ class Inferencer {
             const rt = this.u.resolve(argType);
             if (rt.kind === 'fun') {
                 const ret = this.u.resolve(rt.to);
-                if (ret.kind !== 'var') {
-                    const isOrder = ret.kind === 'order' || (ret.kind === 'list' && this.u.resolve(ret.of).kind === 'order');
-                    if (!isOrder) this.diag(node, `sort expects order items like asc u.name or a list of them, got an expression of type ${this.u.pretty(ret)}`);
+                // A concrete return must already BE an order item or a list of
+                // them; an unconstrained variable is skolemized so it cannot
+                // silently bind to `order`/`[order]` — `sort (u => u.name)`
+                // must fail here, not at runtime.
+                const isOrder = ret.kind === 'order'
+                    || (ret.kind === 'list' && this.u.resolve(ret.of).kind === 'order');
+                if (!isOrder && ret.kind !== 'var') {
+                    this.diag(node, `sort expects order items like asc u.name or a list of them, got an expression of type ${this.u.pretty(ret)}`);
+                } else if (ret.kind === 'var') {
+                    const sk = this.u.skolemize(ret);
+                    try {
+                        this.u.unify(ret, { kind: 'order' });
+                    } catch {
+                        try {
+                            this.u.unify(ret, listOf({ kind: 'order' }));
+                        } catch {
+                            this.diag(node, `sort expects order items like asc u.name or a list of them, got an expression of type ${this.u.pretty(ret)}`);
+                        } finally {
+                            sk.restore();
+                        }
+                    }
                 }
             }
         }

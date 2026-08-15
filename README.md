@@ -381,6 +381,29 @@ q: query { id: int } = table "users" : query { id: int }    # ascribe a query ty
 Annotations are erased at evaluation time; `check` and `render` both reject
 type errors, so they never disagree.
 
+### Query modes are types
+
+The type system encodes the SQL phases a query step lives in, so mode mistakes
+are static errors, not runtime surprises:
+
+- **Join kinds** (`inner`, `left`, `right`, `full`) are a dedicated `join kind`
+  type — `join "inner" ...` is a type error, the kind is a constant, not a
+  string.
+- **Aggregates** (`count`, `sum`, `avg`, `min`, `max`, `list`) have aggregate
+  mode (`sum o.total : agg float`) and `group` has group mode
+  (`group o.user_id : group int`). A `fold` entry that is neither is a type
+  error — no more "must be wrapped in an aggregate" surprises:
+  ```
+  fold (o => { x = o.age })            # ✗ type error: plain column
+  fold (o => { x = sum o.age })        # ✓ aggregate mode
+  ```
+  The modes are transparent in unification, so comparing or computing on
+  aggregate results works, and a fold's result row is plain — downstream
+  `filter` becomes `HAVING` and `sort`/`map` see normal columns.
+- **`asc`/`desc`** return the `order` type, so `sort (u => u.name)` (a plain
+  column) is a type error; `sort (u => asc u.name)` and
+  `sort (u => [asc u.name, desc u.age])` are fine.
+
 ### Query roots and steps
 
 | Builtin | Meaning | Renders to |
@@ -443,18 +466,18 @@ date_format u.created_at "%Y-%m-%d"      # dialect-native format string
 date_parse u.note "%Y-%m-%d"             # dialect-native format string
 to_unixtime u.created_at  from_unixtime u.id
 ceil u.balance  floor u.balance  sqrt u.balance  pow u.balance 2  mod u.id 3
-round u.balance 2                      # optional scale
-greatest u.a u.b  least u.a u.b        # variadic — all arguments at once
-concat u.first u.last                  # variadic; sqlite renders || — joins
+round [u.balance, 2]                 # optional scale — one list argument
+greatest [u.a, u.b]  least [u.a, u.b]  # any number of arguments, one list
+concat [u.first, u.last]             # sqlite renders || — joins
 merge u { active = true }              # record union — right record wins on overlap
 u <> { active = true }                 # infix form of merge (a monoid: {} is the identity)
 trim u.name  reverse u.name  replace u.name "x" "y"
-substring u.name 1 3                   # optional length; sqlite renders SUBSTR
+substring [u.name, 1, 3]             # optional length; sqlite renders SUBSTR
 position u.name "a"                    # POSITION / LOCATE / INSTR, per dialect
 left_substring u.name 3  right_substring u.name 2
-lpad u.code 8 "0"  rpad u.code 8 "0"   # sqlite has no LPAD/RPAD (render error)
+lpad [u.code, 8, "0"]  rpad [u.code, 8, "0"]   # sqlite has no LPAD/RPAD (render error)
 regex_like u.name "^[A-Z]"  regex_replace u.name "[0-9]" "#"
-regex_extract u.name "([0-9]+)" 1
+regex_extract [u.name, "([0-9]+)", 1]
 like u.name "a%"                       # x LIKE pattern
 null_if u.name ""  is_null u.name  is_not_null u.name
 case { u.active => u.name, _ => "inactive" }    # CASE WHEN active THEN name ELSE 'inactive' END
@@ -464,7 +487,7 @@ cast u.id "string"  try_cast u.name "int"   # TRY_CAST is Trino-only
 over row_number { partition = [u.dept], order = [desc u.salary] }   # window functions — parens optional for zero-arg fns
 over rank { partition = [u.dept] }          # rank / dense_rank / percent_rank
 over (ntile 4) { partition = [u.dept] }     # multi-arg fns keep parens
-over (lag u.salary 1 0) { order = [asc u.joined] }   # lag / lead (offset, default optional)
+over (lag [u.salary, 1, 0]) { order = [asc u.joined] }   # lag / lead (offset, default optional)
 over (sum u.salary) { partition = [u.dept] }        # windowed aggregates
 ```
 

@@ -18,8 +18,8 @@ describe('math functions', () => {
                 s = sqrt u.balance,
                 p = pow u.balance 2,
                 m = mod u.id 3,
-                r1 = round u.balance,
-                r2 = round u.balance 2,
+                r1 = round [u.balance],
+                r2 = round [u.balance, 2],
             })
         `, 'trino');
         expect(sql).toContain('CEIL(balance) AS c');
@@ -37,39 +37,39 @@ describe('math functions', () => {
     });
 
     test('greatest/least with many arguments', () => {
-        const sql = render(`${USERS}\nq = users & map (u => { g = greatest u.balance u.id 5, l = least u.balance u.id 5 })`, 'trino');
+        const sql = render(`${USERS}\nq = users & map (u => { g = greatest [u.balance, u.id, 5], l = least [u.balance, u.id, 5] })`, 'trino');
         expect(sql).toContain('GREATEST(balance, id, 5) AS g');
         expect(sql).toContain('LEAST(balance, id, 5) AS l');
     });
 
-    test('variadic builtins work through a binding', () => {
+    test('list-argument builtins work through a binding', () => {
         const sql = render(`
             ${USERS}
             pick = greatest
-            q = users & map (u => { g = pick u.balance 5 })
+            q = users & map (u => { g = pick [u.balance, 5] })
         `, 'trino');
         expect(sql).toContain('GREATEST(balance, 5) AS g');
     });
 
     test('greatest requires matching types', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { g = greatest u.balance u.name })`).join('\n')).toContain('greatest requires matching types, got float and string');
+        expect(errors(`${USERS}\nq = users & map (u => { g = greatest [u.balance, u.name] })`).join('\n')).toContain('greatest requires matching types, got float and string');
     });
 
-    test('variadic arity is validated', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { g = greatest u.balance })`).join('\n')).toContain('greatest expects 2 or more arguments, got 1');
-        expect(errors(`${USERS}\nq = users & map (u => { r = round u.balance 2 3 })`).join('\n')).toContain('round expects 1 to 2 arguments, got 3');
+    test('list-argument arity is validated', () => {
+        expect(errors(`${USERS}\nq = users & map (u => { g = greatest [u.balance] })`).join('\n')).toContain('greatest expects 2 or more arguments, got 1');
+        expect(errors(`${USERS}\nq = users & map (u => { r = round [u.balance, 2, 3] })`).join('\n')).toContain('round expects 1 to 2 arguments, got 3');
     });
 });
 
 describe('string functions', () => {
     test('concat renders CONCAT except sqlite ||', () => {
-        const src = `${USERS}\nq = users & map (u => { full = concat u.name "-" u.name })`;
+        const src = `${USERS}\nq = users & map (u => { full = concat [u.name, "-", u.name] })`;
         expect(render(src, 'trino')).toContain(`CONCAT(name, '-', name) AS "full"`);
         expect(render(src, 'sqlite')).toContain(`name || '-' || name AS "full"`);
     });
 
     test('substring with optional length; sqlite uses SUBSTR', () => {
-        const src = `${USERS}\nq = users & map (u => { a = substring u.name 1, b = substring u.name 1 3 })`;
+        const src = `${USERS}\nq = users & map (u => { a = substring [u.name, 1], b = substring [u.name, 1, 3] })`;
         expect(render(src, 'trino')).toContain('SUBSTRING(name, 1) AS a');
         expect(render(src, 'trino')).toContain('SUBSTRING(name, 1, 3) AS b');
         expect(render(src, 'sqlite')).toContain('SUBSTR(name, 1) AS a');
@@ -104,7 +104,7 @@ describe('string functions', () => {
     });
 
     test('lpad/rpad render directly; sqlite errors', () => {
-        const src = `${USERS}\nq = users & map (u => { l = lpad u.name 8 "0", r = rpad u.name 8 "0" })`;
+        const src = `${USERS}\nq = users & map (u => { l = lpad [u.name, 8, "0"], r = rpad [u.name, 8, "0"] })`;
         expect(render(src, 'trino')).toContain(`LPAD(name, 8, '0') AS l`);
         expect(render(src, 'trino')).toContain(`RPAD(name, 8, '0') AS r`);
         expect(() => render(src, 'sqlite')).toThrow('lpad is not supported for the sqlite dialect');
@@ -128,12 +128,12 @@ describe('regex functions', () => {
     });
 
     test('regex_replace and regex_extract', () => {
-        const src = `${USERS}\nq = users & map (u => { r = regex_replace u.name "[0-9]" "#", e = regex_extract u.name "([0-9]+)" })`;
+        const src = `${USERS}\nq = users & map (u => { r = regex_replace u.name "[0-9]" "#", e = regex_extract [u.name, "([0-9]+)"] })`;
         expect(render(src, 'trino')).toContain(`REGEXP_REPLACE(name, '[0-9]', '#') AS r`);
         expect(render(src, 'trino')).toContain(`REGEXP_EXTRACT(name, '([0-9]+)') AS e`);
         expect(render(src, 'postgresql')).toContain(`REGEXP_SUBSTR(name, '([0-9]+)') AS e`);
         expect(() => render(src, 'sqlite')).toThrow('regex_replace is not supported for the sqlite dialect');
-        const extract = `${USERS}\nq = users & map (u => { e = regex_extract u.name "([0-9]+)" })`;
+        const extract = `${USERS}\nq = users & map (u => { e = regex_extract [u.name, "([0-9]+)"] })`;
         expect(() => render(extract, 'sqlite')).toThrow('regex_extract is not supported for the sqlite dialect');
         expect(() => render(extract, 'mysql')).toThrow('regex_extract is not supported for the mysql dialect');
     });
@@ -319,17 +319,17 @@ describe('validation', () => {
     });
 
     test('concat rejects non-strings', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { c = concat u.name u.id })`).join('\n')).toContain('concat expects string expressions');
+        expect(errors(`${USERS}\nq = users & map (u => { c = concat [u.name, u.id] })`).join('\n')).toContain('concat expects string expressions');
     });
 
     test('substring validates argument kinds', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { s = substring u.id 1 3 })`).join('\n')).toContain('substring expects string expressions');
-        expect(errors(`${USERS}\nq = users & map (u => { s = substring u.name u.name })`).join('\n')).toContain('substring expects numeric expressions');
+        expect(errors(`${USERS}\nq = users & map (u => { s = substring [u.id, 1, 3] })`).join('\n')).toContain('substring expects string expressions');
+        expect(errors(`${USERS}\nq = users & map (u => { s = substring [u.name, u.name] })`).join('\n')).toContain('substring expects numeric expressions');
     });
 
     test('lpad/rpad validate argument kinds', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { s = lpad u.id 8 "0" })`).join('\n')).toContain('lpad expects string expressions');
-        expect(errors(`${USERS}\nq = users & map (u => { s = rpad u.name "8" "0" })`).join('\n')).toContain('rpad expects numeric expressions');
+        expect(errors(`${USERS}\nq = users & map (u => { s = lpad [u.id, 8, "0"] })`).join('\n')).toContain('lpad expects string expressions');
+        expect(errors(`${USERS}\nq = users & map (u => { s = rpad [u.name, "8", "0"] })`).join('\n')).toContain('rpad expects numeric expressions');
     });
 
     test('like requires string operands', () => {
@@ -353,10 +353,10 @@ describe('type inference', () => {
                 c = ceil u.balance,
                 p = pow u.balance 2,
                 m = mod u.id 3,
-                r = round u.balance 2,
-                g = greatest u.balance 1.5,
-                full = concat u.name "-" u.name,
-                sub = substring u.name 1 3,
+                r = round [u.balance, 2],
+                g = greatest [u.balance, 1.5],
+                full = concat [u.name, "-", u.name],
+                sub = substring [u.name, 1, 3],
                 pos = position u.name "a",
                 li = like u.name "a%",
                 nf = null_if u.name "",
@@ -370,7 +370,7 @@ describe('type inference', () => {
         // Regression: `pow u.balance 2` must not pin balance to int.
         const src = `
             ${USERS}
-            q = users & map (u => { p = pow u.balance 2, g = greatest u.balance 1.5 })
+            q = users & map (u => { p = pow u.balance 2, g = greatest [u.balance, 1.5] })
         `;
         expect(typeErrors(src)).toEqual([]);
         expect(typeErrors(src)).not.toContain('greatest requires matching types');

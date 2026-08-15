@@ -26,7 +26,20 @@ export type Type =
     /** A record row: unordered label → type map, plus an optional tail variable. */
     | { kind: 'row'; fields: Map<string, Type>; tail: Type | null }
     | { kind: 'query'; row: Type }
-    | { kind: 'order' };
+    /** An ORDER BY item (`asc`/`desc`). */
+    | { kind: 'order' }
+    /** A join kind constant (`inner`, `left`, `right`, `full`). */
+    | { kind: 'jkind' }
+    /**
+     * An aggregate-mode expression (`sum o.total`, `count o.id`, ...) — "the
+     * value of type `t`, aggregated". Transparent in unification (like `?`),
+     * so comparisons/arithmetic on aggregate results work; the mode is
+     * enforced by the fold/map mode checks in inference, which inspect the
+     * raw (pre-unification) field types.
+     */
+    | { kind: 'agg'; of: Type }
+    /** A group-mode expression (`group o.user_id`). Transparent in unification. */
+    | { kind: 'group'; of: Type };
 
 export type VarKind = 'type' | 'row';
 
@@ -80,6 +93,20 @@ export function listOf(t: Type): Type {
 
 export function queryOf(row: Type): Type {
     return { kind: 'query', row };
+}
+
+export function jkindType(): Type {
+    return { kind: 'jkind' };
+}
+
+/** Wrap `t` in the aggregate mode: `agg t` ("an aggregate of `t`"). */
+export function aggOf(t: Type): Type {
+    return t.kind === 'agg' ? t : { kind: 'agg', of: t };
+}
+
+/** Wrap `t` in the group mode: `group t` (a GROUP BY key). */
+export function groupOf(t: Type): Type {
+    return t.kind === 'group' ? t : { kind: 'group', of: t };
 }
 
 export function rowOf(fields: [string, Type][], tail: Type | null = null): Type {
@@ -150,7 +177,8 @@ export class TypeUniverse {
                     if (r.tail) visit(r.tail);
                     break;
                 case 'query': visit(r.row); break;
-                case 'prim': case 'order': break;
+                case 'agg': case 'group': visit(r.of); break;
+                case 'prim': case 'order': case 'jkind': break;
             }
         };
         visit(t);
@@ -230,6 +258,21 @@ export class TypeUniverse {
             return nullable(inner);
         }
 
+        // `agg`/`group` mode absorption (transparent, like `?`): unify the
+        // payloads and re-wrap. Mixed modes never unify (an aggregate result
+        // is not a GROUP BY key and vice versa).
+        const aAgg = a.kind === 'agg' ? a.of : null;
+        const bAgg = b.kind === 'agg' ? b.of : null;
+        const aGroup = a.kind === 'group' ? a.of : null;
+        const bGroup = b.kind === 'group' ? b.of : null;
+        if (aAgg !== null || bAgg !== null || aGroup !== null || bGroup !== null) {
+            if ((aAgg !== null && bGroup !== null) || (aGroup !== null && bAgg !== null)) {
+                throw new UnifyError(a, b);
+            }
+            const inner = this.unify(aAgg ?? aGroup ?? a, bAgg ?? bGroup ?? b);
+            return aAgg !== null || bAgg !== null ? aggOf(inner) : groupOf(inner);
+        }
+
         switch (a.kind) {
             case 'prim':
                 if (b.kind === 'prim' && a.name === b.name) return a;
@@ -261,6 +304,9 @@ export class TypeUniverse {
                 break;
             case 'order':
                 if (b.kind === 'order') return a;
+                break;
+            case 'jkind':
+                if (b.kind === 'jkind') return a;
                 break;
         }
         throw new UnifyError(a, b);
@@ -461,7 +507,9 @@ export class TypeUniverse {
                 return { kind: 'row', fields, tail };
             }
             case 'query': return queryOf(this.substitute(subst, r.row));
-            case 'prim': case 'order': return r;
+            case 'agg': return aggOf(this.substitute(subst, r.of));
+            case 'group': return groupOf(this.substitute(subst, r.of));
+            case 'prim': case 'order': case 'jkind': return r;
         }
     }
 
@@ -502,11 +550,14 @@ export class TypeUniverse {
                     return `{ ${body}${tailText} }`;
                 }
                 case 'query': return `query ${p(r.row, false)}`;
+                case 'agg': return `agg ${p(r.of, false)}`;
+                case 'group': return `group ${p(r.of, false)}`;
                 case 'fun': {
                     const s = `${p(r.from, true)} -> ${p(r.to, false)}`;
                     return paren ? `(${s})` : s;
                 }
                 case 'order': return 'order';
+                case 'jkind': return 'join kind';
             }
         };
         return p(t, false);

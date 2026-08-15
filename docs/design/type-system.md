@@ -303,25 +303,32 @@ row polymorphism: one signature, instantiated at every use.
 table     : string -> query r                            -- schema via binding annotation or inference (§5)
 filter    : forall r. (r -> bool) -> query r -> query r  -- alias: filtered
 map       : forall r s. (r -> {s}) -> query r -> query {s}
-sort      : forall r. (r -> order | [order]) -> query r -> query r     -- ∨ special-case: either shape
+sort      : forall r. (r -> t) -> query r -> query r     -- t checked to be order or [order] (see below)
 take      : int -> query r -> query r                    -- forall r
 distinct  : forall r. query r -> query r
 fold      : forall r s. (r -> {s}) -> query r -> query {s}
-join      : forall r s t. string -> query s -> (r -> s -> bool) -> (r -> s -> {t})
+join      : forall r s t. join kind -> query s -> (r -> s -> bool) -> (r -> s -> {t})
                 -> query r -> query {t}              -- kind: inner|left|right|full; the merger projects the result row
 
 asc, desc: forall t. t? -> order                        -- internal type 'order' for sort items
-group     : forall t. t? -> t?
-count     : forall t. t? -> int
-sum       : t? -> t?                     -- t numeric (int or float), result same as operand
-avg       : t? -> float?                 -- t numeric
-min, max  : forall t. t? -> t?           -- comparable t
+inner, left, right, full: join kind                     -- a dedicated type, not string
+group     : forall t. t? -> group t                     -- GROUP BY key — group mode
+count     : forall t. t? -> agg int                     -- aggregate mode
+sum       : forall t. t? -> agg t                       -- t numeric (int or float)
+avg       : forall t. t? -> agg float                   -- t numeric
+min, max  : forall t. t? -> agg t                       -- comparable t
+list      : forall t. t? -> agg [t?]                    -- collect values into a list
 not       : bool -> bool
 abs       : t? -> t?                     -- t numeric
 upper, lower: string? -> string?
 length    : string? -> int?
 is_in, is_not_in: forall t. t? -> [t?] -> bool
 coalesce  : forall t. t? -> t? -> t?
+concat    : [string?] -> string?          -- one list argument
+greatest, least: forall t. [t?] -> t?    -- one list argument
+round     : forall t. [t?] -> t?          -- one list argument ([x] or [x, scale])
+substring, lpad, rpad, regex_extract: [string?] -> string?   -- one list argument
+lag, lead : forall t. [t?] -> t?          -- one list argument ([x] or [x, offset, default])
 ==  !=  <  <=  >  >=  : forall t. t? -> t? -> bool       -- strict numerics: int vs float fails
 &&  ||              : bool -> bool -> bool               -- absorption accepts bool? operands
 +  -  *  /  %       : t? -> t? -> t?                     -- t numeric; both sides same type; result nullable
@@ -330,17 +337,34 @@ coalesce  : forall t. t? -> t? -> t?
 int  float  string  bool  date  timestamp: Type         -- internal; only valid in table schemas
 ```
 
+**Query modes are types.** `agg t` / `group t` / `order` / `join kind` are
+transparent in unification (like `?`), so comparing or computing on aggregate
+results works; the mode is enforced by *mode checks* in inference that inspect
+the raw (pre-unification) field types:
+
+- **`fold`** — every field of the projection row must be `agg t` or `group t`
+  with at least one aggregate; the result row strips the modes, so downstream
+  steps see plain columns (`query { user_id: int, total: float }`).
+- **`map`** — projection fields must not be `group` or `order` (SQL cannot
+  select a GROUP BY key or an ORDER BY item as a value); aggregate fields are
+  allowed because after a fold the map runs on the aggregated result (nested
+  aggregation), which the evaluator validates positionally.
+- **`sort`** — the lambda's return type is checked to be `order` or `[order]`
+  (skolemized, so an unconstrained column like `u => u.name` is rejected).
+
+The **list-argument builtins** take one list argument (`concat [a, b]`) instead
+of variadic application — they are ordinary curried functions, and inference
+checks each element's kind and the arity (`checkListBuiltin`).
+
 Special cases the inferencer implements directly (they are not expressible as
 plain schemes):
 
 - **`table`'s schema argument.** The second argument is a record type
   literal whose type IS the row (§5) — `table`'s scheme applies it like any
   other argument; there is no special casing.
-- **`sort`'s selector.** The lambda's return type must unify with `order` or
-  `[order]` (today: "sort expects order items like asc u.name or a list of
-  them", `interpreter.ts:1122`).
-- **`map`/`fold` projections.** The lambda's return type must be a row type;
-  the *structural* rules (projection non-empty, aggregates only inside `fold`,
+- **`map`/`fold` projections.** The lambda's return type must be a row type
+  (an unconstrained variable is bound to the open result row, so mid-typing
+  completion keeps working); the *structural* rules (projection non-empty,
   one `fold` per pipeline, `fold` after `map`, …) remain in the evaluator.
 - **Implicit `$n` lambdas.** `filter ($1.active && $1.age >= 18)` is typed as
   the lambda `($1, …, $n) => …` with arity = highest `$n` not bound and not
