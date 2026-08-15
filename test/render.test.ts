@@ -721,3 +721,54 @@ describe('implicit lambda parameters ($n)', () => {
         expect(render(src2)).toContain('0 - age AS b');
     });
 });
+
+describe('review fixes: pure-local bindings, step composition, SQL escaping', () => {
+    test('let binds a pure local expression inside a projection', () => {
+        const src = 'users: query { id: int, age: int } = table "users"\nq = users & map (u => let double = u.age * 2 in { double = double, next = double + 1 })';
+        const sql = render(src);
+        expect(sql).toBe([
+            'SELECT',
+            '    age * 2 AS double,',
+            '    age * 2 + 1 AS next',
+            'FROM users',
+        ].join('\n'));
+    });
+
+    test('query steps compose point-free with >>>', () => {
+        const sql = render(`
+            ${USERS}
+            adult = u => u.active
+            q = users & (filter (adult) >>> take 10)
+        `);
+        expect(sql).toBe('SELECT *\nFROM users\nWHERE active\nLIMIT 10');
+    });
+
+    test('identifiers with embedded quotes are escaped per dialect', () => {
+        const src = 'q: query { id: int } = table "a\\\"b"';
+        expect(render(src, 'sqlite')).toBe('SELECT *\nFROM "a""b"');
+        expect(render(src, 'postgresql')).toBe('SELECT *\nFROM "a""b"');
+    });
+
+    test('backtick identifiers are escaped for mysql/hive', () => {
+        const src = 'q: query { id: int } = table "a`b"';
+        expect(render(src, 'mysql')).toBe('SELECT *\nFROM `a``b`');
+        expect(render(src, 'hive')).toBe('SELECT *\nFROM `a``b`');
+    });
+
+    test('date_format strings are quoted as SQL string literals', () => {
+        const src = 'users: query { created_at: date } = table "users"\nq = users & map (u => { d = date_format u.created_at "it\'s" })';
+        expect(render(src, 'sqlite')).toContain(`STRFTIME('it''s', created_at)`);
+    });
+
+    test('regex_extract group is not silently ignored on unsupported dialects', () => {
+        const src = 'users: query { name: string } = table "users"\nq = users & map (u => { e = regex_extract [u.name, "([0-9]+)", 1] })';
+        expect(() => render(src, 'postgresql')).toThrow('regex_extract group argument is not supported for the postgresql dialect');
+        expect(() => render(src, 'hive')).toThrow('regex_extract group argument is not supported for the hive dialect');
+        expect(render(src, 'trino')).toContain('REGEXP_EXTRACT(name, \'([0-9]+)\', 1)');
+    });
+
+    test('a let-bound table accepts a query-type schema annotation', () => {
+        const sql = render('q = let users: query { id: int } = table "users" in users & map (u => { id = u.id })');
+        expect(sql).toBe('SELECT id\nFROM users');
+    });
+});

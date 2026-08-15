@@ -11,13 +11,15 @@ import type { NumberLiteral } from './generated/ast.js';
 import { AstUtils } from 'langium';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBooleanLiteral,
-    isCaseExpression, isIdentifier, isLambda, isLambdaBinaryExpression, isDollarParam, isListLiteral,
+    isCaseExpression, isIdentifier, isLambda, isLambdaBinaryExpression, isLambdaLetExpression,
+    isDollarParam, isLetExpression, isListLiteral,
     isListType, isMapLiteral,
     isNullLiteral, isNullType, isNumberLiteral, isQueryType, isStringLiteral,
     isTypeParen, isTypeVar, isUnaryMinus,
     type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
 } from './generated/ast.js';
 import type { ProjectModule } from './imports.js';
+import type { BuiltinName } from './builtin.js';
 
 // ---------------------------------------------------------------------------
 // SQL model
@@ -27,47 +29,47 @@ export type SqlType = 'int' | 'float' | 'string' | 'bool' | 'date' | 'timestamp'
 export type TypeOrNull = SqlType | 'null';
 
 export interface SqlColumn {
-    type: SqlType;
+    readonly type: SqlType;
     /** Table name for qualification, or null for computed columns. */
-    table: string | null;
+    readonly table: string | null;
     /**
      * For derived columns (projections from map/fold): the defining SQL
      * expression, inlined whenever the column is referenced later in the
      * pipeline (teta-style). Undefined for base table columns.
      */
-    expr?: SqlNode;
+    readonly expr?: SqlNode;
 }
-export type Schema = Map<string, SqlColumn>;
+export type Schema = ReadonlyMap<string, SqlColumn>;
 
 export type SqlNode =
-    | { kind: 'col'; name: string; table: string | null; type: SqlType }
-    | { kind: 'lit'; value: number | string | boolean | null; type: TypeOrNull }
-    | { kind: 'bin'; op: string; left: SqlNode; right: SqlNode; type: SqlType }
-    | { kind: 'is-null'; expr: SqlNode; negated: boolean; type: 'bool' }
-    | { kind: 'not'; expr: SqlNode; type: 'bool' }
-    | { kind: 'call'; name: string; args: SqlNode[]; type: SqlType }
-    | { kind: 'current-date'; type: 'date' }
-    | { kind: 'current-timestamp'; type: 'timestamp' }
-    | { kind: 'in'; expr: SqlNode; list: SqlNode[]; negated: boolean; type: 'bool' }
-    | { kind: 'agg'; name: string; arg: SqlNode; type: SqlType }
-    | { kind: 'group'; expr: SqlNode; table: string | null; type: SqlType }
-    | { kind: 'order'; expr: SqlNode; dir: 'ASC' | 'DESC'; type: SqlType }
-    | { kind: 'window'; fn: SqlNode; partition: SqlNode[]; order: { node: SqlNode; dir: 'ASC' | 'DESC' }[]; type: SqlType }
-    | { kind: 'case'; branches: { cond: SqlNode; value: SqlNode }[]; elseValue: SqlNode | null; type: SqlType };
+    | { readonly kind: 'col'; readonly name: string; readonly table: string | null; readonly type: SqlType }
+    | { readonly kind: 'lit'; readonly value: number | string | boolean | null; readonly type: TypeOrNull }
+    | { readonly kind: 'bin'; readonly op: string; readonly left: SqlNode; readonly right: SqlNode; readonly type: SqlType }
+    | { readonly kind: 'is-null'; readonly expr: SqlNode; readonly negated: boolean; readonly type: 'bool' }
+    | { readonly kind: 'not'; readonly expr: SqlNode; readonly type: 'bool' }
+    | { readonly kind: 'call'; readonly name: string; readonly args: readonly SqlNode[]; readonly type: SqlType }
+    | { readonly kind: 'current-date'; readonly type: 'date' }
+    | { readonly kind: 'current-timestamp'; readonly type: 'timestamp' }
+    | { readonly kind: 'in'; readonly expr: SqlNode; readonly list: readonly SqlNode[]; readonly negated: boolean; readonly type: 'bool' }
+    | { readonly kind: 'agg'; readonly name: string; readonly arg: SqlNode; readonly type: SqlType }
+    | { readonly kind: 'group'; readonly expr: SqlNode; readonly table: string | null; readonly type: SqlType }
+    | { readonly kind: 'order'; readonly expr: SqlNode; readonly dir: 'ASC' | 'DESC'; readonly type: SqlType }
+    | { readonly kind: 'window'; readonly fn: SqlNode; readonly partition: readonly SqlNode[]; readonly order: readonly { node: SqlNode; dir: 'ASC' | 'DESC' }[]; readonly type: SqlType }
+    | { readonly kind: 'case'; readonly branches: readonly { cond: SqlNode; value: SqlNode }[]; readonly elseValue: SqlNode | null; readonly type: SqlType };
 
 export interface RowNode {
-    fields: { key: string; node: SqlNode }[];
+    readonly fields: readonly { key: string; node: SqlNode }[];
 }
 
 export type JoinKind = 'inner' | 'left' | 'right' | 'full';
 
 export type QueryStep =
-    | { kind: 'filter'; cond: SqlNode; having: boolean }
-    | { kind: 'map'; proj: RowNode }
-    | { kind: 'sort'; items: { node: SqlNode; dir: 'ASC' | 'DESC' }[] }
-    | { kind: 'take'; n: number }
-    | { kind: 'fold'; proj: RowNode }
-    | { kind: 'join'; joinKind: JoinKind; right: Query; on: SqlNode; proj: RowNode };
+    | { readonly kind: 'filter'; readonly cond: SqlNode; readonly having: boolean }
+    | { readonly kind: 'map'; readonly proj: RowNode }
+    | { readonly kind: 'sort'; readonly items: readonly { node: SqlNode; dir: 'ASC' | 'DESC' }[] }
+    | { readonly kind: 'take'; readonly n: number }
+    | { readonly kind: 'fold'; readonly proj: RowNode }
+    | { readonly kind: 'join'; readonly joinKind: JoinKind; readonly right: Query; readonly on: SqlNode; readonly proj: RowNode };
 
 export interface Query {
     /**
@@ -76,17 +78,17 @@ export interface Query {
      * generated aliases (derived tables, joined subqueries) over invented
      * names, so the output reads like the source.
      */
-    name?: string;
-    root: {
-        name: string;
-        schema: Schema;
+    readonly name?: string;
+    readonly root: {
+        readonly name: string;
+        readonly schema: Schema;
         /**
          * A derived table: the query is `(SELECT ... FROM ... ) AS name` rather
          * than a real table. Set when a pipeline step is applied after a fold
          * (map/join wrap the aggregated result so it can be projected or
          * joined again, teta-style — a fold ends the flat FROM scope).
          */
-        from?: Query;
+        readonly from?: Query;
     };
     /**
      * Whether the query's schema is complete. A bare `table "users"` with no
@@ -94,16 +96,16 @@ export interface Query {
      * synthesized lazily and type checks relax. `map`/`fold` projections and
      * a schema annotation make it known again.
      */
-    known: boolean;
+    readonly known: boolean;
     /**
      * Table aliases in FROM-clause order (root first). A table name that
      * appears more than once in one query gets suffixed aliases (users,
      * users_1, ...) so self-joins stay unambiguous. Column nodes carry the
      * alias in their `table` field.
      */
-    aliases: string[];
-    steps: QueryStep[];
-    distinct: boolean;
+    readonly aliases: readonly string[];
+    readonly steps: readonly QueryStep[];
+    readonly distinct: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,9 +319,9 @@ function nodeTable(node: SqlNode): string | null {
 }
 
 export function rowNodeSchema(row: RowNode): Schema {
-    const schema: Schema = new Map();
+    const schema = new Map<string, SqlColumn>();
     for (const field of row.fields) {
-        if (field.node.type === 'null') continue;
+        if (field.node.type === "null") continue;
         schema.set(field.key, {
             type: field.node.type as SqlType,
             table: nodeTable(field.node),
@@ -330,7 +332,7 @@ export function rowNodeSchema(row: RowNode): Schema {
 }
 
 export function querySchema(q: Query): Schema {
-    let schema = new Map(q.root.schema);
+    let schema: Schema = new Map(q.root.schema);
     for (const step of q.steps) {
         switch (step.kind) {
             case 'filter': case 'sort': case 'take': break;
@@ -352,6 +354,25 @@ function addStep(q: Query, step: QueryStep): Query {
 
 function hasFoldStep(q: Query): boolean {
     return q.steps.some(s => s.kind === 'fold');
+}
+
+function hasTakeStep(q: Query): boolean {
+    return q.steps.some(s => s.kind === 'take');
+}
+
+/** True when the query's last projection contains a window function. */
+function hasWindowProjection(q: Query): boolean {
+    for (let i = q.steps.length - 1; i >= 0; i--) {
+        const step = q.steps[i]!;
+        if (step.kind !== 'map' && step.kind !== 'fold' && step.kind !== 'join') continue;
+        for (const field of step.proj.fields) {
+            let found = false;
+            forEachNode(field.node, n => { if (n.kind === 'window') found = true; });
+            if (found) return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 /**
@@ -394,7 +415,7 @@ function wrapAsDerived(q: Query): Query {
     // The subquery's SELECT aliases every fold output column, so the outer
     // query references them as plain columns of the derived table — the
     // inlined `expr` (e.g. `SUM(total)`) must not leak into the outer scope.
-    const schema: Schema = new Map();
+    const schema = new Map<string, SqlColumn>();
     for (const [key, col] of querySchema(q)) {
         schema.set(key, { type: col.type, table: alias });
     }
@@ -405,6 +426,21 @@ function wrapAsDerived(q: Query): Query {
         steps: [],
         distinct: false,
     };
+}
+
+/**
+ * Make a query ready for the next pipeline step without changing observable
+ * semantics. Relational steps commute with many clauses, but LIMIT, DISTINCT
+ * and window projections do not. When a later step needs the row set produced
+ * by one of those operations, wrap everything so far as a derived table.
+ * `take` after `take` is kept flat so the take builtin can fold the two
+ * limits together (LIMIT n then LIMIT m is LIMIT (min n m)).
+ */
+function prepareQueryForStep(q: Query, stepName: string): Query {
+    const needsBoundary = q.distinct
+        || hasWindowProjection(q)
+        || (hasTakeStep(q) && stepName !== 'take');
+    return needsBoundary ? wrapAsDerived(q) : q;
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +457,8 @@ export function apply(f: Value, arg: Value, at: AstNode | undefined, ctx: Ctx): 
                 ctx.diagnostics.push({ node: at ?? astOf(arg) ?? f.ast ?? fallbackNode(ctx), message: `step '${f.name}' expects a query, got ${describe(arg)} — use it in a pipeline: query & ${f.name} ...` });
                 return ERROR;
             }
-            const next = f.apply(arg.query, at, ctx);
+            const query = prepareQueryForStep(arg.query, f.name);
+            const next = f.apply(query, at, ctx);
             return next ? { kind: 'query', query: next, ast: at } : ERROR;
         }
         case 'lambda': {
@@ -449,7 +486,7 @@ function astOf(v: Value): AstNode | undefined {
 
 /** Derive a record's schema from its evaluated fields (types only where known). */
 function recordSchemaOf(fields: { key: string; value: Value }[]): Schema {
-    const schema: Schema = new Map();
+    const schema = new Map<string, SqlColumn>();
     for (const { key, value } of fields) {
         if (value.kind === 'expr') {
             schema.set(key, { type: value.node.type as SqlType, table: nodeTable(value.node), expr: value.node });
@@ -560,14 +597,20 @@ function isApplicable(v: Value): v is Extract<Value, { kind: 'fn' }> | Extract<V
     return v.kind === 'fn' || v.kind === 'lambda';
 }
 
+/** Is the value composable with `<<<`/`>>>`? Steps are query functions too. */
+function isComposable(v: Value): v is Extract<Value, { kind: 'fn' }> | Extract<Value, { kind: 'lambda' }> | Extract<Value, { kind: 'step' }> {
+    return v.kind === 'fn' || v.kind === 'lambda' || v.kind === 'step';
+}
+
 /**
  * `l1 <<< l2` / `l1 >>> l2` — PureScript function composition:
  * `f <<< g` = `x => f (g x)`, `f >>> g` = `x => g (f x)`.
  */
 function composeValues(l: Value, r: Value, op: '>>>' | '<<<', at: AstNode, ctx: Ctx): Value {
-    if (isApplicable(l) && isApplicable(r)) {
-        const lName = l.kind === 'fn' ? l.name : 'λ';
-        const rName = r.kind === 'fn' ? r.name : 'λ';
+    if (isComposable(l) && isComposable(r)) {
+        const nameOf = (v: Value): string => v.kind === 'fn' || v.kind === 'step' ? v.name : 'λ';
+        const lName = nameOf(l);
+        const rName = nameOf(r);
         return fn(`(${lName} ${op} ${rName})`, (x, at2, ctx2) => {
             const first = op === '<<<' ? r : l;
             const second = op === '<<<' ? l : r;
@@ -749,6 +792,35 @@ function dollarLambda(body: Expr, arity: number, ctx: Ctx): Value {
 }
 
 export function evalExpr(e: Expr, ctx: Ctx): Value {
+    if (isLetExpression(e) || isLambdaLetExpression(e)) {
+        // `let x = value in body` — a pure lexical binding. Evaluation
+        // extends the environment immutably; the value is not mutable state.
+        let v = evalExpr(e.value as Expr, ctx);
+        if (isError(v)) return ERROR;
+        // A query-type annotation on a local bare table defines the schema,
+        // exactly like a top-level binding annotation.
+        if (e.type && v.kind === 'query' && !v.query.known
+            && v.query.steps.every(step => step.kind !== 'join')) {
+            const qt = queryTypeOf(e.type);
+            if (qt) {
+                const schema = schemaFromQueryType(qt, e, ctx);
+                if (schema) {
+                    const alias = v.query.aliases[0] ?? v.query.root.name;
+                    const stamped: Schema = new Map(
+                        [...schema].map(([key, col]) => [key, { ...col, table: alias }]),
+                    );
+                    v = {
+                        kind: 'query',
+                        query: { ...v.query, known: true, root: { ...v.query.root, schema: stamped } },
+                        ast: v.ast,
+                    };
+                }
+            }
+        }
+        const env = new Map(ctx.env);
+        env.set(e.name ?? '', v);
+        return evalExpr(e.body as Expr, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
+    }
     if (isAscription(e)) return evalExpr(e.operand!, ctx); // type annotations are erased
     if (isUnaryMinus(e)) return evalUnary(e, ctx);
     if (isBinaryExpression(e) || isLambdaBinaryExpression(e)) {
@@ -994,7 +1066,7 @@ const AGG_TYPES: Record<string, SqlType> = {
     count: 'int', sum: 'int', avg: 'float', min: 'int', max: 'int', list: 'array',
 };
 
-export const BUILTINS: Record<string, () => Value> = {
+export const BUILTINS: Record<BuiltinName, () => Value> = {
     // --- join kinds (bare identifiers, usable as `join`'s first argument) ---
     inner: () => ({ kind: 'jkind', name: 'inner' }),
     left: () => ({ kind: 'jkind', name: 'left' }),
@@ -1050,7 +1122,10 @@ export const BUILTINS: Record<string, () => Value> = {
             // columns are aggregate expressions).
             const items = orderItems(v, at2 ?? sel.ast, ctx2, hasFoldStep(q) || schemaHasAggregates(q));
             if (!items) return null;
-            return addStep(q, { kind: 'sort', items });
+            // A query has one observable ORDER BY: applying sort again replaces
+            // the previous sort (earlier sorts are unordered relational steps).
+            const withoutSorts = { ...q, steps: q.steps.filter(s => s.kind !== 'sort') };
+            return addStep(withoutSorts, { kind: 'sort', items });
         });
     }),
 
@@ -1060,7 +1135,16 @@ export const BUILTINS: Record<string, () => Value> = {
             ctx.diagnostics.push({ node: at ?? arg.ast, message: `take expects a non-negative integer literal, got ${n === null ? describe(arg) : String(n)}` });
             return ERROR;
         }
-        return step('take', (q) => addStep(q, { kind: 'take', n }));
+        return step('take', (q) => {
+            // LIMIT n followed by LIMIT m is LIMIT (min n m) in one flat scope.
+            if (hasTakeStep(q)) {
+                return {
+                    ...q,
+                    steps: q.steps.map(s => s.kind === 'take' ? { ...s, n: Math.min(s.n, n) } : s),
+                };
+            }
+            return addStep(q, { kind: 'take', n });
+        });
     }),
 
     distinct: () => fn('distinct', (arg, at, ctx) => {
@@ -1068,7 +1152,13 @@ export const BUILTINS: Record<string, () => Value> = {
             ctx.diagnostics.push({ node: at ?? arg.ast, message: `distinct expects a query, got ${describe(arg)} — use it in a pipeline: query & distinct` });
             return ERROR;
         }
-        return { kind: 'query', query: { ...arg.query, distinct: true }, ast: at };
+        // DISTINCT after LIMIT or after a window projection needs the prior
+        // query as a derived table: SQL's SELECT DISTINCT ... LIMIT n would
+        // apply DISTINCT before the limit, not after.
+        let q = arg.query;
+        if (q.distinct) return { kind: 'query', query: q, ast: at };
+        if (hasTakeStep(q) || hasWindowProjection(q)) q = wrapAsDerived(q);
+        return { kind: 'query', query: { ...q, distinct: true }, ast: at };
     }),
 
     // --- records -------------------------------------------------------
@@ -1098,15 +1188,20 @@ export const BUILTINS: Record<string, () => Value> = {
             return ERROR;
         }
         return step('fold', (q, at2, ctx2) => {
-            // A second fold aggregates the aggregated result: the first fold
+            // A sort before a fold has no observable effect (aggregation is
+            // over an unordered relation), so drop it before wrapping. A
+            // second fold aggregates the aggregated result: the first fold
             // becomes a derived table (nested aggregation), teta-style.
+            if (!hasTakeStep(q) && !hasWindowProjection(q)) {
+                q = { ...q, steps: q.steps.filter(s => s.kind !== 'sort') };
+            }
             if (hasFoldStep(q)) q = wrapAsDerived(q);
             const v = apply(sel, rowRecord(q, at2), at2, ctx2);
             if (v.kind !== 'record') {
                 ctx2.diagnostics.push({ node: at2 ?? sel.ast, message: `fold expects a projection record, got ${describe(v)}` });
                 return null;
             }
-            const row: RowNode = { fields: [] };
+            const row: { fields: { key: string; node: SqlNode }[] } = { fields: [] };
             let aggregates = 0;
             for (const { key, value } of v.fields) {
                 const node = exprNode(value);
@@ -1134,7 +1229,7 @@ export const BUILTINS: Record<string, () => Value> = {
         // right or full — a bare-identifier constant), the right-hand query,
         // the two-parameter `on` condition lambda, and the two-parameter
         // `merger` lambda that projects the result row:
-        //   join inner orders (l, r) => l.id == r.user_id (l, r) => { id = l.id }
+        //   join inner orders (l => r => l.id == r.user_id) (l => r => { id = l.id })
         // The right side is a first-class query VALUE (any query — pipelines
         // render as subqueries), so joins compose like every other step. The
         // merger replaces the old disjoint-union of both rows: the result row
@@ -1146,7 +1241,7 @@ export const BUILTINS: Record<string, () => Value> = {
         }
         return fn('join', (right, at2, ctx2) => {
             if (right.kind !== 'query') {
-                ctx2.diagnostics.push({ node: at2 ?? right.ast, message: `join expects a query as its second argument, got ${describe(right)} — bind a table or pipeline first, e.g. join inner orders (l, r) => ...` });
+                ctx2.diagnostics.push({ node: at2 ?? right.ast, message: `join expects a query as its second argument, got ${describe(right)} — bind a table or pipeline first, e.g. join inner orders (l => r => ...)` });
                 return ERROR;
             }
             return fn('join', (on, at3, ctx3) => {
@@ -2051,9 +2146,13 @@ function listPad(name: 'lpad' | 'rpad', args: Value[], at: AstNode | undefined, 
     if (value === null) return ERROR;
     const length = exprArgs([args[1]!], name, 'numeric', at, ctx);
     if (length === null) return ERROR;
-    const padding = args[2] !== undefined ? exprArgs([args[2]!], name, 'string', at, ctx) : null;
-    if (padding === null) return ERROR;
-    return mkExpr({ kind: 'call', name, args: padding ? [value[0]!, length[0]!, padding[0]!] : [value[0]!, length[0]!], type: 'string' }, at);
+    const hasPadding = args[2] !== undefined;
+    const padding = hasPadding ? exprArgs([args[2]!], name, 'string', at, ctx) : null;
+    if (hasPadding && padding === null) return ERROR;
+    const callArgs = padding
+        ? [value[0]!, length[0]!, padding[0]!]
+        : [value[0]!, length[0]!];
+    return mkExpr({ kind: 'call', name, args: callArgs, type: 'string' }, at);
 }
 
 /** lag/lead — value, optional offset (int), optional default (any type). */
@@ -2156,7 +2255,7 @@ function windowSpec(v: Value, at: AstNode | undefined, ctx: Ctx): { partition: S
  * `ROW_NUMBER()` would render invalid SQL. `over (sum u.x) {...}` is fine
  * because `sum` is an aggregate, not a window-only function.
  */
-function validateWindowUses(fields: { key: string; node: SqlNode }[], at: AstNode | undefined, ctx: Ctx): boolean {
+function validateWindowUses(fields: readonly { key: string; node: SqlNode }[], at: AstNode | undefined, ctx: Ctx): boolean {
     let bad = false;
     const visit = (n: SqlNode, parent: SqlNode | null, slot: string | null): void => {
         if (n.kind === 'call' && WINDOW_ONLY.has(n.name) && !(parent?.kind === 'window' && slot === 'fn')) {
@@ -2234,7 +2333,7 @@ function schemaFromQueryType(t: QueryType, at: AstNode | undefined, ctx: Ctx): S
         ctx.diagnostics.push({ node: t, message: `table schema must be a closed record — every column must be listed` });
         return null;
     }
-    const schema: Schema = new Map();
+    const schema = new Map<string, SqlColumn>();
     for (const field of t.fields) {
         const type = scalarTypeOf(field.type);
         if (type === null) {
@@ -2272,7 +2371,7 @@ function rowFromRecord(v: Value, at: AstNode | undefined, ctx: Ctx, what: string
         ctx.diagnostics.push({ node: at ?? v.ast, message: `${what} must be a record like { key = expr, ... }, got ${describe(v)}` });
         return null;
     }
-    const row: RowNode = { fields: [] };
+    const row: { fields: { key: string; node: SqlNode }[] } = { fields: [] };
     for (const { key, value } of v.fields) {
         const node = exprNode(value);
         if (!node) {
@@ -2473,10 +2572,18 @@ function checkBinding(binding: Binding, ctx: Ctx, seen: Set<string>): Value {
             const schema = schemaFromQueryType(qt, binding, ctx);
             if (schema) {
                 // Stamp with the root's plain alias (last segment), matching
-                // rowRecord, so column references stay `alias.column`.
-                for (const col of schema.values()) col.table = v.query.aliases[0] ?? v.query.root.name;
-                v.query.root.schema = schema;
-                v.query.known = true;
+                // rowRecord, so column references stay `alias.column`. Build a
+                // new map and a new query value: annotations never mutate an
+                // existing query in place.
+                const alias = v.query.aliases[0] ?? v.query.root.name;
+                const stamped: Schema = new Map(
+                    [...schema].map(([key, col]) => [key, { ...col, table: alias }]),
+                );
+                v = {
+                    kind: 'query',
+                    query: { ...v.query, known: true, root: { ...v.query.root, schema: stamped } },
+                    ast: v.ast,
+                };
             }
         }
     }

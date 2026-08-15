@@ -65,7 +65,7 @@ describe('string functions', () => {
     test('concat renders CONCAT except sqlite ||', () => {
         const src = `${USERS}\nq = users & map (u => { full = concat [u.name, "-", u.name] })`;
         expect(render(src, 'trino')).toContain(`CONCAT(name, '-', name) AS "full"`);
-        expect(render(src, 'sqlite')).toContain(`name || '-' || name AS "full"`);
+        expect(render(src, 'sqlite')).toContain(`COALESCE(name, '') || COALESCE('-', '') || COALESCE(name, '') AS "full"`);
     });
 
     test('substring with optional length; sqlite uses SUBSTR', () => {
@@ -121,7 +121,7 @@ describe('regex functions', () => {
     test('regex_like lowers per dialect', () => {
         const src = `${USERS}\nq = users & filter (u => regex_like u.name "^[A-Z]")`;
         expect(render(src, 'trino')).toContain(`REGEXP_LIKE(name, '^[A-Z]')`);
-        expect(render(src, 'postgresql')).toContain(`REGEXP_MATCH(name, '^[A-Z]') IS NOT NULL`);
+        expect(render(src, 'postgresql')).toContain(`name ~ '^[A-Z]'`);
         expect(render(src, 'mysql')).toContain(`REGEXP_LIKE(name, '^[A-Z]')`);
         expect(render(src, 'hive')).toContain(`name RLIKE '^[A-Z]'`);
         expect(() => render(src, 'sqlite')).toThrow('regex_like is not supported for the sqlite dialect');

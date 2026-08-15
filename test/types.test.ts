@@ -124,7 +124,7 @@ describe('row polymorphism', () => {
 
     test('map, fold, join, composition and $n all type-check', () => {
         expect(typeErrors(`${USERS}
-            orders: query { user_id: int, total: float } = table "orders"
+            orders: query { user_id: int, total: float, status: string } = table "orders"
             paid = orders & filter (o => o.status == "paid")
             q = users
                 & filter ($1.active && $1.age >= 18)
@@ -138,8 +138,12 @@ describe('row polymorphism', () => {
         `)).toEqual([]);
         expect(typeErrors(`${USERS}
             adult = u => u.age >= 18
-            q = users & filter (adult <<< (x => x + 1))
+            q = users & filter ((u => u.active) <<< (u => u))
         `)).toEqual([]);
+        expect(typeErrors(`${USERS}
+            adult = u => u.age >= 18
+            q = users & filter (adult <<< (x => x + 1))
+        `).join('\n')).toContain('cannot compose');
     });
 
     test('row polymorphism survives map projections (the row narrows)', () => {
@@ -204,7 +208,10 @@ describe('annotations and ascription', () => {
     });
 
     test('binding annotation narrowing to a closed row', () => {
-        expect(typeErrors(`${USERS}\nadult: { age: int } -> bool = u => u.age >= 18\nq = users & filter (adult)`)).toEqual([]);
+        // The annotation becomes the binding type, so applying the closed-row
+        // predicate to a wider users row is a static row mismatch.
+        const messages = typeErrors(`${USERS}\nadult: { age: int } -> bool = u => u.age >= 18\nq = users & filter (adult)`);
+        expect(messages.join('\n')).toContain('cannot apply a function of type query { age: int } -> query { age: int }');
     });
 
     test('binding annotation missing the used field is an error', () => {
@@ -550,5 +557,40 @@ describe('DSL modes are static types', () => {
     test('aggregates type as agg mode; windowed aggregates keep their value type', () => {
         expect(typeErrors(`${USERS}\nq = users & map (u => { ws = over (sum u.age) { partition = [u.id] } })`)).toEqual([]);
         expect(typeErrors(`${USERS}\nq = users & map (u => { x = sum u.age })`)).not.toContain('cannot compare');
+    });
+});
+
+describe('review fixes: composition types, merge partials, shadowing, case nullability', () => {
+    function typeOf(text: string, binding: string): string | undefined {
+        const model = parseModel(text);
+        const result = inferProject([{ model, uri: undefined, imports: [] }]);
+        const b = model.bindings.find(x => x.name === binding);
+        return b ? result.typeOf(b) : undefined;
+    }
+
+    test('composition infers a function type, not its result type', () => {
+        expect(typeOf('f = upper <<< lower', 'f')).toBe('string? -> string?');
+    });
+
+    test('partial application of merge keeps the row union', () => {
+        const text = `users: query { id: int, name: string } = table "users"
+extend = merge { active = true }
+q = users & map (u => extend u)`;
+        expect(typeErrors(text)).toEqual([]);
+        expect(typeOf(text, 'q')).toBe('query { active: bool, id: int, name: string }');
+    });
+
+    test('case is nullable only when it has no fallback branch', () => {
+        expect(typeOf('q = case { true => 1, _ => 2 }', 'q')).toBe('int');
+        expect(typeOf('q = case { true => 1 }', 'q')).toBe('int?');
+    });
+
+    test('special builtin typing is disabled when the prelude name is shadowed', () => {
+        expect(typeErrors('map = u => u + 1\nq = map 1')).toEqual([]);
+    });
+
+    test('closed-row binding annotations now narrow downstream applications', () => {
+        const messages = typeErrors(`${USERS}\nadult: { age: int } -> bool = u => u.age >= 18\nq = users & filter (adult)`);
+        expect(messages.join('\n')).toContain('cannot apply a function of type query { age: int } -> query { age: int }');
     });
 });

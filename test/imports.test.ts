@@ -27,7 +27,9 @@ function renderFiles(files: Record<string, string>, main: string, dialect = 'sql
         throw new Error(`invalid: ${result.diagnostics.map(d => d.message).join(' | ')}`);
     }
     if (result.value.kind !== 'query') throw new Error('not a query');
-    return renderQuery(result.value.query, DIALECTS[dialect]!);
+    const rendered = renderQuery(result.value.query, DIALECTS[dialect]!);
+    if (!rendered.ok) throw new Error(`render failed: ${rendered.diagnostics.map(d => d.message).join(' | ')}`);
+    return rendered.sql;
 }
 
 describe('multi-file modules', () => {

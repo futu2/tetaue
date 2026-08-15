@@ -31,6 +31,13 @@ export type Type =
     /** A join kind constant (`inner`, `left`, `right`, `full`). */
     | { kind: 'jkind' }
     /**
+     * A prelude builtin reference. Transparent in unification and pretty
+     * printing, but the tag survives generalization/instantiation so a
+     * builtin bound to a user name (`by = sort`) keeps its special static
+     * checks — referential transparency at the type level.
+     */
+    | { kind: 'builtin'; name: string; of: Type }
+    /**
      * An aggregate-mode expression (`sum o.total`, `count o.id`, ...) — "the
      * value of type `t`, aggregated". Transparent in unification (like `?`),
      * so comparisons/arithmetic on aggregate results work; the mode is
@@ -39,7 +46,9 @@ export type Type =
      */
     | { kind: 'agg'; of: Type }
     /** A group-mode expression (`group o.user_id`). Transparent in unification. */
-    | { kind: 'group'; of: Type };
+    | { kind: 'group'; of: Type }
+    /** A window-only expression (`row_number`, `lag`, ...) that must be wrapped by `over`. */
+    | { kind: 'window'; of: Type };
 
 export type VarKind = 'type' | 'row';
 
@@ -95,6 +104,11 @@ export function queryOf(row: Type): Type {
     return { kind: 'query', row };
 }
 
+/** Tag a prelude scheme so builtin identity survives first-class bindings. */
+export function builtinOf(name: string, of: Type): Type {
+    return { kind: 'builtin', name, of };
+}
+
 export function jkindType(): Type {
     return { kind: 'jkind' };
 }
@@ -107,6 +121,11 @@ export function aggOf(t: Type): Type {
 /** Wrap `t` in the group mode: `group t` (a GROUP BY key). */
 export function groupOf(t: Type): Type {
     return t.kind === 'group' ? t : { kind: 'group', of: t };
+}
+
+/** Wrap `t` in the window mode: `window t` (a window-only function result). */
+export function windowOf(t: Type): Type {
+    return t.kind === 'window' ? t : { kind: 'window', of: t };
 }
 
 export function rowOf(fields: [string, Type][], tail: Type | null = null): Type {
@@ -148,6 +167,13 @@ export class TypeUniverse {
         return cur;
     }
 
+    /** Resolve variables and strip transparent builtin tags for structural checks. */
+    peel(t: Type): Type {
+        let r = this.resolve(t);
+        while (r.kind === 'builtin') r = this.resolve(r.of);
+        return r;
+    }
+
     /** Resolve, then normalize `?`: strip wrappers around vars that resolve to nullable. */
     normalize(t: Type): Type {
         const r = this.resolve(t);
@@ -177,7 +203,8 @@ export class TypeUniverse {
                     if (r.tail) visit(r.tail);
                     break;
                 case 'query': visit(r.row); break;
-                case 'agg': case 'group': visit(r.of); break;
+                case 'builtin':
+                case 'agg': case 'group': case 'window': visit(r.of); break;
                 case 'prim': case 'order': case 'jkind': break;
             }
         };
@@ -225,12 +252,47 @@ export class TypeUniverse {
         this.bindings.set(varId, t);
     }
 
-    /** Unify two types (with `?` absorption). Returns the unified type. Throws UnifyError. */
+    /**
+     * Unify two types transactionally: a failed unification leaves no
+     * bindings behind. Internal recursion uses `unifyInternal`.
+     */
     unify(a: Type, b: Type): Type {
+        const snapshot = this.snapshot();
+        try {
+            return this.unifyInternal(a, b);
+        } catch (err) {
+            this.restore(snapshot);
+            throw err;
+        }
+    }
+
+    private snapshot(): { bindings: Map<number, Type>; infos: Map<number, VarInfo>; nextId: number; nextName: number } {
+        return {
+            bindings: new Map(this.bindings),
+            infos: new Map([...this.infos].map(([id, info]) => [id, { ...info }])),
+            nextId: this.nextId,
+            nextName: this.nextName,
+        };
+    }
+
+    private restore(snapshot: { bindings: Map<number, Type>; infos: Map<number, VarInfo>; nextId: number; nextName: number }): void {
+        this.bindings = snapshot.bindings;
+        this.infos = snapshot.infos;
+        this.nextId = snapshot.nextId;
+        this.nextName = snapshot.nextName;
+    }
+
+    /** Unify two types (with `?` absorption). Returns the unified type. Throws UnifyError. */
+    private unifyInternal(a: Type, b: Type): Type {
         a = this.resolve(a);
         b = this.resolve(b);
         if (a === b) return a;
         if (a.kind === 'var' && b.kind === 'var' && a.id === b.id) return a;
+
+        // Builtin tags are transparent; keep the underlying function/value
+        // type for structural unification.
+        if (a.kind === 'builtin') return this.unifyInternal(a.of, b);
+        if (b.kind === 'builtin') return this.unifyInternal(a, b.of);
 
         if (a.kind === 'var') {
             // `α` vs `α?` is fine: `?` is transparent (occurs check strips it).
@@ -254,7 +316,7 @@ export class TypeUniverse {
         const aNull = a.kind === 'nullable' ? a.of : null;
         const bNull = b.kind === 'nullable' ? b.of : null;
         if (aNull !== null || bNull !== null) {
-            const inner = this.unify(aNull ?? a, bNull ?? b);
+            const inner = this.unifyInternal(aNull ?? a, bNull ?? b);
             return nullable(inner);
         }
 
@@ -269,7 +331,7 @@ export class TypeUniverse {
             if ((aAgg !== null && bGroup !== null) || (aGroup !== null && bAgg !== null)) {
                 throw new UnifyError(a, b);
             }
-            const inner = this.unify(aAgg ?? aGroup ?? a, bAgg ?? bGroup ?? b);
+            const inner = this.unifyInternal(aAgg ?? aGroup ?? a, bAgg ?? bGroup ?? b);
             return aAgg !== null || bAgg !== null ? aggOf(inner) : groupOf(inner);
         }
 
@@ -279,14 +341,14 @@ export class TypeUniverse {
                 break;
             case 'fun':
                 if (b.kind === 'fun') {
-                    this.unify(a.from, b.from);
-                    this.unify(a.to, b.to);
+                    this.unifyInternal(a.from, b.from);
+                    this.unifyInternal(a.to, b.to);
                     return a;
                 }
                 break;
             case 'list':
                 if (b.kind === 'list') {
-                    this.unify(a.of, b.of);
+                    this.unifyInternal(a.of, b.of);
                     return a;
                 }
                 break;
@@ -307,6 +369,12 @@ export class TypeUniverse {
                 break;
             case 'jkind':
                 if (b.kind === 'jkind') return a;
+                break;
+            case 'window':
+                if (b.kind === 'window') {
+                    this.unifyInternal(a.of, b.of);
+                    return a;
+                }
                 break;
         }
         throw new UnifyError(a, b);
@@ -384,7 +452,7 @@ export class TypeUniverse {
             const f1 = r1.fields.get(label);
             const f2 = r2.fields.get(label);
             if (f1 && f2) {
-                this.unify(f1, f2);
+                this.unifyInternal(f1, f2);
             } else if (f1) {
                 this.absorbExtra(label, f1, r2);
             } else {
@@ -399,7 +467,7 @@ export class TypeUniverse {
         const t2 = rr2.tail ? this.resolve(rr2.tail) : null;
         const empty = { kind: 'row', fields: new Map<string, Type>(), tail: null } as Type;
         if (t1 && t2) {
-            if (t1.kind === 'var' && t2.kind === 'var') this.unify(t1, t2);
+            if (t1.kind === 'var' && t2.kind === 'var') this.unifyInternal(t1, t2);
             else if (t1.kind === 'row' && t2.kind === 'row') this.unifyRow(t1, t2);
             else throw new UnifyError(a, b);
         } else if (t1) {
@@ -507,8 +575,10 @@ export class TypeUniverse {
                 return { kind: 'row', fields, tail };
             }
             case 'query': return queryOf(this.substitute(subst, r.row));
+            case 'builtin': return builtinOf(r.name, this.substitute(subst, r.of));
             case 'agg': return aggOf(this.substitute(subst, r.of));
             case 'group': return groupOf(this.substitute(subst, r.of));
+            case 'window': return windowOf(this.substitute(subst, r.of));
             case 'prim': case 'order': case 'jkind': return r;
         }
     }
@@ -550,8 +620,10 @@ export class TypeUniverse {
                     return `{ ${body}${tailText} }`;
                 }
                 case 'query': return `query ${p(r.row, false)}`;
+                case 'builtin': return p(r.of, paren);
                 case 'agg': return `agg ${p(r.of, false)}`;
                 case 'group': return `group ${p(r.of, false)}`;
+                case 'window': return `window ${p(r.of, false)}`;
                 case 'fun': {
                     const s = `${p(r.from, true)} -> ${p(r.to, false)}`;
                     return paren ? `(${s})` : s;

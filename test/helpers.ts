@@ -65,5 +65,9 @@ export function render(text: string, dialect: string = 'sqlite', format: RenderF
     if (value.kind !== 'query') {
         throw new Error(`module did not produce a query (got ${value.kind})`);
     }
-    return renderQuery(value.query, DIALECTS[dialect]!, format);
+    const result = renderQuery(value.query, DIALECTS[dialect]!, format);
+    if (!result.ok) {
+        throw new Error(`render failed: ${result.diagnostics.map(d => d.message).join(' | ')}`);
+    }
+    return result.sql;
 }

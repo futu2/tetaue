@@ -53,6 +53,8 @@ export type TetaueKeywordNames =
     | "export"
     | "false"
     | "import"
+    | "in"
+    | "let"
     | "null"
     | "query"
     | "true"
@@ -98,7 +100,7 @@ export function isApplication(item: unknown): item is Application {
 }
 
 export interface Ascription extends langium.AstNode {
-    readonly $container: AccessExpression | Application | BinaryExpression | Binding | CaseBranch | CaseExpression | Lambda | LambdaBinaryExpression | ListLiteral | MapEntry | UnaryMinus;
+    readonly $container: AccessExpression | Application | BinaryExpression | Binding | CaseBranch | CaseExpression | Lambda | LambdaBinaryExpression | LambdaLetExpression | LetExpression | ListLiteral | MapEntry | UnaryMinus;
     readonly $type: 'Ascription';
     operand?: BinaryExpression;
     type?: Type;
@@ -115,7 +117,7 @@ export function isAscription(item: unknown): item is Ascription {
 }
 
 export interface BinaryExpression extends langium.AstNode {
-    readonly $container: AccessExpression | Application | Ascription | BinaryExpression | Binding | CaseBranch | CaseExpression | LambdaBinaryExpression | ListLiteral | MapEntry | UnaryMinus;
+    readonly $container: AccessExpression | Application | Ascription | BinaryExpression | Binding | CaseBranch | CaseExpression | LambdaBinaryExpression | LetExpression | ListLiteral | MapEntry | UnaryMinus;
     readonly $type: 'BinaryExpression';
     left: UnaryExpression;
     operator: '!=' | '$' | '%' | '&&' | '&' | '*' | '+' | '-' | '/' | '<' | '<<<' | '<=' | '<>' | '==' | '>' | '>=' | '>>>' | '||';
@@ -230,7 +232,7 @@ export function isExpr(item: unknown): item is Expr {
     return reflection.isInstance(item, Expr.$type);
 }
 
-export type Expression = Ascription | BinaryExpression;
+export type Expression = Ascription | BinaryExpression | LetExpression;
 
 export const Expression = {
     $type: 'Expression'
@@ -241,7 +243,7 @@ export function isExpression(item: unknown): item is Expression {
 }
 
 export interface FunType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | ListType | NullType | RecordField | TypeParen;
+    readonly $container: Ascription | Binding | FunType | LambdaLetExpression | LambdaParam | LetExpression | ListType | NullType | RecordField | TypeParen;
     readonly $type: 'FunType';
     left: NullType;
     right: Type;
@@ -309,7 +311,7 @@ export function isLambda(item: unknown): item is Lambda {
 }
 
 export interface LambdaBinaryExpression extends langium.AstNode {
-    readonly $container: Lambda;
+    readonly $container: Lambda | LambdaLetExpression;
     readonly $type: 'LambdaBinaryExpression';
     left: UnaryExpression;
     operator: '!=' | '%' | '&&' | '*' | '+' | '-' | '/' | '<' | '<<<' | '<=' | '<>' | '==' | '>' | '>=' | '>>>' | '||';
@@ -327,7 +329,7 @@ export function isLambdaBinaryExpression(item: unknown): item is LambdaBinaryExp
     return reflection.isInstance(item, LambdaBinaryExpression.$type);
 }
 
-export type LambdaBody = Ascription | LambdaBinaryExpression;
+export type LambdaBody = Ascription | LambdaBinaryExpression | LambdaLetExpression;
 
 export const LambdaBody = {
     $type: 'LambdaBody'
@@ -335,6 +337,27 @@ export const LambdaBody = {
 
 export function isLambdaBody(item: unknown): item is LambdaBody {
     return reflection.isInstance(item, LambdaBody.$type);
+}
+
+export interface LambdaLetExpression extends langium.AstNode {
+    readonly $container: Lambda | LambdaLetExpression;
+    readonly $type: 'LambdaLetExpression';
+    body?: LambdaBody;
+    name?: string;
+    type?: Type;
+    value?: LambdaBody;
+}
+
+export const LambdaLetExpression = {
+    $type: 'LambdaLetExpression',
+    body: 'body',
+    name: 'name',
+    type: 'type',
+    value: 'value'
+} as const;
+
+export function isLambdaLetExpression(item: unknown): item is LambdaLetExpression {
+    return reflection.isInstance(item, LambdaLetExpression.$type);
 }
 
 export interface LambdaParam extends langium.AstNode {
@@ -354,6 +377,27 @@ export function isLambdaParam(item: unknown): item is LambdaParam {
     return reflection.isInstance(item, LambdaParam.$type);
 }
 
+export interface LetExpression extends langium.AstNode {
+    readonly $container: AccessExpression | Application | BinaryExpression | Binding | CaseBranch | CaseExpression | LambdaBinaryExpression | LetExpression | ListLiteral | MapEntry | UnaryMinus;
+    readonly $type: 'LetExpression';
+    body?: Expression;
+    name?: string;
+    type?: Type;
+    value?: Expression;
+}
+
+export const LetExpression = {
+    $type: 'LetExpression',
+    body: 'body',
+    name: 'name',
+    type: 'type',
+    value: 'value'
+} as const;
+
+export function isLetExpression(item: unknown): item is LetExpression {
+    return reflection.isInstance(item, LetExpression.$type);
+}
+
 export interface ListLiteral extends langium.AstNode {
     readonly $container: AccessExpression | Application | BinaryExpression | LambdaBinaryExpression | UnaryMinus;
     readonly $type: 'ListLiteral';
@@ -370,7 +414,7 @@ export function isListLiteral(item: unknown): item is ListLiteral {
 }
 
 export interface ListType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | ListType | NullType | RecordField | TypeParen;
+    readonly $container: Ascription | Binding | FunType | LambdaLetExpression | LambdaParam | LetExpression | ListType | NullType | RecordField | TypeParen;
     readonly $type: 'ListType';
     type: Type;
 }
@@ -446,7 +490,7 @@ export function isNullLiteral(item: unknown): item is NullLiteral {
 }
 
 export interface NullType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | ListType | NullType | RecordField | TypeParen;
+    readonly $container: Ascription | Binding | FunType | LambdaLetExpression | LambdaParam | LetExpression | ListType | NullType | RecordField | TypeParen;
     readonly $type: 'NullType';
     base: Type;
     nullable: boolean;
@@ -478,7 +522,7 @@ export function isNumberLiteral(item: unknown): item is NumberLiteral {
 }
 
 export interface QueryType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | ListType | NullType | RecordField | TypeParen;
+    readonly $container: Ascription | Binding | FunType | LambdaLetExpression | LambdaParam | LetExpression | ListType | NullType | RecordField | TypeParen;
     readonly $type: 'QueryType';
     fields: Array<RecordField>;
     tail?: string;
@@ -512,7 +556,7 @@ export function isRecordField(item: unknown): item is RecordField {
 }
 
 export interface RecordType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | ListType | NullType | RecordField | TypeParen;
+    readonly $container: Ascription | Binding | FunType | LambdaLetExpression | LambdaParam | LetExpression | ListType | NullType | RecordField | TypeParen;
     readonly $type: 'RecordType';
     fields: Array<RecordField>;
     tail?: string;
@@ -554,7 +598,7 @@ export function isType(item: unknown): item is Type {
 }
 
 export interface TypeParen extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | ListType | NullType | RecordField | TypeParen;
+    readonly $container: Ascription | Binding | FunType | LambdaLetExpression | LambdaParam | LetExpression | ListType | NullType | RecordField | TypeParen;
     readonly $type: 'TypeParen';
     type: Type;
 }
@@ -569,7 +613,7 @@ export function isTypeParen(item: unknown): item is TypeParen {
 }
 
 export interface TypeVar extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | ListType | NullType | RecordField | TypeParen;
+    readonly $container: Ascription | Binding | FunType | LambdaLetExpression | LambdaParam | LetExpression | ListType | NullType | RecordField | TypeParen;
     readonly $type: 'TypeVar';
     name: string;
 }
@@ -626,7 +670,9 @@ export type TetaueAstType = {
     Lambda: Lambda
     LambdaBinaryExpression: LambdaBinaryExpression
     LambdaBody: LambdaBody
+    LambdaLetExpression: LambdaLetExpression
     LambdaParam: LambdaParam
+    LetExpression: LetExpression
     ListLiteral: ListLiteral
     ListType: ListType
     MapEntry: MapEntry
@@ -860,6 +906,28 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
             },
             superTypes: []
         },
+        LambdaLetExpression: {
+            name: LambdaLetExpression.$type,
+            properties: {
+                body: {
+                    name: LambdaLetExpression.body,
+                    optional: true
+                },
+                name: {
+                    name: LambdaLetExpression.name,
+                    optional: true
+                },
+                type: {
+                    name: LambdaLetExpression.type,
+                    optional: true
+                },
+                value: {
+                    name: LambdaLetExpression.value,
+                    optional: true
+                }
+            },
+            superTypes: [LambdaBody.$type]
+        },
         LambdaParam: {
             name: LambdaParam.$type,
             properties: {
@@ -872,6 +940,28 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                 }
             },
             superTypes: []
+        },
+        LetExpression: {
+            name: LetExpression.$type,
+            properties: {
+                body: {
+                    name: LetExpression.body,
+                    optional: true
+                },
+                name: {
+                    name: LetExpression.name,
+                    optional: true
+                },
+                type: {
+                    name: LetExpression.type,
+                    optional: true
+                },
+                value: {
+                    name: LetExpression.value,
+                    optional: true
+                }
+            },
+            superTypes: [Expression.$type]
         },
         ListLiteral: {
             name: ListLiteral.$type,

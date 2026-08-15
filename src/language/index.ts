@@ -13,4 +13,4 @@ export type {
 export { collectModuleTree, moduleOf } from './imports.js';
 export type { ProjectModule, ModuleTree, ModuleTreeOptions } from './imports.js';
 export { renderQuery, DIALECTS, isDialect } from './render.js';
-export type { DialectSpec, RenderFormat } from './render.js';
+export type { DialectSpec, RenderFormat, RenderResult, RenderDiagnostic } from './render.js';

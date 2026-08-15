@@ -152,6 +152,7 @@ numeric strictness §7.
 | `u => e` | `τu -> τe` | `u` is a fresh kind-flexible var; body checked with `u: τu` |
 | `u => v => e` | `τu -> τv -> τe` | curried (no `(u, v) =>` form) |
 | `e: T` (ascription) | `τ` where `unify(τ, instantiate(T))` | annotation on any expression; constrains/asserts, §10 |
+| `let x = e in body` | `τbody` | pure local binding; `x` is let-polymorphic inside `body`; value is inlined at render time |
 | `x: T = e` (binding annotation) | annotation check, §10 | |
 
 **Field access extends rows.** If `e: ρ` (a fresh row var) then `e.l: t`
@@ -281,14 +282,14 @@ therefore changes no existing test.
 
 ## 8. Generalization (let-polymorphism)
 
-The generalization point is **module bindings** (including imported ones), only:
+The generalization points are **module bindings** (including imported ones) and **local `let` bindings**:
 
 ```
 gen(Γ, τ) = ∀α. τ      -- α = free type/row variables of τ not free in Γ
 ```
 
-Bindings are generalized unconditionally — the language is pure, there is no
-mutable state, so no value restriction is needed (unlike ML). Lambda parameters
+Bindings and let-locals are generalized unconditionally — the language is pure,
+there is no mutable state, so no value restriction is needed (unlike ML). Lambda parameters
 and lambda bodies are *monomorphic*: a lambda's type is generalized only when
 the lambda is bound to a name. Scheme instantiation (`instantiate`) replaces
 quantified variables with fresh flexible metavariables at each use. `null`'s
@@ -337,10 +338,14 @@ lag, lead : forall t. [t?] -> t?          -- one list argument ([x] or [x, offse
 int  float  string  bool  date  timestamp: Type         -- internal; only valid in table schemas
 ```
 
-**Query modes are types.** `agg t` / `group t` / `order` / `join kind` are
-transparent in unification (like `?`), so comparing or computing on aggregate
-results works; the mode is enforced by *mode checks* in inference that inspect
-the raw (pre-unification) field types:
+**Query modes are types.** `agg t` / `group t` / `order` /
+`join kind` / `window t` are distinct static modes. `agg` and `group`
+are transparent in unification (like `?`), so comparing or computing on
+aggregate results works; the other modes are enforced by *mode checks* in
+inference that inspect the raw (pre-unification) field types. `window t`
+marks window-only functions (`row_number`, `ntile`, `lag`, ...); it is
+not transparent, so `row_number + 1` is a static type error and `over`
+must unwrap it.
 
 - **`fold`** — every field of the projection row must be `agg t` or `group t`
   with at least one aggregate; the result row strips the modes, so downstream
@@ -351,6 +356,9 @@ the raw (pre-unification) field types:
   aggregation), which the evaluator validates positionally.
 - **`sort`** — the lambda's return type is checked to be `order` or `[order]`
   (skolemized, so an unconstrained column like `u => u.name` is rejected).
+- **`over`** — the wrapped expression must be `agg t` or `window t`; the result
+  is the payload `t`. A bare window-mode value in a projection is an error
+  (it must be wrapped in `over`).
 
 The **list-argument builtins** take one list argument (`concat [a, b]`) instead
 of variadic application — they are ordinary curried functions, and inference
@@ -406,12 +414,14 @@ Checking rules:
   too-specific or wrong annotation is an error:
   ```
   adult: { age: int | r } -> bool = u => u.age >= 18    # ok
-  adult: { age: int } -> bool     = u => u.age >= 18    # ok — narrows (closed row)
+  adult: { age: int } -> bool     = u => u.age >= 18    # ok — becomes the binding type, so wider rows are rejected at application
   adult: { a: int | r } -> bool   = u => u.age >= 18    # error — body needs 'age', annotation lacks it
   ```
   (The third fails because the skolemized `{ age: int? | ρ0 }` cannot be
   unified with `{ a: int | r' }` — `age` cannot be absorbed into the rigid tail
-  `ρ0`.)
+  `ρ0`.) Once the check passes, the binding is generalized with the declared
+  type `S`, not the inferred type, so a closed annotation really narrows
+  downstream applications.
 - **Lambda-parameter annotation `(u: T) => e`**: `u` is bound to the annotation
   with its free variables treated as *rigid* inside the body (the user names
   them; the body must work for any such row). The resulting lambda type is

@@ -98,7 +98,7 @@ PostgreSQL, `yyyy-MM-dd` Hive).
 | `floor x` / `sqrt x` | Direct (`FLOOR`/`SQRT`) | Direct | Direct | Direct | Direct |
 | `pow x y` | `POW(x, y)` | Direct | Direct | Direct | Direct |
 | `mod x y` | `MOD(x, y)` | Direct | Direct | Direct | Direct |
-| `round x` / `round x n` | `ROUND(x[, n])` | Direct | Direct | Direct | Direct |
+| `round [x]` / `round [x, n]` | `ROUND(x[, n])` | Direct | Direct | Direct | Direct |
 | `greatest x y ...` / `least ...` | `GREATEST(...)` / `LEAST(...)` | Direct | Direct | Direct (MAX/MIN aliases) | Direct |
 
 `greatest`/`least` require all arguments to share a comparable type (strict
@@ -108,18 +108,18 @@ numerics: int and float do not mix, like everywhere else in the language).
 
 | tetaue | Trino | PostgreSQL | MySQL | SQLite | Hive |
 |---|---|---|---|---|---|
-| `concat a b ...` | `CONCAT(a, b, ...)` | Direct | Direct | **Fallback** `a \|\| b` | Direct |
+| `concat [a, b, ...]` | `CONCAT(a, b, ...)` | Direct | Direct | **Fallback** `a \|\| b` | Direct |
 | `trim x` | `TRIM(x)` | Direct | Direct | Direct | Direct |
-| `substring x s [l]` | `SUBSTRING(x, s[, l])` | Direct | Direct | **Mapped** `SUBSTR(x, s[, l])` | Direct |
+| `substring [x, s, l?]` | `SUBSTRING(x, s[, l])` | Direct | Direct | **Mapped** `SUBSTR(x, s[, l])` | Direct |
 | `position x n` | `POSITION(n IN x)` | Direct | **Mapped** `LOCATE(n, x)` | **Mapped** `INSTR(x, n)` | `INSTR(x, n)` |
 | `replace x s r` | `REPLACE(x, s, r)` | Direct | Direct | Direct | Direct |
 | `reverse x` | `REVERSE(x)` | Direct | Direct | **error** | Direct |
 | `left_substring x n` | `LEFT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, 1, n)` | Direct |
 | `right_substring x n` | `RIGHT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, -n)` | Direct |
-| `lpad x n [p]` / `rpad` | `LPAD(x, n[, p])` | Direct | Direct | **error** | Direct |
+| `lpad [x, n, p?]` / `rpad` | `LPAD(x, n[, p])` | Direct | Direct | **error** | Direct |
 | `regex_like x p` | `REGEXP_LIKE(x, p)` | **Fallback** `REGEXP_MATCH(x, p) IS NOT NULL` | `REGEXP_LIKE(x, p)` | **error** | `x RLIKE p` |
 | `regex_replace x p r` | `REGEXP_REPLACE(x, p, r)` | Direct | Direct | **error** | Direct |
-| `regex_extract x p [g]` | `REGEXP_EXTRACT(x, p)` | **Mapped** `REGEXP_SUBSTR(x, p)` | **error** | **error** | `REGEXP_EXTRACT(x, p)` |
+| `regex_extract [x, p, g?]` | `REGEXP_EXTRACT(x, p[, g])` | **Mapped** `REGEXP_SUBSTR(x, p)`; group arg **error** | **error** | **error** | `REGEXP_EXTRACT(x, p)`; group arg **error** |
 
 ## Logical / null handling / casts
 
@@ -167,8 +167,9 @@ simple form); values must share a comparable type (a `null` literal absorbs
 like `coalesce`, so `case { u.active => u.name, _ => null }` is `string`).
 The `_` fallback branch must be last (at most one). Aggregates cannot be
 wrapped (`case` inside `fold` is rejected like `coalesce`). The result type
-is the unified branch value type, nullable because a CASE without an ELSE
-branch yields NULL.
+is the unified branch value type. Without a `_` fallback it is nullable
+(because an unmatched CASE yields NULL); with a `_` fallback it keeps the
+unified value type.
 
 ## Window functions
 
@@ -177,8 +178,8 @@ spec record (both fields optional; `{}` renders `OVER ()`). `partition` takes
 a list of column expressions (or one), `order` takes asc/desc items like
 `sort`. **Zero-argument functions (`row_number`, `rank`, `dense_rank`,
 `percent_rank`) can be written bare** — `over row_number {...}`; functions
-with arguments need parens (`over (ntile 4) {...}`, `over (lag u.salary 1 0)
-{...}`, `over (sum u.salary) {...}`), because a bare `lag u.salary 1 0` would
+with arguments need parens (`over (ntile 4) {...}`, `over (lag [u.salary, 1, 0])
+{...}`, `over (sum u.salary) {...}`), because a bare `lag [u.salary, 1, 0]` would
 flatten into separate application arguments (an error message explains this).
 The syntax and rendering are identical across dialects (PostgreSQL, MySQL 8+,
 SQLite 3.25+, Trino, Hive all support the standard `FN(...) OVER (...)` form):
@@ -188,7 +189,7 @@ SQLite 3.25+, Trino, Hive all support the standard `FN(...) OVER (...)` form):
 | `over row_number { ... }` | `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` |
 | `rank`, `dense_rank`, `percent_rank` | `RANK()` / `DENSE_RANK()` / `PERCENT_RANK()` |
 | `over (ntile 4) { ... }` | `NTILE(4) OVER (...)`, `ntile` takes a numeric bucket count |
-| `over (lag u.x 1 0) { ... }` | `LAG(x, 1, 0) OVER (...)`, `lead` — value, optional offset, optional default |
+| `over (lag [u.x, 1, 0]) { ... }` | `LAG(x, 1, 0) OVER (...)`, `lead` — value, optional offset, optional default |
 | `over (sum u.x) { ... }` | `SUM(x) OVER (...)`, windowed `avg`/`count`/`min`/`max`/`list` too |
 
 The wrapped expression must be an aggregate (`sum`/`avg`/`count`/`min`/`max`/`list`)

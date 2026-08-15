@@ -9,6 +9,7 @@
  ******************************************************************************/
 import { describe, expect, test } from 'bun:test';
 import { BUILTIN_ALIASES, BUILTIN_NAMES, BUILTIN_SPECS } from '../src/language/catalog.js';
+import type { BuiltinSpecName } from '../src/language/catalog.js';
 import { BUILTINS } from '../src/language/interpreter.js';
 
 describe('builtin catalog', () => {
@@ -51,7 +52,7 @@ describe('builtin catalog', () => {
         const { TypeUniverse } = await import('../src/language/types.js');
         const spec = new Map(BUILTIN_SPECS.map(s => [s.name, s]));
         for (const kind of ['inner', 'left', 'right', 'full']) {
-            const t = spec.get(kind)!.scheme(new TypeUniverse());
+            const t = spec.get(kind as BuiltinSpecName)!.scheme(new TypeUniverse());
             expect(t.vars).toEqual([]);
             expect(t.type).toMatchObject({ kind: 'jkind' });
         }

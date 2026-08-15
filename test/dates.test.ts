@@ -243,3 +243,15 @@ describe('type inference', () => {
         expect(typeErrors(src)).toEqual([]);
     });
 });
+
+describe('review fix: date argument types are checked statically', () => {
+    test('inference rejects non-date values for the date family', () => {
+        expect(typeErrors('q = year 5').join('\n')).toContain('year expects a date or timestamp expression, got type int');
+        expect(typeErrors('q = date_add current_date "day" "soon"').join('\n')).toContain('date_add expects a numeric amount, got type string');
+        expect(typeErrors('q = date_diff current_date "day" 5').join('\n')).toContain('date_diff expects a date or timestamp expression, got type int');
+    });
+
+    test('date_diff does not unify its two date arguments (no type pollution)', () => {
+        expect(typeErrors(`${ORDERS}\nq = orders & map (o => { d = date_diff o.created_at "day" current_date })`)).toEqual([]);
+    });
+});

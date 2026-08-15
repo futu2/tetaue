@@ -15,6 +15,9 @@ import { URI } from 'langium';
 
 const ROOT = resolve(import.meta.dir, '..');
 const SERVER = resolve(ROOT, 'extension', 'server', 'server.mjs');
+// Prefer a real node binary when present; otherwise run the bundle with the
+// current bun executable so `bun test` works in bun-only environments.
+const NODE = process.env.TETAUE_TEST_NODE ?? (Bun.which('node') ?? process.execPath);
 // examples/strings.tetaue is the one example that parses with the current grammar.
 const EXAMPLE = resolve(ROOT, 'examples', 'strings.tetaue');
 
@@ -107,7 +110,7 @@ describe('tetaue language server (LSP over stdio)', () => {
         const { tmpdir } = require('node:os') as typeof import('node:os');
         const { join } = require('node:path') as typeof import('node:path');
         const dir = mkdtempSync(join(tmpdir(), 'tetaue-lsp-'));
-        const server = spawn('node', [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const server = spawn(NODE, [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
         const stderr: string[] = [];
         server.stderr.on('data', chunk => stderr.push(chunk.toString('utf8')));
         try {
@@ -168,7 +171,7 @@ describe('tetaue language server (LSP over stdio)', () => {
         const { tmpdir } = require('node:os') as typeof import('node:os');
         const { join } = require('node:path') as typeof import('node:path');
         const dir = mkdtempSync(join(tmpdir(), 'tetaue-lsp-'));
-        const server = spawn('node', [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const server = spawn(NODE, [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
         const stderr: string[] = [];
         server.stderr.on('data', chunk => stderr.push(chunk.toString('utf8')));
         try {
@@ -241,7 +244,7 @@ describe('tetaue language server (LSP over stdio)', () => {
     });
 
     test('initialize, render an example to SQL, shutdown', async () => {
-        const server = spawn('node', [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const server = spawn(NODE, [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
         const stderr: string[] = [];
         server.stderr.on('data', chunk => stderr.push(chunk.toString('utf8')));
         try {
@@ -300,7 +303,7 @@ describe('tetaue language server (LSP over stdio)', () => {
     });
 
     test('hover shows types and docs; completion suggests row fields after `.`', async () => {
-        const server = spawn('node', [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const server = spawn(NODE, [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
         const stderr: string[] = [];
         server.stderr.on('data', chunk => stderr.push(chunk.toString('utf8')));
         try {
@@ -389,7 +392,7 @@ describe('tetaue language server (LSP over stdio)', () => {
     });
 
     test('semantic tokens classify keywords, types, functions, and variables', async () => {
-        const server = spawn('node', [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const server = spawn(NODE, [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
         const stderr: string[] = [];
         server.stderr.on('data', chunk => stderr.push(chunk.toString('utf8')));
         try {
@@ -549,7 +552,7 @@ describe('tetaue language server (LSP over stdio)', () => {
     });
 
     test('formatting returns canonical text', async () => {
-        const server = spawn('node', [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const server = spawn(NODE, [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
         const stderr: string[] = [];
         server.stderr.on('data', chunk => stderr.push(chunk.toString('utf8')));
         try {

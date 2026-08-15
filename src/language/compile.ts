@@ -111,6 +111,17 @@ export function compileModuleText(
     options?: CompileOptions,
 ): CompileOutcome {
     const { dialect = 'sqlite', format = 'pretty', requireQuery = true } = options ?? {};
+    if (!isDialect(dialect)) {
+        return {
+            ok: false,
+            diagnostics: [{
+                uri: rootUri,
+                line: 0,
+                character: 0,
+                message: `unknown dialect '${dialect}' — available: ${Object.keys(DIALECTS).join(', ')}`,
+            }],
+        };
+    }
 
     let main: ProjectModule;
     try {
@@ -141,15 +152,18 @@ export function compileModuleText(
     if (value.kind !== 'query') {
         return { ok: false, diagnostics: [] };
     }
-    const spec = isDialect(dialect) ? DIALECTS[dialect]! : DIALECTS.sqlite!;
-    try {
-        return { ok: true, sql: renderQuery(value.query, spec, format), warnings: warningList };
-    } catch (err) {
-        // Render-time capability errors (e.g. a date function the dialect
-        // cannot lower) surface as diagnostics like any other failure.
+    const spec = DIALECTS[dialect]!;
+    const rendered = renderQuery(value.query, spec, format);
+    if (!rendered.ok) {
         return {
             ok: false,
-            diagnostics: [{ uri: rootUri, line: 0, character: 0, message: err instanceof Error ? err.message : String(err) }],
+            diagnostics: rendered.diagnostics.map(d => ({
+                uri: rootUri,
+                line: 0,
+                character: 0,
+                message: d.message,
+            })),
         };
     }
+    return { ok: true, sql: rendered.sql, warnings: warningList };
 }

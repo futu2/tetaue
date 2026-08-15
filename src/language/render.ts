@@ -5,6 +5,7 @@
  * boolean literals and function-name mappings are resolved at render time.
  ******************************************************************************/
 import type { JoinKind, Query, SqlNode } from './interpreter.js';
+import type { BuiltinName } from './builtin.js';
 
 export interface DialectSpec {
     name: string;
@@ -18,7 +19,7 @@ export interface DialectSpec {
     /** Render a string literal (dialects differ in backslash handling). */
     stringLiteral: (value: string) => string;
     /** canonical builtin name → SQL function name */
-    functions: Record<string, string>;
+    functions: Partial<Record<BuiltinName, string>>;
 }
 
 /**
@@ -59,6 +60,14 @@ function quoteQualifiedName(name: string, dialect: DialectSpec): string {
     return name.split('.').map(part => dialect.quoteIdentifier(part)).join('.');
 }
 
+function quoteDoubleQuoted(value: string): string {
+    return `"${value.replace(/"/g, '""')}"`;
+}
+
+function quoteBacktickQuoted(value: string): string {
+    return `\`${value.replace(/`/g, '``')}\``;
+}
+
 function quoteSingleQuoted(value: string): string {
     return `'${value.replace(/'/g, "''")}'`;
 }
@@ -71,7 +80,7 @@ function quoteMysql(value: string): string {
 export const DIALECTS: Record<string, DialectSpec> = {
     sqlite: {
         name: 'sqlite',
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, n => `"${n}"`),
+        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
         boolLiteral: b => (b ? '1' : '0'),
         stringLiteral: quoteSingleQuoted,
         functions: {
@@ -83,7 +92,7 @@ export const DIALECTS: Record<string, DialectSpec> = {
     },
     postgresql: {
         name: 'postgresql',
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, n => `"${n}"`),
+        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteSingleQuoted,
         functions: {
@@ -94,7 +103,7 @@ export const DIALECTS: Record<string, DialectSpec> = {
     },
     mysql: {
         name: 'mysql',
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, n => `\`${n}\``),
+        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteBacktickQuoted),
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteMysql,
         functions: {
@@ -105,7 +114,7 @@ export const DIALECTS: Record<string, DialectSpec> = {
     },
     trino: {
         name: 'trino',
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, n => `"${n}"`),
+        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteSingleQuoted,
         functions: {
@@ -116,7 +125,7 @@ export const DIALECTS: Record<string, DialectSpec> = {
     },
     hive: {
         name: 'hive',
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, n => `\`${n}\``),
+        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteBacktickQuoted),
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteMysql,
         functions: {
@@ -271,7 +280,7 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
             if (special !== null) {
                 return parenIf(special, precOf('CALL'), parentPrec);
             }
-            const name = ctx.dialect.functions[node.name] ?? node.name.toUpperCase();
+            const name = ctx.dialect.functions[node.name as BuiltinName] ?? node.name.toUpperCase();
             const text = `${name}(${node.args.map(a => renderExpr(a, ctx)).join(', ')})`;
             return parenIf(text, precOf('CALL'), parentPrec);
         }
@@ -285,7 +294,7 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
             return parenIf(text, precOf('IN'), parentPrec);
         }
         case 'agg': {
-            const name = ctx.dialect.functions[node.name] ?? node.name.toUpperCase();
+            const name = ctx.dialect.functions[node.name as BuiltinName] ?? node.name.toUpperCase();
             const text = `${name}(${renderExpr(node.arg, ctx)})`;
             return parenIf(text, precOf('CALL'), parentPrec);
         }
@@ -323,7 +332,7 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
 // ---------------------------------------------------------------------------
 
 /** Canonical builtin names that lower to dialect-specific date/time SQL. */
-const DATE_FUNCTIONS = new Set([
+const DATE_FUNCTIONS = new Set<BuiltinName>([
     'extract', 'year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second',
     'date_add', 'date_diff', 'date_trunc',
     'date_format', 'date_parse', 'to_unixtime', 'from_unixtime',
@@ -341,27 +350,37 @@ const DATE_UNIT_SQL: Record<string, string> = {
  * plain same-name call (sqlite fallbacks, binary forms, casts, gaps that must
  * error explicitly).
  */
-const SPECIAL_CALLS = new Set([
+const SPECIAL_CALLS = new Set<BuiltinName>([
     // date/time family (see renderDateFunction)
     'extract', 'year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second',
     'date_add', 'date_diff', 'date_trunc', 'date_format', 'date_parse',
     'to_unixtime', 'from_unixtime',
     // scalar family
-    'concat', 'substring', 'position', 'reverse', 'left_substring', 'right_substring',
+    'concat', 'greatest', 'least', 'substring', 'position', 'reverse', 'left_substring', 'right_substring',
     'lpad', 'rpad', 'regex_like', 'regex_replace', 'regex_extract', 'cast', 'try_cast',
 ]);
 
 function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): string | null {
-    if (DATE_FUNCTIONS.has(node.name)) return renderDateFunction(node, ctx);
-    if (!SPECIAL_CALLS.has(node.name)) return null;
+    if (DATE_FUNCTIONS.has(node.name as BuiltinName)) return renderDateFunction(node, ctx);
+    if (!SPECIAL_CALLS.has(node.name as BuiltinName)) return null;
     const d = ctx.dialect.name;
     const x = (i = 0) => renderExpr(node.args[i]!, ctx, precOf('CALL'));
 
     switch (node.name) {
         case 'concat': {
             const parts = node.args.map(a => renderExpr(a, ctx));
-            if (d === 'sqlite') return parts.join(' || '); // sqlite has no CONCAT
+            if (d === 'sqlite') {
+                // SQLite has no CONCAT; || propagates NULL, so COALESCE each
+                // argument to the empty string to match CONCAT semantics.
+                return parts.map(p => `COALESCE(${p}, '')`).join(' || ');
+            }
             return `CONCAT(${parts.join(', ')})`;
+        }
+        case 'greatest': case 'least': {
+            if (d !== 'sqlite') return null; // GREATEST/LEAST via the default path
+            // SQLite has scalar MAX/MIN with GREATEST/LEAST-like NULL semantics.
+            const fn = node.name === 'greatest' ? 'MAX' : 'MIN';
+            return `${fn}(${node.args.map(a => renderExpr(a, ctx)).join(', ')})`;
         }
         case 'substring': {
             // value, start, length?
@@ -383,12 +402,17 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
         case 'right_substring':
             return d === 'sqlite' ? `SUBSTR(${x()}, -${x(1)})` : `RIGHT(${x()}, ${x(1)})`;
         case 'lpad': case 'rpad':
-            // sqlite has no LPAD/RPAD; other dialects render LPAD/RPAD via the default path
+            // sqlite has no LPAD/RPAD.
             if (d === 'sqlite') throw new Error(`${node.name} is not supported for the sqlite dialect`);
+            if (node.args.length === 2) {
+                // MySQL/Trino/Hive require the pad string; PostgreSQL defaults
+                // to a space. Make the default explicit for a uniform lowering.
+                return `${node.name.toUpperCase()}(${x()}, ${x(1)}, ' ')`;
+            }
             return null;
         case 'regex_like': {
             if (d === 'sqlite') throw new Error(`regex_like is not supported for the sqlite dialect`);
-            if (d === 'postgresql') return `REGEXP_MATCH(${x()}, ${x(1)}) IS NOT NULL`;
+            if (d === 'postgresql') return `${x()} ~ ${x(1)}`;
             if (d === 'hive') return `${x()} RLIKE ${x(1)}`;
             return `REGEXP_LIKE(${x()}, ${x(1)})`; // mysql, trino
         }
@@ -398,8 +422,16 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
         }
         case 'regex_extract': {
             if (d === 'mysql' || d === 'sqlite') throw new Error(`regex_extract is not supported for the ${d} dialect`);
-            if (d === 'postgresql') return `REGEXP_SUBSTR(${x()}, ${x(1)})`;
-            if (d === 'trino' || d === 'hive') return `REGEXP_EXTRACT(${x()}, ${x(1)})`;
+            const groupNode = node.args[2];
+            if (d === 'postgresql') {
+                if (groupNode) throw new Error(`regex_extract group argument is not supported for the postgresql dialect`);
+                return `REGEXP_SUBSTR(${x()}, ${x(1)})`;
+            }
+            if (d === 'hive') {
+                if (groupNode) throw new Error(`regex_extract group argument is not supported for the hive dialect`);
+                return `REGEXP_EXTRACT(${x()}, ${x(1)})`;
+            }
+            if (d === 'trino') return groupNode ? `REGEXP_EXTRACT(${x()}, ${x(1)}, ${x(2)})` : `REGEXP_EXTRACT(${x()}, ${x(1)})`;
             return null;
         }
         case 'cast': case 'try_cast': {
@@ -446,8 +478,8 @@ function renderDateFunction(node: Extract<SqlNode, { kind: 'call' }>, ctx: Rende
         case 'date_add': return renderDateAdd(d, x(), unit(), third!, arg, num);
         case 'date_diff': return renderDateDiff(d, x(), unit(), arg());
         case 'date_trunc': return renderDateTrunc(d, x(), unit());
-        case 'date_format': return renderDateFormat(d, x(), str(second) ?? '%Y-%m-%d');
-        case 'date_parse': return renderDateParse(d, x(), str(second) ?? '%Y-%m-%d');
+        case 'date_format': return renderDateFormat(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral);
+        case 'date_parse': return renderDateParse(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral);
         case 'to_unixtime': return renderToUnixtime(d, x());
         case 'from_unixtime': return renderFromUnixtime(d, x());
     }
@@ -559,34 +591,36 @@ function renderDateTrunc(d: string, x: string, unit: string): string {
 }
 
 /** `date_format value format` — dialect-native format string. */
-function renderDateFormat(d: string, x: string, format: string): string {
+function renderDateFormat(d: string, x: string, format: string, quote: (v: string) => string): string {
+    const f = quote(format);
     switch (d) {
         case 'postgresql':
-            return `TO_CHAR(${x}, '${format}')`;
+            return `TO_CHAR(${x}, ${f})`;
         case 'mysql': case 'trino': case 'hive':
-            return `DATE_FORMAT(${x}, '${format}')`;
+            return `DATE_FORMAT(${x}, ${f})`;
         case 'sqlite':
-            return `STRFTIME('${format}', ${x})`;
+            return `STRFTIME(${f}, ${x})`;
         default:
-            return `DATE_FORMAT(${x}, '${format}')`;
+            return `DATE_FORMAT(${x}, ${f})`;
     }
 }
 
 /** `date_parse value format` — dialect-native format string. */
-function renderDateParse(d: string, x: string, format: string): string {
+function renderDateParse(d: string, x: string, format: string, quote: (v: string) => string): string {
+    const f = quote(format);
     switch (d) {
         case 'postgresql':
-            return `TO_TIMESTAMP(${x}, '${format}')`;
+            return `TO_TIMESTAMP(${x}, ${f})`;
         case 'mysql':
-            return `STR_TO_DATE(${x}, '${format}')`;
+            return `STR_TO_DATE(${x}, ${f})`;
         case 'sqlite':
             return `DATETIME(${x})`; // sqlite parses many formats natively; the format is ignored
         case 'trino':
-            return `DATE_PARSE(${x}, '${format}')`;
+            return `DATE_PARSE(${x}, ${f})`;
         case 'hive':
             throw new Error(`date_parse is not supported for the hive dialect — use date_format with to_unixtime/from_unixtime instead`);
         default:
-            return `DATE_PARSE(${x}, '${format}')`;
+            return `DATE_PARSE(${x}, ${f})`;
     }
 }
 
@@ -624,7 +658,7 @@ function renderFromUnixtime(d: string, x: string): string {
 
 // --- query rendering -------------------------------------------------------
 
-export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): string {
+function renderQueryUnsafe(q: Query, dialect: DialectSpec, format: RenderFormat = "pretty"): string {
     const ctx: RenderCtx = { dialect, qualify: countTables(q) > 1 };
     const pretty = format === 'pretty';
     const clauses: string[] = [];
@@ -656,8 +690,8 @@ export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat
     if (q.root.from) {
         const derivedAlias = q.aliases[0] ?? q.root.name;
         clauses.push(pretty
-            ? `FROM (\n${indentLines(renderQuery(q.root.from, dialect, 'pretty'), INDENT)}\n) AS ${dialect.quoteIdentifier(derivedAlias)}`
-            : `FROM (${renderQuery(q.root.from, dialect, 'compact')}) AS ${dialect.quoteIdentifier(derivedAlias)}`);
+            ? `FROM (\n${indentLines(renderQueryUnsafe(q.root.from, dialect, 'pretty'), INDENT)}\n) AS ${dialect.quoteIdentifier(derivedAlias)}`
+            : `FROM (${renderQueryUnsafe(q.root.from, dialect, 'compact')}) AS ${dialect.quoteIdentifier(derivedAlias)}`);
     } else {
         const rootAlias = q.aliases[0] ?? q.root.name;
         const rootAliasClause = ctx.qualify && rootAlias !== q.root.name
@@ -683,8 +717,8 @@ export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat
                 // stepped or derived right side: render as a subquery so
                 // joins compose
                 rightSql = pretty
-                    ? `(\n${indentLines(renderQuery(right, dialect, 'pretty'), INDENT)}\n) AS ${dialect.quoteIdentifier(rightAlias)}`
-                    : `(${renderQuery(right, dialect, 'compact')}) AS ${dialect.quoteIdentifier(rightAlias)}`;
+                    ? `(\n${indentLines(renderQueryUnsafe(right, dialect, 'pretty'), INDENT)}\n) AS ${dialect.quoteIdentifier(rightAlias)}`
+                    : `(${renderQueryUnsafe(right, dialect, 'compact')}) AS ${dialect.quoteIdentifier(rightAlias)}`;
             }
             const onClause = `ON ${renderExpr(step.on, ctx)}`;
             // In pretty mode a subquery join is laid out vertically so the
@@ -736,4 +770,33 @@ export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat
     }
 
     return pretty ? clauses.join('\n') : clauses.join(' ');
+}
+
+export interface RenderDiagnostic {
+    message: string;
+    /** The originating SQL/IR node when known. */
+    node?: unknown;
+}
+
+export type RenderResult =
+    | { ok: true; sql: string }
+    | { ok: false; diagnostics: RenderDiagnostic[] };
+
+/**
+ * Pure renderer entry point: lowering errors are data, not exceptions.
+ * `renderQueryUnsafe` may still throw internally while the dialect tables are
+ * being made total; the public API converts every failure to a diagnostic.
+ */
+export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
+    try {
+        return { ok: true, sql: renderQueryUnsafe(q, dialect, format) };
+    } catch (err) {
+        return {
+            ok: false,
+            diagnostics: [{
+                message: err instanceof Error ? err.message : String(err),
+                node: undefined,
+            }],
+        };
+    }
 }

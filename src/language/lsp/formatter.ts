@@ -7,11 +7,11 @@
  * (strings, comments and escapes are untouched). This makes the formatter
  * safe on partially-written code and idempotent.
  *
- * One deliberate exception: whitespace adjacent to `-` is preserved, because
- * it is semantically meaningful in tetaue — `abs -1` applies `abs` to `-1`
- * (actually: binary minus would need a left operand, so `-1` stays a unary
- * argument) while `abs - 1` is `abs` minus `1`. The formatter never invents
- * or removes a space next to `-`.
+ * One deliberate exception: whitespace adjacent to `-` is preserved. Negative
+ * numbers are written with parens in application position (`abs (-1)`);
+ * `abs -1` and `abs - 1` both parse as subtraction, but preserving the
+ * user's spacing keeps the formatter reversible on partial edits and never
+ * invents or removes a space next to `-`.
  ******************************************************************************/
 import { type LangiumDocument } from 'langium';
 import type { Formatter } from 'langium/lsp';
@@ -34,7 +34,7 @@ const CONTINUATION = new Set(['&', '$', '|', '==', '!=', '<', '<=', '>', '>=', '
 
 /** Word-like tokens that get a space between them and their neighbors. */
 const WORD_TOKEN_NAMES = new Set(['ID', 'ARG_ID', 'NUMBER', 'STRING', 'LAMBDA_PARAM']);
-const WORD_KEYWORDS = new Set(['query', 'true', 'false', 'null']);
+const WORD_KEYWORDS = new Set(['query', 'true', 'false', 'null', 'let', 'in']);
 
 function isComment(t: Tok): boolean {
     return t.tokenType?.name === 'COMMENT';
@@ -67,7 +67,7 @@ function isName(t: Tok): boolean {
 
 /**
  * A line that starts a new top-level statement: `import "..."` or a binding
- * `name = ...` / `name: T = ...`. Everything else — `(l, r) => ...` arguments,
+ * `name = ...` / `name: T = ...`. Everything else — `(l => r => ...)` arguments,
  * bare names, openers — merely continues the current expression.
  */
 function startsNewStatement(tokens: Tok[]): boolean {
@@ -145,7 +145,7 @@ export function formatTetaue(text: string, indentUnit: string, services: TetaueS
         const first = line.tokens[0];
         // Pipeline context: `&`-continuation lines open it; a new top-level
         // statement at depth 0 closes it. Lines that merely continue the
-        // current expression — `(l, r) => ...` arguments, bare names — keep
+        // current expression — `(l => r => ...)` arguments, bare names — keep
         // it open, so multi-line `join` arguments stay indented.
         if (first) {
             if (CONTINUATION.has(first.image)) cont = true;

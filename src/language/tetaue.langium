@@ -8,6 +8,7 @@
  *     is `l => r => ...` (there is no `(l, r) => ...` form)
  *   - `case { cond => value, ..., _ => value }` — SQL CASE WHEN as a
  *     first-class expression (`_` is the fallback branch; `case`/`_` reserved)
+ *   - `let x = e in body` — pure local bindings (`let`/`in` reserved)
  *   - implicit lambdas: a parenthesized expression using $n parameters,
  *     `($1 + 3)` ≡ `u => u + 3`, `($1 + $2)` ≡ `$1 => $2 => $1 + $2`
  *   - builtins live in a prelude of plain identifiers (table, filter, ...)
@@ -45,7 +46,14 @@ Binding:
     (export?='export')? name=(ID | ARG_ID) (':' type=Type)? '=' value=Expression;
 
 Expression:
-    Ascription | BinaryExpression;
+    Ascription | LetExpression | BinaryExpression;
+
+// `let x = e in body` — a pure local binding (no recursion). The value and
+// body are ordinary expressions; inside a lambda the dedicated
+// LambdaLetExpression keeps `&`/`$` out of the lambda body unless
+// parenthesized.
+LetExpression:
+    {infer LetExpression} 'let' name=(ID | ARG_ID) (':' type=Type)? '=' value=Expression 'in' body=Expression;
 
 // `e : T` — a type annotation on any expression, lowest precedence
 // (`a & f : T` is `(a & f) : T`). Annotations are erased at evaluation time.
@@ -113,7 +121,10 @@ infix BinaryExpression on UnaryExpression:
 // the lambda at the record instead of swallowing the next pipeline step. To
 // use `&`/`$` inside a lambda body, parenthesize: `u => (u.a & take 1)`.
 LambdaBody:
-    Ascription | LambdaBinaryExpression;
+    Ascription | LambdaLetExpression | LambdaBinaryExpression;
+
+LambdaLetExpression:
+    {infer LambdaLetExpression} 'let' name=(ID | ARG_ID) (':' type=Type)? '=' value=LambdaBody 'in' body=LambdaBody;
 
 infix LambdaBinaryExpression on UnaryExpression:
     right assoc '>>>' | '<<<'

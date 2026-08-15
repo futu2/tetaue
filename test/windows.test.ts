@@ -111,6 +111,7 @@ describe('window functions', () => {
                 & filter (u => u.rn == 1)
         `, 'trino');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn');
+        expect(sql).toContain('FROM (\n    SELECT');
         expect(sql).toContain('WHERE rn = 1');
     });
 });
@@ -170,5 +171,16 @@ describe('type inference', () => {
                 & filter (u => u.rn >= 1)
         `;
         expect(typeErrors(src)).toEqual([]);
+    });
+});
+
+describe('review fix: window-only functions are a static mode', () => {
+    test('inference types row_number as a window-mode value and requires over in projections', () => {
+        expect(typeErrors(`${USERS}\nq = users & map (u => { x = row_number })`).join('\n')).toContain('row_number must be wrapped in over');
+        expect(typeErrors(`${USERS}\nq = users & map (u => { x = over (row_number) {} })`)).toEqual([]);
+    });
+
+    test('window-mode values cannot be used as plain scalars', () => {
+        expect(typeErrors('x = row_number + 1').join('\n')).toContain("'+' requires numeric operands");
     });
 });

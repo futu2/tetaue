@@ -38,7 +38,7 @@ describe('tetaue formatter', () => {
         expect(out).toBe('a = $1.id == $2.user_id\n');
     });
 
-    test('preserves `-` adjacency (semantic!)', () => {
+    test('preserves `-` adjacency', () => {
         expect(roundTrip('a = abs -1\n')).toBe('a = abs -1\n');
         expect(roundTrip('b = x - 1\n')).toBe('b = x - 1\n');
         expect(roundTrip('c = x-1\n')).toBe('c = x-1\n');
@@ -158,6 +158,10 @@ describe('tetaue formatter', () => {
             const text = readFileSync(resolve(import.meta.dir, '..', 'examples', file), 'utf8');
             expect(fmt(text), file).toBe(text);
         }
+    });
+
+    test('spaces let and in', () => {
+        expect(roundTrip('q = let x=1 in x\n')).toBe('q = let x = 1 in x\n');
     });
 
     test('returns undefined on unlexable input', () => {
