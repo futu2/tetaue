@@ -8,3 +8,4 @@ extension/node_modules/
 extension/out/
 extension/server/
 extension/*.vsix
+/result

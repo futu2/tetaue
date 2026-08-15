@@ -133,6 +133,44 @@ beyond the OS itself. (The VS Code extension's `lsp` command and the
 standalone binary serve the same language server; each editor keeps working
 with the extension's own bundled server.)
 
+### Nix (flake)
+
+The repo ships a [flake](https://nixos.wiki/wiki/Flakes) that builds the CLI as
+a self-contained executable (like the standalone builds above, but hermetically
+— dependencies are fetched from the pinned `bun.lock` instead of a network
+`bun install`):
+
+```sh
+nix build                   # → result/bin/tetaue (self-contained CLI)
+nix run . -- render examples/adults.tetaue --dialect postgresql
+nix build .#vsix            # → result = tetaue-vscode-0.1.0.vsix (VS Code extension)
+nix develop                   # dev shell: bun, node, langium-cli, bun2nix
+nix flake check               # builds the package and runs the test suite
+nix fmt                       # format flake.nix with nixpkgs-fmt
+```
+
+The VS Code extension is built two ways:
+
+- `nix build .#vsix` produces the raw `.vsix` file — install it with
+  `code --install-extension result` (or the Extensions view → Install from VSIX).
+- `nix build .#extension` produces a nixpkgs-style extension derivation, for
+  NixOS + home-manager:
+
+  ```nix
+  programs.vscode.extensions = [ tetaue.packages.${system}.extension ];
+  ```
+
+  Its language server bundle (`extension/server/server.mjs`) is built from this
+  repo's TypeScript, and the extension's npm dependencies come from
+  `extension/package-lock.json` (fetched via `fetchNpmDeps`).
+
+- `bun.nix` is generated from `bun.lock` by
+  [bun2nix](https://github.com/nix-community/bun2nix) and must be kept in sync:
+  after changing dependencies run `bun2nix -o bun.nix` (available in the dev
+  shell) and commit both files.
+- The flake pins its own `nixpkgs-unstable` input, so the host NixOS channel
+  does not matter.
+
 ## Modules
 
 A module is a list of bindings; **the last binding is the module's query**. Bindings
