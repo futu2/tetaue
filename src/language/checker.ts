@@ -20,9 +20,8 @@
  * validator, hover/completion, and `tetaue types`) all use this pass.
  ******************************************************************************/
 import type { AstNode } from 'langium';
-import type { Binding } from './generated/ast.js';
 import {
-    ERROR, checkBinding, createPreludeEnv, describe, type Diagnostic, type Value,
+    ERROR, createPreludeEnv, describe, type Diagnostic, type Value,
 } from './interpreter.js';
 import { Inferencer, mergeDiagnostics } from './inference.js';
 import type { Scheme, Type } from './types.js';
@@ -49,40 +48,6 @@ export interface CheckProjectOptions {
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
     /** Render this root-module binding instead of the last one. */
     entryBinding?: string;
-}
-
-/**
- * Advance ONE binding through both the runtime evaluator and the type
- * inferencer, in order, using the same shared lexical scope. The value side
- * installs the binding in the runtime env; the inference side installs its
- * scheme and exports it when requested.
- */
-function checkTypedBinding(
-    binding: Binding,
-    valueEnv: Map<string, Value>,
-    inferencer: Inferencer,
-    moduleBindings: ReadonlySet<string>,
-    seen: ReadonlySet<string>,
-    scope: Map<string, string>,
-    exportedSchemes: Map<string, Scheme>,
-): { env: Map<string, Value>; seen: Set<string>; value: Value; diagnostics: Diagnostic[] } {
-    const diagnostics: Diagnostic[] = [];
-    if (scope.has(binding.name)) {
-        diagnostics.push({
-            node: binding,
-            message: `name '${binding.name}' (a local binding) conflicts with ${scope.get(binding.name)!}`,
-        });
-    }
-
-    // Type first against the ORIGINAL imported scope; the runtime diagnostic
-    // above is authoritative for scope collisions, so inference only
-    // installs the binding scheme here.
-    inferencer.inferBinding(binding, exportedSchemes, scope, false);
-    scope.set(binding.name, `local binding '${binding.name}'`);
-
-    const result = checkBinding(binding, valueEnv, moduleBindings, seen);
-    diagnostics.push(...result.diagnostics);
-    return { env: result.env, seen: result.seen, value: result.value, diagnostics };
 }
 
 /**
@@ -144,8 +109,8 @@ export function checkProject(
         const exportedSchemes = new Map<string, Scheme>();
         let seen = new Set<string>();
         for (const binding of module.model.bindings) {
-            const result = checkTypedBinding(
-                binding, env, inferencer, moduleBindings, seen, scope, exportedSchemes,
+            const result = inferencer.typedBinding(
+                binding, exportedSchemes, scope, env, moduleBindings, seen,
             );
             moduleDiagnostics.push(...result.diagnostics);
             env = result.env;

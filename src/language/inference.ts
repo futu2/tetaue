@@ -33,7 +33,8 @@ import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
 import { moduleOf } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
-import { parseStringLiteral } from './interpreter.js';
+import { checkBinding, parseStringLiteral } from './interpreter.js';
+import type { Diagnostic, Value } from './interpreter.js';
 import { labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
 import { CAST_TYPES, LIST_ARITY } from './builtin.js';
@@ -341,6 +342,38 @@ export class Inferencer {
         // Exported bindings are the module's public surface: importers see
         // their generalized schemes (polymorphism survives qualified access).
         if (b.export) exported.set(b.name, scheme);
+    }
+
+    /**
+     * The per-binding typed pass used by `checkProject`: type the binding,
+     * then evaluate its runtime IR in the same scope step. Inference owns the
+     * scheme and exports; the interpreter owns the SQL Value.
+     */
+    typedBinding(
+        b: Binding,
+        exported: Map<string, Scheme>,
+        scope: Map<string, string>,
+        valueEnv: Map<string, Value>,
+        moduleBindings: ReadonlySet<string>,
+        seen: ReadonlySet<string>,
+    ): { env: Map<string, Value>; seen: Set<string>; value: Value; diagnostics: Diagnostic[] } {
+        const diagnostics: Diagnostic[] = [];
+        if (scope.has(b.name)) {
+            diagnostics.push({
+                node: b,
+                message: `name '${b.name}' (a local binding) conflicts with ${scope.get(b.name)!}`,
+            });
+        }
+
+        // Type first against the ORIGINAL imported scope; the runtime
+        // diagnostic above is authoritative, so inference only installs the
+        // binding scheme and resolves namespace shadowing.
+        this.inferBinding(b, exported, scope, false);
+        scope.set(b.name, `local binding '${b.name}'`);
+
+        const result = checkBinding(b, valueEnv, moduleBindings, seen);
+        diagnostics.push(...result.diagnostics);
+        return { env: result.env, seen: result.seen, value: result.value, diagnostics };
     }
 
     // -----------------------------------------------------------------------
