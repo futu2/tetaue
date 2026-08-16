@@ -9,16 +9,17 @@
  * CLI reads the file); `import`ed modules are read from disk relative to the
  * root. Imports intentionally resolve with the same filesystem semantics as
  * the CLI (relative specs, `..`/absolute paths allowed) — this is a local
- * language tool, not a sandbox. Interpreter + inference diagnostics are
- * merged with exact dedupe, exactly like the CLI's `render`/`check`.
+ * language tool, not a sandbox. The single checker pass (`checkProject`)
+ * builds the typed SQL IR and emits exact-deduped diagnostics, exactly like
+ * the CLI's `render`/`check`.
  ******************************************************************************/
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 import { URI } from 'langium';
 import type { TetaueServices } from './tetaue-module.js';
-import { analyzeProject, type Diagnostic } from './interpreter.js';
-import { inferProject, mergeDiagnostics } from './inference.js';
+import type { Diagnostic } from './interpreter.js';
+import { checkProject } from './checker.js';
 import { renderQuery, renderQueryWithCtes, DIALECTS, isDialect } from './render.js';
 import type { RenderFormat } from './render.js';
 import { collectModuleTree, moduleOf } from './imports.js';
@@ -181,10 +182,7 @@ export function compileModuleText(
     }
 
     const { modules, importsByModule, diagnostics: treeDiagnostics, warnings: treeWarnings } = projectTreeFor(main, services);
-    const { value, diagnostics } = analyzeProject(modules, { requireQuery, importsByModule });
-    const { diagnostics: typeDiagnostics } = inferProject(modules, importsByModule);
-    // Interpreter + inference merged with exact (node, message) dedupe.
-    const merged = mergeDiagnostics(modules, diagnostics, typeDiagnostics);
+    const { value, diagnostics: merged } = checkProject(modules, { requireQuery, importsByModule });
 
     const all: CompileDiagnostic[] = [];
     for (const d of [...treeDiagnostics, ...merged]) {

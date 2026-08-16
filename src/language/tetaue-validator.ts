@@ -1,6 +1,6 @@
 /******************************************************************************
- * tetaue validator — runs the interpreter over the AST (resolving imports)
- * and reports the resulting diagnostics through Langium's validation.
+ * tetaue validator — runs the single checker pass over the AST (resolving
+ * imports) and reports the resulting diagnostics through Langium's validation.
  *
  * Diagnostics that belong to imported modules are folded onto the `import`
  * statement that leads to them, so a single open file shows its imports'
@@ -10,8 +10,9 @@ import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { URI, type AstNode, type ValidationAcceptor, type ValidationChecks } from 'langium';
 import type { Import, TetaueAstType, Model } from './generated/ast.js';
-import { analyzeProject, parseStringLiteral, type Diagnostic } from './interpreter.js';
-import { inferProject, mergeDiagnostics } from './inference.js';
+import { parseStringLiteral, type Diagnostic } from './interpreter.js';
+import { mergeDiagnostics } from './inference.js';
+import { checkProject } from './checker.js';
 import { createImportResolver } from './resolve.js';
 import type { TetaueServices } from './tetaue-module.js';
 import { collectModuleTree, moduleOf } from './imports.js';
@@ -52,12 +53,12 @@ export function checkModel(model: Model, accept: ValidationAcceptor, services: T
 
     // The root document is analyzed without the query requirement (imported
     // helper modules legitimately end in non-query bindings); the CLI enforces
-    // it for the root. The type-inference pass runs alongside the interpreter;
-    // the two are merged with exact (node, message) dedupe so each type error
-    // is reported exactly once.
-    const result = analyzeProject(modules, { requireQuery: false, importsByModule });
-    const { diagnostics: typeDiagnostics } = inferProject(modules, importsByModule);
-    const merged = mergeDiagnostics(modules, diagnostics, result.diagnostics, typeDiagnostics);
+    // it for the root. The checker runs IR construction and type inference as
+    // one pass and returns the exact-deduped diagnostics.
+    const { diagnostics: checked } = checkProject(modules, { requireQuery: false, importsByModule });
+    // Tree diagnostics (unresolved imports, cycles, parse errors) are not
+    // produced by the checker, so fold them into the same exact-deduped list.
+    const merged = mergeDiagnostics(modules, diagnostics, checked);
 
     for (const diagnostic of merged) acceptFolded(diagnostic, 'error', model, modules, accept);
     for (const warning of warnings) acceptFolded(warning, 'warning', model, modules, accept);

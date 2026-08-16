@@ -3046,6 +3046,15 @@ export interface ProjectAnalysisOptions {
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
 }
 
+/** The prelude environment shared by `analyzeProject` and `checkProject`. */
+export function createPreludeEnv(): Map<string, Value> {
+    const env = new Map<string, Value>();
+    for (const [name, factory] of Object.entries(BUILTINS)) {
+        env.set(name, factory());
+    }
+    return env;
+}
+
 /**
  * Evaluate a project: the modules in import order (imports first, the root
  * module last). Each module is evaluated in its OWN scope — the prelude, its
@@ -3069,10 +3078,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         // Each module gets its OWN immutable scope: prelude, imports, then
         // local bindings. The environment is threaded through the binding
         // fold; nothing is reassigned on a shared context object.
-        let env = new Map<string, Value>();
-        for (const [name, factory] of Object.entries(BUILTINS)) {
-            env.set(name, factory());
-        }
+        let env = createPreludeEnv();
         const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
         const moduleDiagnostics: Diagnostic[] = [];
 
@@ -3154,14 +3160,14 @@ export function analyze(model: Model): AnalysisResult {
     return analyzeProject([{ model, uri: undefined, imports: [] }], { importsByModule: new Map() });
 }
 
-interface BindingResult {
+export interface BindingResult {
     value: Value;
     env: Map<string, Value>;
     seen: Set<string>;
     diagnostics: Diagnostic[];
 }
 
-function checkBinding(binding: Binding, env: Map<string, Value>, moduleBindings: ReadonlySet<string>, seen: ReadonlySet<string>): BindingResult {
+export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBindings: ReadonlySet<string>, seen: ReadonlySet<string>): BindingResult {
     const diagnostics: Diagnostic[] = [];
     const nextSeen = new Set(seen);
     if (nextSeen.has(binding.name)) {

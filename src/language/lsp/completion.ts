@@ -22,7 +22,7 @@ import {
 } from 'vscode-languageserver';
 import type { TetaueServices } from '../tetaue-module.js';
 import { BUILTINS } from '../interpreter.js';
-import { inferProject } from '../inference.js';
+import { checkProject } from '../checker.js';
 import { projectTreeFor } from '../compile.js';
 import { isAccessExpression, isApplication, isIdentifier } from '../generated/ast.js';
 import type { Model } from '../generated/ast.js';
@@ -156,7 +156,7 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
             return CompletionList.create(items, false);
         }
 
-        const inferred = inferProject(modules, importsByModule);
+        const inferred = checkProject(modules, { requireQuery: false, importsByModule });
         let typed: AstNode | undefined = receiver;
         while (typed && !inferred.nodeTypes.has(typed)) typed = typed.$container;
         if (!typed) return undefined;

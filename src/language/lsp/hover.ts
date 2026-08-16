@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs';
 import type { HoverProvider } from 'langium/lsp';
 import { Hover, HoverParams, MarkupKind } from 'vscode-languageserver';
 import type { TetaueServices } from '../tetaue-module.js';
-import { inferProject } from '../inference.js';
+import { checkProject } from '../checker.js';
 import { projectTreeFor } from '../compile.js';
 import { moduleOf } from '../imports.js';
 import type { ProjectModule } from '../imports.js';
@@ -31,7 +31,7 @@ export class TetaueHoverProvider implements HoverProvider {
         if (!node) return undefined;
 
         const { modules, importsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
-        const result = inferProject(modules, importsByModule);
+        const result = checkProject(modules, { requireQuery: false, importsByModule });
 
         // Walk up to the nearest node with a recorded type (leaf terminals
         // belong to their owning AST node, which is already recorded).

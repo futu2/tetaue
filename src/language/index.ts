@@ -12,5 +12,7 @@ export type {
 } from './interpreter.js';
 export { collectModuleTree, moduleOf } from './imports.js';
 export type { ProjectModule, ModuleTree, ModuleTreeOptions, ResolvedImportEdge } from './imports.js';
+export { checkProject } from './checker.js';
+export type { CheckProjectOptions, CheckProjectResult } from './checker.js';
 export { renderQuery, renderQueryWithCtes, DIALECTS, isDialect } from './render.js';
 export type { DialectSpec, RenderFormat, RenderResult, RenderDiagnostic } from './render.js';
