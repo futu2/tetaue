@@ -27,3 +27,11 @@ export function parseStringLiteral(raw: string): string {
     }
     return out;
 }
+
+/**
+ * Decode a grammar label token that may be either a plain identifier or a
+ * STRING literal (`"weird name"`). Plain identifiers pass through unchanged.
+ */
+export function labelName(raw: string): string {
+    return raw.startsWith('"') ? parseStringLiteral(raw) : raw;
+}

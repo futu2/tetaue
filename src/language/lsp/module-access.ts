@@ -9,6 +9,7 @@
 import { isApplication, isIdentifier } from '../generated/ast.js';
 import type { AccessExpression, Binding } from '../generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from '../imports.js';
+import { labelName } from '../strings.js';
 
 /** The namespace alias the access receiver names, or undefined. */
 export function moduleQualifiedReceiver(e: AccessExpression): string | undefined {
@@ -28,6 +29,7 @@ export function moduleQualifiedBinding(e: AccessExpression, modules: readonly Pr
     if (!edge) return undefined;
     // Selective imports may rename: `import "x" as t (users as u)` exposes
     // `t.u` for exported binding `users`.
-    const selected = edge.importNode.names.find(item => (item.renamed ?? item.name) === e.property);
-    return edge.target.model.bindings.find(b => b.name === (selected?.name ?? e.property));
+    const property = labelName(e.property);
+    const selected = edge.importNode.names.find(item => (item.renamed ?? item.name) === property);
+    return edge.target.model.bindings.find(b => b.name === (selected?.name ?? property));
 }

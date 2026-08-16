@@ -20,7 +20,7 @@ import {
 } from './generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
-import { parseStringLiteral } from './strings.js';
+import { labelName, parseStringLiteral } from './strings.js';
 export { parseStringLiteral };
 import { CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
 
@@ -28,7 +28,7 @@ import { CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
 // SQL model
 // ---------------------------------------------------------------------------
 
-export type SqlType = 'int' | 'float' | 'string' | 'bool' | 'date' | 'timestamp' | 'array' | 'unknown';
+export type SqlType = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' | 'timestamp' | 'array' | 'unknown';
 export type TypeOrNull = SqlType | 'null';
 
 export interface SqlColumn {
@@ -44,7 +44,7 @@ export interface SqlColumn {
 }
 export type Schema = ReadonlyMap<string, SqlColumn>;
 
-export type SqlNode =
+export type SqlNodeBase =
     | { readonly kind: 'col'; readonly name: string; readonly table: string | null; readonly type: SqlType }
     | { readonly kind: 'lit'; readonly value: number | string | boolean | null; readonly type: TypeOrNull }
     | { readonly kind: 'bin'; readonly op: string; readonly left: SqlNode; readonly right: SqlNode; readonly type: SqlType }
@@ -66,6 +66,12 @@ export type SqlNode =
     | { readonly kind: 'window'; readonly fn: SqlNode; readonly partition: readonly SqlNode[]; readonly order: readonly { node: SqlNode; dir: 'ASC' | 'DESC' }[]; readonly frame: { start: number; end: number } | null; readonly type: SqlType }
     | { readonly kind: 'case'; readonly branches: readonly { cond: SqlNode; value: SqlNode }[]; readonly elseValue: SqlNode | null; readonly type: SqlType };
 
+/**
+ * Every SQL expression node optionally remembers the source AST node that
+ * produced it, so render-time capability errors can be positioned precisely.
+ */
+export type SqlNode = SqlNodeBase & { readonly ast?: AstNode };
+
 export interface RowNode {
     readonly fields: readonly { key: string; node: SqlNode }[];
 }
@@ -74,14 +80,14 @@ export type JoinKind = 'inner' | 'left' | 'right' | 'full';
 export type SetOp = 'UNION' | 'UNION ALL' | 'INTERSECT' | 'EXCEPT';
 
 export type QueryStep =
-    | { readonly kind: 'filter'; readonly cond: SqlNode; readonly having: boolean }
-    | { readonly kind: 'map'; readonly proj: RowNode }
-    | { readonly kind: 'sort'; readonly items: readonly { node: SqlNode; dir: 'ASC' | 'DESC' }[] }
-    | { readonly kind: 'take'; readonly n: number }
-    | { readonly kind: 'drop'; readonly n: number }
-    | { readonly kind: 'fold'; readonly proj: RowNode }
-    | { readonly kind: 'join'; readonly joinKind: JoinKind; readonly right: Query; readonly on: SqlNode; readonly proj: RowNode; readonly lateral?: boolean }
-    | { readonly kind: 'set'; readonly op: SetOp; readonly right: Query };
+    | { readonly kind: 'filter'; readonly cond: SqlNode; readonly having: boolean; readonly ast?: AstNode }
+    | { readonly kind: 'map'; readonly proj: RowNode; readonly ast?: AstNode }
+    | { readonly kind: 'sort'; readonly items: readonly { node: SqlNode; dir: 'ASC' | 'DESC' }[]; readonly ast?: AstNode }
+    | { readonly kind: 'take'; readonly n: number; readonly ast?: AstNode }
+    | { readonly kind: 'drop'; readonly n: number; readonly ast?: AstNode }
+    | { readonly kind: 'fold'; readonly proj: RowNode; readonly ast?: AstNode }
+    | { readonly kind: 'join'; readonly joinKind: JoinKind; readonly right: Query; readonly on: SqlNode; readonly proj: RowNode; readonly lateral?: boolean; readonly ast?: AstNode }
+    | { readonly kind: 'set'; readonly op: SetOp; readonly right: Query; readonly ast?: AstNode };
 
 export interface Query {
     /**
@@ -194,7 +200,7 @@ export function isError(v: Value): v is { kind: 'error'; ast?: AstNode } {
 // ---------------------------------------------------------------------------
 
 const TYPE_NAMES: Record<TypeOrNull, string> = {
-    int: 'int', float: 'float', string: 'string', bool: 'bool',
+    int: 'int', float: 'float', decimal: 'decimal', string: 'string', bool: 'bool',
     date: 'date', timestamp: 'timestamp', array: 'array', null: 'null', unknown: 'unknown',
 };
 
@@ -203,7 +209,7 @@ export function typeName(t: TypeOrNull): string {
 }
 
 export function isNumeric(t: TypeOrNull): boolean {
-    return t === 'int' || t === 'float';
+    return t === 'int' || t === 'float' || t === 'decimal';
 }
 
 export function comparable(a: TypeOrNull, b: TypeOrNull): boolean {
@@ -237,7 +243,8 @@ export function exprNode(v: Value): SqlNode | null {
 }
 
 function mkExpr(node: SqlNode, ast?: AstNode): Value {
-    return { kind: 'expr', node, ast };
+    const tagged: SqlNode = ast ? { ...node, ast } : node;
+    return { kind: 'expr', node: tagged, ast };
 }
 
 /** A literal is `float` iff its source text contains '.', so `100.0` is float. */
@@ -370,12 +377,13 @@ export function querySchema(q: Query): Schema {
     return schema;
 }
 
-function addStep(q: Query, step: QueryStep): Query {
+function addStep(q: Query, step: QueryStep, at?: AstNode): Query {
     // A projection (map/fold/join-merger) defines the complete schema;
     // other steps preserve it.
     let known = q.known;
     if (step.kind === 'map' || step.kind === 'fold' || step.kind === 'join') known = true;
-    return { ...q, known, steps: [...q.steps, step] };
+    const tagged = at ? { ...step, ast: at } : step;
+    return { ...q, known, steps: [...q.steps, tagged] };
 }
 
 function hasFoldStep(q: Query): boolean {
@@ -707,7 +715,7 @@ function mapStepFromTransformer(q: Query, f: Value, at: AstNode | undefined, ctx
     // Window-only functions (row_number, rank, lag, ...) are invalid outside
     // `over (...)` — catch them here so they never render broken SQL.
     if (validateWindowUses(proj.fields, at ?? f.ast, ctx)) return null;
-    return addStep(q, { kind: 'map', proj });
+    return addStep(q, { kind: 'map', proj }, at);
 }
 
 function fallbackNode(ctx: Ctx): AstNode {
@@ -888,7 +896,12 @@ export function evalExprWith(e: Expr, ctx: Ctx): Value {
         env.set(e.name ?? '', v);
         return evalExprWith(e.body as Expr, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings, typeAliases: ctx.typeAliases, typeNamespaces: ctx.typeNamespaces });
     }
-    if (isAscription(e)) return evalExprWith(e.operand!, ctx); // type annotations are erased
+    if (isAscription(e)) {
+        // Type annotations are erased except for query schemas on plain
+        // tables, where the annotation IS the schema.
+        const v = evalExprWith(e.operand!, ctx);
+        return stampQueryTypeAnnotation(v, e.type, e, ctx);
+    }
     if (isUnaryMinus(e)) return evalUnary(e, ctx);
     if (isBinaryExpression(e) || isLambdaBinaryExpression(e)) {
         // (LambdaBinaryExpression is the `&`/`$`-free chain used for lambda
@@ -921,7 +934,7 @@ export function evalExprWith(e: Expr, ctx: Ctx): Value {
     if (isAccessExpression(e)) {
         const recv = evalExprWith(e.receiver, ctx);
         if (isError(recv)) return ERROR;
-        return access(recv, e.property, e, ctx);
+        return access(recv, labelName(e.property), e, ctx);
     }
     if (isApplication(e)) {
         // All builtins are ordinary curried functions — including the
@@ -979,10 +992,11 @@ export function evalExprWith(e: Expr, ctx: Ctx): Value {
         }
         const literalKeys = new Set<string>();
         for (const entry of e.entries) {
-            if (literalKeys.has(entry.key)) {
-                ctx.diagnostics.push({ node: entry, message: `duplicate map key '${entry.key}'` });
+            const key = labelName(entry.key);
+            if (literalKeys.has(key)) {
+                ctx.diagnostics.push({ node: entry, message: `duplicate map key '${key}'` });
             }
-            literalKeys.add(entry.key);
+            literalKeys.add(key);
             let entryValue: Value;
             if (entry.value) {
                 entryValue = evalExprWith(entry.value, ctx);
@@ -990,18 +1004,18 @@ export function evalExprWith(e: Expr, ctx: Ctx): Value {
                 // Field punning: `{ id }` is `{ id = <lambda param>.id }`.
                 const paramName = enclosingLambdaParamName(entry);
                 if (paramName === null) {
-                    ctx.diagnostics.push({ node: entry, message: `field pun '${entry.key}' requires an enclosing lambda parameter, e.g. map (u => { ${entry.key} })` });
+                    ctx.diagnostics.push({ node: entry, message: `field pun '${key}' requires an enclosing lambda parameter, e.g. map (u => { ${key} })` });
                     return ERROR;
                 }
                 const rec = ctx.env.get(paramName);
                 if (!rec || rec.kind !== 'record') {
-                    ctx.diagnostics.push({ node: entry, message: `field pun '${entry.key}' expects lambda parameter '${paramName}' to be a record` });
+                    ctx.diagnostics.push({ node: entry, message: `field pun '${key}' expects lambda parameter '${paramName}' to be a record` });
                     return ERROR;
                 }
-                entryValue = readField(entry.key, rec, entry, ctx);
+                entryValue = readField(key, rec, entry, ctx);
                 if (isError(entryValue)) return ERROR;
             }
-            fields = [...fields.filter(f => f.key !== entry.key), { key: entry.key, value: entryValue }];
+            fields = [...fields.filter(f => f.key !== key), { key, value: entryValue }];
         }
         return recordValue(fields, e);
     }
@@ -1179,7 +1193,7 @@ function setOpBuiltin(name: string, op: SetOp): () => Value {
             // derived table via prepareQueryForStep/hasSetStep.
             const left = prepareQueryForStep(q, name);
             const rightQuery = prepareQueryForStep(right.query, name);
-            return addStep(left, { kind: 'set', op, right: rightQuery });
+            return addStep(left, { kind: 'set', op, right: rightQuery }, at2);
         });
     });
 }
@@ -1198,8 +1212,8 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     // --- query roots -----------------------------------------------------
     param: () => fn('param', (arg, at, ctx) => {
         const name = stringValue(arg);
-        if (name === null) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `param expects a parameter name string, e.g. param "user_id"` });
+        if (name === null || name.trim().length === 0) {
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `param expects a non-empty parameter name string, e.g. param "user_id"` });
             return ERROR;
         }
         return mkExpr({ kind: 'param', name, type: 'unknown' }, at);
@@ -1212,6 +1226,10 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         const name = stringValue(arg1);
         if (name === null) {
             ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `table expects a table name string, e.g. table "users"` });
+            return ERROR;
+        }
+        if (name.trim().length === 0) {
+            ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `table expects a non-empty table name string, e.g. table "users"` });
             return ERROR;
         }
         // A schema-qualified table name (`ecs.dcm_ecs_c_ecis_m_tb1150_sf_f`)
@@ -1265,7 +1283,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             }
             const proj = rowFromRecord(recordValue(fields, at2), at2, ctx2, 'select');
             if (!proj) return null;
-            return addStep(q, { kind: 'map', proj });
+            return addStep(q, { kind: 'map', proj }, at2);
         });
     }),
 
@@ -1293,7 +1311,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             // A query has one observable ORDER BY: applying sort again replaces
             // the previous sort (earlier sorts are unordered relational steps).
             const withoutSorts = { ...q, steps: q.steps.filter(s => s.kind !== 'sort') };
-            return addStep(withoutSorts, { kind: 'sort', items });
+            return addStep(withoutSorts, { kind: 'sort', items }, at2);
         });
     }),
 
@@ -1303,7 +1321,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             ctx.diagnostics.push({ node: at ?? arg.ast, message: `take expects a non-negative integer literal, got ${n === null ? describe(arg) : String(n)}` });
             return ERROR;
         }
-        return step('take', (q) => {
+        return step('take', (q, at2) => {
             // LIMIT n followed by LIMIT m is LIMIT (min n m) in one flat scope.
             if (hasTakeStep(q)) {
                 return {
@@ -1311,7 +1329,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                     steps: q.steps.map(s => s.kind === 'take' ? { ...s, n: Math.min(s.n, n) } : s),
                 };
             }
-            return addStep(q, { kind: 'take', n });
+            return addStep(q, { kind: 'take', n }, at2);
         });
     }),
 
@@ -1321,7 +1339,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             ctx.diagnostics.push({ node: at ?? arg.ast, message: `drop expects a non-negative integer literal, got ${n === null ? describe(arg) : String(n)}` });
             return ERROR;
         }
-        return step('drop', (q) => addStep(q, { kind: 'drop', n }));
+        return step('drop', (q, at2) => addStep(q, { kind: 'drop', n }, at2));
     }),
 
     recursive: () => fn('recursive', (f, at, ctx) => {
@@ -1405,6 +1423,47 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                 return ERROR;
             }
             return mergeValues(l, r, at2, ctx2);
+        });
+    }),
+
+    group_by: () => fn('group_by', (sel, at, ctx) => {
+        if (!isApplicable(sel) || (sel.kind === 'lambda' && sel.params.length !== 1)) {
+            ctx.diagnostics.push({ node: at ?? sel.ast, message: `group_by expects a one-parameter projection lambda, e.g. group_by (o => { id = group o.id })` });
+            return ERROR;
+        }
+        return step('group_by', (q, at2, ctx2) => {
+            // Sorting before grouping has no observable effect; a second
+            // grouping step groups the already-grouped result (derived table).
+            if (!hasTakeStep(q) && !hasWindowProjection(q)) {
+                q = { ...q, steps: q.steps.filter(s => s.kind !== 'sort') };
+            }
+            if (hasFoldStep(q)) q = wrapAsDerived(q);
+            const v = applyWith(sel, rowRecord(q, at2), at2, ctx2);
+            if (v.kind !== 'record') {
+                ctx2.diagnostics.push({ node: at2 ?? sel.ast, message: `group_by expects a projection record, got ${describe(v)}` });
+                return null;
+            }
+            const row: { fields: { key: string; node: SqlNode }[] } = { fields: [] };
+            let groups = 0;
+            for (const { key, value } of v.fields) {
+                const node = exprNode(value);
+                if (!node) {
+                    ctx2.diagnostics.push({ node: value.ast ?? at2, message: `group_by entry '${key}' must be wrapped in group, e.g. group ${key}` });
+                    return null;
+                }
+                if (node.kind !== 'group') {
+                    ctx2.diagnostics.push({ node: value.ast ?? at2, message: `group_by entry '${key}' must be wrapped in group, e.g. group ${key}` });
+                    return null;
+                }
+                groups++;
+                row.fields.push({ key, node });
+            }
+            if (groups === 0) {
+                ctx2.diagnostics.push({ node: sel.ast ?? at2, message: `group_by must contain at least one group entry, e.g. group_by (o => { id = group o.id })` });
+                return null;
+            }
+            // The fold step is the GROUP BY projection; it has no aggregate.
+            return addStep(q, { kind: 'fold', proj: row }, at2);
         });
     }),
 
@@ -1493,7 +1552,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                 ctx2.diagnostics.push({ node: sel.ast ?? at2, message: `fold must contain at least one aggregate (count, sum, ...)` });
                 return null;
             }
-            return addStep(q, { kind: 'fold', proj: row });
+            return addStep(q, { kind: 'fold', proj: row }, at2);
         });
     }),
 
@@ -1556,7 +1615,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                         return null;
                     }
                     const next: Query = { ...q, aliases: [...q.aliases, alias] };
-                    return addStep(next, { kind: 'join', joinKind: 'inner', right: rightQuery, on: onNode, proj, lateral: true });
+                    return addStep(next, { kind: 'join', joinKind: 'inner', right: rightQuery, on: onNode, proj, lateral: true }, at4);
                 });
             });
         });
@@ -1657,7 +1716,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                             return null;
                         }
                         const next: Query = { ...q, aliases: [...q.aliases, alias] };
-                        return addStep(next, { kind: 'join', joinKind, right: rightQuery, on: node, proj });
+                        return addStep(next, { kind: 'join', joinKind, right: rightQuery, on: node, proj }, at5);
                     });
                 });
             });
@@ -1777,6 +1836,33 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         return mkExpr({ kind: 'call', name: 'abs', args: [node], type: node.type as SqlType }, at);
     }),
     coalesce: () => fn('coalesce', (arg1, at1, ctx) => {
+        // Variadic list form: coalesce [a, b, c].
+        if (arg1.kind === 'list') {
+            if (arg1.items.length < 2) {
+                ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `coalesce expects at least two expressions, e.g. coalesce [u.nickname, u.email]` });
+                return ERROR;
+            }
+            const nodes: SqlNode[] = [];
+            let resultType: TypeOrNull = 'null';
+            for (const item of arg1.items) {
+                const node = exprNode(item);
+                if (!node) {
+                    ctx.diagnostics.push({ node: item.ast ?? at1, message: `coalesce list items must be expressions, got ${describe(item)}` });
+                    return ERROR;
+                }
+                if (node.kind === 'agg' || node.kind === 'group' || node.kind === 'order' || node.kind === 'window') {
+                    ctx.diagnostics.push({ node: item.ast ?? at1, message: `coalesce cannot wrap ${kindLabel(node.kind)}` });
+                    return ERROR;
+                }
+                if (resultType === 'null') resultType = node.type;
+                if (node.type !== 'null' && resultType !== 'null' && !comparable(resultType, node.type)) {
+                    ctx.diagnostics.push({ node: item.ast ?? at1, message: `coalesce requires matching types, got ${typeName(resultType)} and ${typeName(node.type)}` });
+                    return ERROR;
+                }
+                nodes.push(node);
+            }
+            return mkExpr({ kind: 'call', name: 'coalesce', args: nodes, type: resultType === 'null' ? 'string' : resultType as SqlType }, at1);
+        }
         const node1 = exprNode(arg1);
         if (!node1) {
             ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `coalesce expects expressions, e.g. coalesce u.nickname u.name` });
@@ -1804,15 +1890,20 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     // --- date & time ---------------------------------------------------
     date: () => fn('date', (arg, at, ctx) => {
         const value = stringValue(arg);
-        if (value === null) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `date expects an ISO date string literal, e.g. date "2024-01-01"` });
+        if (value === null || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `date expects an ISO date string literal (YYYY-MM-DD), e.g. date "2024-01-01"` });
             return ERROR;
         }
         return mkExpr({ kind: 'date-literal', value, type: 'date' }, at);
     }),
     timestamp: () => fn('timestamp', (arg, at, ctx) => {
         const value = stringValue(arg);
-        if (value === null) {
+        // ISO-8601-ish: date + space/T + HH:MM:SS with optional fraction and
+        // timezone. Conservative enough to reject typos while accepting the
+        // dialect TIMESTAMP literal forms.
+        const validTimestamp = value !== null
+            && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/.test(value);
+        if (!validTimestamp) {
             ctx.diagnostics.push({ node: at ?? arg.ast, message: `timestamp expects an ISO timestamp string literal, e.g. timestamp "2024-01-01 12:00:00"` });
             return ERROR;
         }
@@ -1844,7 +1935,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     from_unixtime: unixTimeBuiltin('from_unixtime'),
 
     // --- math -------------------------------------------------------------
-    // add/sub/mul/div are the `+ - * /` operators; mod is the `%` operator.
+    // add/sub/mul/div are the `+ - * /` operators; mod is a curried builtin.
     ceil: numericUnaryBuiltin('ceil'),
     floor: numericUnaryBuiltin('floor'),
     sqrt: numericUnaryBuiltin('sqrt'),
@@ -2195,7 +2286,7 @@ function filterBuiltin(name: string): () => Value {
             // After fold the predicate becomes HAVING, where aggregates are allowed.
             const forbidden: SqlNode['kind'][] = having ? ['order', 'window'] : ['agg', 'group', 'order', 'window'];
             if (forbid(node, forbidden, `the ${name} predicate`, at2 ?? pred.ast, ctx2)) return null;
-            return addStep(q, { kind: 'filter', cond: node, having });
+            return addStep(q, { kind: 'filter', cond: node, having }, at2);
         });
     });
 }
@@ -2914,16 +3005,17 @@ function schemaFromQueryType(t: QueryType, at: AstNode | undefined, ctx: Ctx): S
     const schema = new Map<string, SqlColumn>();
     const seenFields = new Set<string>();
     for (const field of t.fields) {
-        if (seenFields.has(field.key)) {
-            ctx.diagnostics.push({ node: field, message: `duplicate field '${field.key}' in query type` });
+        const key = labelName(field.key);
+        if (seenFields.has(key)) {
+            ctx.diagnostics.push({ node: field, message: `duplicate field '${key}' in query type` });
         }
-        seenFields.add(field.key);
+        seenFields.add(key);
         const type = scalarTypeOf(field.type, ctx.typeAliases, ctx.typeNamespaces);
         if (type === null) {
-            ctx.diagnostics.push({ node: field.type, message: `schema entry '${field.key}' must be a scalar type (int, string, bool, float, date, timestamp) or a list of one, e.g. [string]` });
+            ctx.diagnostics.push({ node: field.type, message: `schema entry '${key}' must be a scalar type (int, string, bool, float, decimal, date, timestamp) or a list of one, e.g. [string]` });
             return null; // leave the table dynamic — no partial schema
         }
-        schema.set(field.key, { type, table: null });
+        schema.set(key, { type, table: null });
     }
     return schema;
 }
@@ -2968,7 +3060,7 @@ function scalarTypeOf(
     }
     if (!isTypeVar(cur)) return null;
     const name = cur.name;
-    if (name === 'int' || name === 'float' || name === 'string' || name === 'bool' || name === 'date' || name === 'timestamp') {
+    if (name === 'int' || name === 'float' || name === 'decimal' || name === 'string' || name === 'bool' || name === 'date' || name === 'timestamp') {
         return name;
     }
     return null;
@@ -3167,6 +3259,43 @@ export interface BindingResult {
     diagnostics: Diagnostic[];
 }
 
+/**
+ * A query-type annotation on a plain table defines the table's schema:
+ *   users: query { id: int } = table "users"
+ *   t = table "users": query { id: int }
+ * The same rule applies to binding annotations and expression ascriptions so
+ * the interpreter IR and the type checker never disagree. Only join-free
+ * queries are stamped — stamping joined columns with the root table would
+ * mis-qualify them. Any other annotation is just a signature.
+ */
+function stampQueryTypeAnnotation(
+    v: Value,
+    typeAst: import('./generated/ast.js').Type | undefined,
+    at: AstNode | undefined,
+    ctx: Ctx,
+): Value {
+    if (v.kind !== 'query' || v.query.known || !typeAst
+        || !v.query.steps.every(step => step.kind !== 'join')) {
+        return v;
+    }
+    const qt = queryTypeOf(typeAst, ctx.typeAliases, ctx.typeNamespaces);
+    if (!qt) return v;
+    const schema = schemaFromQueryType(qt, at, ctx);
+    if (!schema) return v;
+    // Stamp with the root's plain alias (last segment), matching rowRecord,
+    // so column references stay `alias.column`. Build a new map and a new
+    // query value: annotations never mutate an existing query in place.
+    const alias = v.query.aliases[0] ?? v.query.root.name;
+    const stamped: Schema = new Map(
+        [...schema].map(([key, col]) => [key, { ...col, table: alias }]),
+    );
+    return {
+        kind: 'query',
+        query: { ...v.query, known: true, root: { ...v.query.root, schema: stamped } },
+        ast: v.ast,
+    };
+}
+
 export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBindings: ReadonlySet<string>, seen: ReadonlySet<string>): BindingResult {
     const diagnostics: Diagnostic[] = [];
     const nextSeen = new Set(seen);
@@ -3176,32 +3305,7 @@ export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBi
     nextSeen.add(binding.name);
     const ctx: Ctx = { env, diagnostics, moduleBindings: new Set(moduleBindings) };
     let v = evalExprWith(binding.value, ctx);
-    // A query-type binding annotation is the schema of a plain table:
-    //   users: query { id: int, name: string } = table "users"
-    // (Only join-free queries: stamping joined columns with the root table
-    // would mis-qualify them. Any other annotation is just a signature.)
-    if (v.kind === 'query' && !v.query.known && binding.type
-        && v.query.steps.every(step => step.kind !== 'join')) {
-        const qt = queryTypeOf(binding.type, ctx.typeAliases, ctx.typeNamespaces);
-        if (qt) {
-            const schema = schemaFromQueryType(qt, binding, ctx);
-            if (schema) {
-                // Stamp with the root's plain alias (last segment), matching
-                // rowRecord, so column references stay `alias.column`. Build a
-                // new map and a new query value: annotations never mutate an
-                // existing query in place.
-                const alias = v.query.aliases[0] ?? v.query.root.name;
-                const stamped: Schema = new Map(
-                    [...schema].map(([key, col]) => [key, { ...col, table: alias }]),
-                );
-                v = {
-                    kind: 'query',
-                    query: { ...v.query, known: true, root: { ...v.query.root, schema: stamped } },
-                    ast: v.ast,
-                };
-            }
-        }
-    }
+    v = stampQueryTypeAnnotation(v, binding.type, binding, ctx);
     // Remember the binding name on query values so generated SQL aliases
     // (derived tables, joined subqueries) can reuse it instead of inventing
     // names like `folded` — the SQL then reads like the source. Copy the

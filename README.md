@@ -59,6 +59,7 @@ bun run src/cli.ts render examples/report.tetaue --dialect sqlite
 
 ```
 tetaue render <file.tetaue> [--dialect sqlite|postgresql|mysql|trino|hive] [--format pretty|compact]
+             [--cte] [--json] [--binding <name>]
 tetaue check <file.tetaue>
 tetaue types <file.tetaue>
 tetaue parse <file.tetaue>
@@ -71,7 +72,9 @@ tetaue lsp [--stdio | --node-ipc | --socket=<port> | --pipe=<name>]
 ```
 
 - `render` validates the module (and its imports) and prints the rendered SQL.
-  `--cte` emits named intermediate queries as `WITH ... AS` clauses.
+  `--cte` emits named intermediate queries as `WITH ... AS` clauses; `--json`
+  prints `{ sql, parameters }`; `--binding <name>` renders a named root binding
+  instead of the last one.
 - `check` prints diagnostics (or `OK`). `types` prints the inferred type
   of every binding. `parse` dumps the AST as JSON.
 - `format` (alias `fmt`) runs the same token-stream formatter the editor uses:
@@ -387,7 +390,7 @@ u & filter ...        # pipeline: apply the step to the query
 
 ### Types
 
-`int`, `float`, `string`, `bool`, `date`, `timestamp` — used in table schemas
+`int`, `float`, `decimal`, `string`, `bool`, `date`, `timestamp` — used in table schemas
 and checked statically against every operation. `(maybe T)` is Haskell-style
 Maybe ("a `T` or SQL NULL") — write `email: (maybe string)` for a nullable
 column. There is **no implicit `T` -> `(maybe T)` conversion**: `null` has
@@ -480,6 +483,7 @@ are static errors, not runtime surprises:
 | `drop n` | OFFSET | `LIMIT n OFFSET n` / dialect-specific |
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
 | `fold (o => { k = group o.k, s = sum o.v })` | aggregation | `SELECT ... GROUP BY ...` |
+| `group_by (o => { k = group o.k })` | grouping without aggregates | `SELECT ... GROUP BY ...` |
 | `join inner table ($1.id == $2.user_id) { uid = $1.id }` | join | `... JOIN ... ON ...` |
 | `join_lateral (l => right) (l => r => on) (l => r => row)` | lateral join | `INNER JOIN LATERAL (...) ON ...` (PG/MySQL) |
 | `recursive (self => termQuery)` | fixed point | `WITH RECURSIVE ... UNION ALL ...` |
@@ -524,6 +528,7 @@ param "user_id"                # SQL bind parameter
 upper u.name  lower u.name     # UPPER / LOWER
 length u.name                  # LENGTH
 coalesce u.nickname u.email    # COALESCE
+coalesce [u.nickname, u.email, just "?"]  # variadic list form
 abs u.balance                  # ABS
 count o.id  sum o.total  avg o.total  min o.x  max o.x   # aggregates (in fold)
 sum_where cond o.total  count_where cond o.id              # filtered aggregates
@@ -565,7 +570,7 @@ over (sum u.salary) { partition = [u.dept] }        # windowed aggregates
 ```
 
 Operator precedence (tightest first): `>>> <<<` (function composition,
-PureScript-style) → `* / %` → `+ - <>` (`<>` is the record-merge monoid) →
+PureScript-style) → `* /` → `+ - <>` (`<>` is the record-merge monoid) →
 `== != < <= > >=` → `&&` → `||` → `&`
 (pipeline: `a & f` ⇔ `f a`) → `$` (application: `f $ a` ⇔ `f a`, right-assoc).
 Application binds tightest: `upper u.name` is `upper (u.name)`.
@@ -628,7 +633,7 @@ identifier quoting, boolean literals, and string-literal escaping resolve at ren
 so one query can target any dialect. Capability gaps are render errors, never
 silently invalid SQL: SQLite `greatest`/`least` lower to scalar `MAX`/`MIN`,
 PostgreSQL `regex_like` uses the `~` operator, and two-argument `lpad`/`rpad`
-get an explicit space pad.
+get an explicit space pad. Hive supports `UNION`/`UNION ALL` only — `intersect` and `except` are render errors.
 
 ## VS Code extension
 

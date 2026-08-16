@@ -4,7 +4,7 @@
  * Dialects are capability-driven (like teta's backend): identifier quoting,
  * boolean literals and function-name mappings are resolved at render time.
  ******************************************************************************/
-import { querySchema, type JoinKind, type Query, type SqlNode } from './interpreter.js';
+import { querySchema, type JoinKind, type Query, type SetOp, type SqlNode } from './interpreter.js';
 import type { BuiltinName } from './builtin.js';
 
 export interface DialectSpec {
@@ -22,6 +22,8 @@ export interface DialectSpec {
     functions: Partial<Record<BuiltinName, string>>;
     /** Join kinds the dialect can render natively (default: all four). */
     joinKinds?: readonly JoinKind[];
+    /** Set operations the dialect can render natively (default: all four). */
+    setOps?: readonly SetOp[];
     /**
      * How to render OFFSET without LIMIT: 'standard' (OFFSET n alone),
      * 'mysql' (enormous LIMIT), 'sqlite' (LIMIT -1 OFFSET n), or
@@ -147,6 +149,8 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         offset: 'none',
         recursive: false,
         lateral: false,
+        // Hive supports UNION [ALL], but not INTERSECT/EXCEPT.
+        setOps: ['UNION', 'UNION ALL'],
         quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteBacktickQuoted),
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteMysql,
@@ -262,7 +266,7 @@ const PREC: Record<string, number> = {
     '&&': 2, AND: 2,
     '=': 3, '!=': 3, '<': 3, '<=': 3, '>': 3, '>=': 3,
     '+': 4, '-': 4,
-    '*': 5, '/': 5, '%': 5,
+    '*': 5, '/': 5,
     IN: 6, NOT: 6, 'IS NULL': 6,
     CALL: 7, ATOM: 8,
 };
@@ -580,6 +584,7 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
 function sqlTypeName(t: string, d: string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
     switch (t) {
         case 'int': return d === 'hive' ? 'INT' : d === 'mysql' ? 'SIGNED' : 'INTEGER';
+        case 'decimal': return d === 'postgresql' ? 'NUMERIC' : 'DECIMAL';
         case 'float': return d === 'sqlite' ? 'REAL' : d === 'postgresql' ? 'DOUBLE PRECISION' : 'DOUBLE';
         case 'string': return d === 'mysql' ? 'CHAR' : d === 'hive' ? 'STRING' : d === 'sqlite' ? 'TEXT' : 'VARCHAR';
         case 'bool':
@@ -799,6 +804,13 @@ function renderSetQuery(q: Query, dialect: DialectSpec, format: RenderFormat, di
     if (step.kind !== 'set') {
         diagnostics.push({ message: 'internal: set step expected', node: step });
         return 'SELECT * FROM (SELECT NULL) AS "render_error"';
+    }
+    if (dialect.setOps && !dialect.setOps.includes(step.op)) {
+        diagnostics.push({
+            message: `${step.op} is not supported for the ${dialect.name} dialect`,
+            node: step,
+        });
+        return 'SELECT NULL';
     }
     const left: Query = { ...q, steps: q.steps.slice(0, index) };
     const right = step.right;

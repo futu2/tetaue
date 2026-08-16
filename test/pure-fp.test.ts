@@ -139,3 +139,22 @@ describe('record update sugar', () => {
         expect(messages).toEqual(["record update expects a record before '|', got type int"]);
     });
 });
+
+describe('set-operation capabilities', () => {
+    test('hive rejects INTERSECT and EXCEPT', () => {
+        const model = parseModel(`${USERS_A}\n${USERS_B}\nq = a & except b`);
+        const { value } = analyze(model);
+        expect(value.kind).toBe('query');
+        if (value.kind !== 'query') return;
+        const result = renderQuery(value.query, DIALECTS.hive!);
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+            expect(result.diagnostics.map(d => d.message).join('\n')).toContain('EXCEPT is not supported for the hive dialect');
+        }
+    });
+
+    test('hive still supports UNION and UNION ALL', () => {
+        expect(render(`${USERS_A}\n${USERS_B}\nq = a & union b`, 'hive')).toContain('UNION');
+        expect(render(`${USERS_A}\n${USERS_B}\nq = a & union_all b`, 'hive')).toContain('UNION ALL');
+    });
+});

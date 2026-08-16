@@ -22,7 +22,6 @@ export type TetaueTerminalNames = keyof typeof TetaueTerminals;
 export type TetaueKeywordNames =
     | "!="
     | "$"
-    | "%"
     | "&"
     | "&&"
     | "("
@@ -333,7 +332,7 @@ export interface LambdaBinaryExpression extends langium.AstNode {
     readonly $container: Lambda | LambdaLetExpression;
     readonly $type: 'LambdaBinaryExpression';
     left: UnaryExpression;
-    operator: '!=' | '%' | '&&' | '*' | '+' | '-' | '/' | '<' | '<<<' | '<=' | '<>' | '==' | '>' | '>=' | '>>>' | '||';
+    operator: '!=' | '&&' | '*' | '+' | '-' | '/' | '<' | '<<<' | '<=' | '<>' | '==' | '>' | '>=' | '>>>' | '||';
     right: UnaryExpression;
 }
 

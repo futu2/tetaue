@@ -16,12 +16,12 @@
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import * as path from 'node:path';
-import { URI } from 'langium';
+import { URI, type AstNode } from 'langium';
 import type { TetaueServices } from './tetaue-module.js';
 import type { Diagnostic } from './interpreter.js';
 import { checkProject } from './checker.js';
 import { renderQuery, renderQueryWithCtes, DIALECTS, isDialect } from './render.js';
-import type { RenderFormat } from './render.js';
+import type { RenderDiagnostic, RenderFormat } from './render.js';
 import { collectModuleTree, moduleOf } from './imports.js';
 import type { ResolvedImportEdge } from './imports.js';
 import type { ProjectModule } from './imports.js';
@@ -38,7 +38,13 @@ export interface CompileDiagnostic {
 }
 
 export type CompileOutcome =
-    | { ok: true; sql: string; warnings?: CompileDiagnostic[] }
+    | {
+        ok: true;
+        sql: string;
+        /** Named query parameters in the order they were encountered. */
+        parameters: string[];
+        warnings?: CompileDiagnostic[];
+    }
     | { ok: false; diagnostics: CompileDiagnostic[] };
 
 export interface CompileOptions {
@@ -52,6 +58,8 @@ export interface CompileOptions {
      * are reported as "no query" rather than as errors.
      */
     requireQuery?: boolean;
+    /** Render this named root-module binding instead of the last one. */
+    binding?: string;
 }
 
 /** Parse text into a Model, throwing with a message on lexer/parser errors. */
@@ -145,6 +153,24 @@ function diagnostic(d: { node?: { $cstNode?: { range: { start: { line: number; c
 }
 
 /**
+ * Render-time diagnostics carry the SQL IR node that failed; every SqlNode
+ * and QueryStep remembers the source AST node that produced it, so capability
+ * errors can be anchored to the offending expression instead of the file
+ * start.
+ */
+function renderDiagnostic(d: RenderDiagnostic, rootUri: string, modules: readonly ProjectModule[], main: ProjectModule): CompileDiagnostic {
+    const ast = (d.node as { ast?: AstNode } | undefined)?.ast;
+    const owner = ast ? (moduleOf(ast, modules) ?? main) : main;
+    const pos = ast?.$cstNode?.range.start;
+    return {
+        uri: owner.uri ?? rootUri,
+        message: d.message,
+        line: pos?.line ?? 0,
+        character: pos?.character ?? 0,
+    };
+}
+
+/**
  * Compile a module's source text to SQL.
  *
  * On success returns `{ ok: true, sql }`. On failure returns `{ ok: false,
@@ -158,7 +184,7 @@ export function compileModuleText(
     services: TetaueServices,
     options?: CompileOptions,
 ): CompileOutcome {
-    const { dialect = 'sqlite', format = 'pretty', requireQuery = true, cte = false } = options ?? {};
+    const { dialect = 'sqlite', format = 'pretty', requireQuery = true, cte = false, binding } = options ?? {};
     if (!isDialect(dialect)) {
         return {
             ok: false,
@@ -182,7 +208,7 @@ export function compileModuleText(
     }
 
     const { modules, importsByModule, diagnostics: treeDiagnostics, warnings: treeWarnings } = projectTreeFor(main, services);
-    const { value, diagnostics: merged } = checkProject(modules, { requireQuery, importsByModule });
+    const { value, diagnostics: merged } = checkProject(modules, { requireQuery, importsByModule, entryBinding: binding });
 
     const all: CompileDiagnostic[] = [];
     for (const d of [...treeDiagnostics, ...merged]) {
@@ -202,13 +228,8 @@ export function compileModuleText(
     if (!rendered.ok) {
         return {
             ok: false,
-            diagnostics: rendered.diagnostics.map(d => ({
-                uri: rootUri,
-                line: 0,
-                character: 0,
-                message: d.message,
-            })),
+            diagnostics: rendered.diagnostics.map(d => renderDiagnostic(d, rootUri, modules, main)),
         };
     }
-    return { ok: true, sql: rendered.sql, warnings: warningList };
+    return { ok: true, sql: rendered.sql, parameters: rendered.parameters, warnings: warningList };
 }

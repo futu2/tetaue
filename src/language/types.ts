@@ -16,7 +16,7 @@
  * See docs/design/type-system.md for the full specification.
  ******************************************************************************/
 
-export type PrimName = 'int' | 'float' | 'string' | 'bool' | 'date' | 'timestamp';
+export type PrimName = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' | 'timestamp';
 
 export type Type =
     | { kind: 'var'; id: number }
@@ -65,6 +65,7 @@ export interface VarInfo {
      * binding shares one unsolved metavariable until unification fills it.
      */
     hole: boolean;
+    absorbAsMaybe?: boolean;
 }
 
 export interface Scheme {
@@ -85,7 +86,7 @@ export class UnifyError extends Error {
 }
 
 const PRIM_NAMES: Record<PrimName, string> = {
-    int: 'int', float: 'float', string: 'string', bool: 'bool',
+    int: 'int', float: 'float', decimal: 'decimal', string: 'string', bool: 'bool',
     date: 'date', timestamp: 'timestamp',
 };
 
@@ -152,14 +153,14 @@ export class TypeUniverse {
 
     fresh(kind: 'flex' | 'type' | 'row' = 'flex', name: string | null = null): Type {
         const id = this.nextId++;
-        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name, hole: false });
+        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name, hole: false, absorbAsMaybe: false });
         return { kind: 'var', id };
     }
 
     /** Create a hole (`?name`): flexible, named, and never generalized. */
     freshHole(kind: 'flex' | 'type' | 'row' = 'flex', name: string): Type {
         const id = this.nextId++;
-        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name, hole: true });
+        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name, hole: true, absorbAsMaybe: false });
         return { kind: 'var', id };
     }
 
@@ -174,6 +175,13 @@ export class TypeUniverse {
         const info = this.infos.get(id);
         if (!info) throw new Error(`unknown type variable ${id}`);
         this.infos = new Map(this.infos).set(id, { ...info, rigid });
+    }
+
+    /** Mark a row-tail variable so fields absorbed later become maybe. */
+    setVarAbsorbAsMaybe(id: number, absorbAsMaybe: boolean): void {
+        const info = this.infos.get(id);
+        if (!info) throw new Error(`unknown type variable ${id}`);
+        this.infos = new Map(this.infos).set(id, { ...info, absorbAsMaybe });
     }
 
     /** Follow variable bindings to the root type. */
@@ -248,7 +256,7 @@ export class TypeUniverse {
                 throw new UnifyError({ kind: 'var', id: varId }, t);
             }
             if (thisKind === 'row') {
-                this.infos = new Map(this.infos).set(r.id, { ...other, kind: 'row' });
+                this.infos = new Map(this.infos).set(r.id, { ...other, kind: 'row', absorbAsMaybe: info.absorbAsMaybe || other.absorbAsMaybe });
             } else if (other.kind === 'row') {
                 thisKind = 'row';
             }
@@ -423,8 +431,11 @@ export class TypeUniverse {
         if (t.kind !== 'var') {
             throw new UnifyError(rowOf([...row.fields]), rowOf([[label, type]]));
         }
+        const absorbAsMaybe = this.varInfo(t.id).absorbAsMaybe === true;
+        const storedType = absorbAsMaybe && type.kind !== 'maybe' ? maybeOf(type) : type;
         const fresh = this.fresh('row');
-        this.bind(t.id, { kind: 'row', fields: new Map([[label, type]]), tail: fresh });
+        if (absorbAsMaybe && fresh.kind === 'var') this.setVarAbsorbAsMaybe(fresh.id, true);
+        this.bind(t.id, { kind: 'row', fields: new Map([[label, storedType]]), tail: fresh });
     }
 
     /** Unify two rows (or row variables). Shared labels unify; extras move into open tails. */

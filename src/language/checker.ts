@@ -47,6 +47,8 @@ export interface CheckProjectOptions {
     requireQuery?: boolean;
     /** Resolved import edges from `collectModuleTree` (pure tree). */
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    /** Render this root-module binding instead of the last one. */
+    entryBinding?: string;
 }
 
 /**
@@ -57,7 +59,7 @@ export function checkProject(
     modules: readonly ProjectModule[],
     options: CheckProjectOptions = {},
 ): CheckProjectResult {
-    const { requireQuery = true, importsByModule = new Map() } = options;
+    const { requireQuery = true, importsByModule = new Map(), entryBinding } = options;
 
     const inferencer = new Inferencer();
     inferencer.prelude();
@@ -69,6 +71,8 @@ export function checkProject(
     const typeExportsByModule = new Map<ProjectModule, Map<string, import('./generated/ast.js').Type>>();
 
     const interpreterDiagnostics: Diagnostic[] = [];
+    const root = modules[modules.length - 1];
+    let rootEnv: Map<string, Value> | undefined;
     let value: Value = ERROR;
 
     for (const module of modules) {
@@ -139,25 +143,35 @@ export function checkProject(
             module.model.types.filter(a => a.export).map(a => [a.name, a.type]),
         ));
 
+        if (module === root) rootEnv = env;
         interpreterDiagnostics.push(...moduleDiagnostics);
     }
 
     inferencer.flushDeferred();
 
-    // Same query requirement as analyzeProject, worded identically.
-    const root = modules[modules.length - 1];
+    // Query requirement. Default: the last binding, as before. With
+    // `entryBinding`, render/check target any named root-module binding.
+    const selectedBinding = entryBinding
+        ? root?.model.bindings.find(b => b.name === entryBinding)
+        : root?.model.bindings[root.model.bindings.length - 1];
+    if (entryBinding && rootEnv) {
+        value = rootEnv.get(entryBinding) ?? ERROR;
+    }
     if (requireQuery && root) {
-        const last = root.model.bindings[root.model.bindings.length - 1];
-        if (!last) {
+        if (!selectedBinding) {
             value = ERROR;
             interpreterDiagnostics.push({
                 node: root.model,
-                message: `a module must have at least one binding — its last binding is the module's query`,
+                message: entryBinding
+                    ? `module has no binding named '${entryBinding}'`
+                    : `a module must have at least one binding — its last binding is the module's query`,
             });
         } else if (!(value.kind === 'error') && value.kind !== 'query') {
             interpreterDiagnostics.push({
-                node: last,
-                message: `a module's last binding must be a query (a table or a pipeline), got ${describe(value)}`,
+                node: selectedBinding,
+                message: entryBinding
+                    ? `binding '${entryBinding}' must be a query (a table or a pipeline), got ${describe(value)}`
+                    : `a module's last binding must be a query (a table or a pipeline), got ${describe(value)}`,
             });
         }
     }

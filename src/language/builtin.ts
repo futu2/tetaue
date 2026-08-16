@@ -93,6 +93,7 @@ export const BUILTIN_SPECS = [
     { name: 'select', category: 'query-step', doc: 'select ["id", "name"] — project only the listed columns', scheme: u => poly(u, [rowVar], r => fun(listOf(p('string')), fun(queryOf(r), queryOf(r)))) },
     { name: 'map', category: 'query-step', doc: 'project one record per row (SELECT)', scheme: projectionScheme },
     { name: 'fold', category: 'query-step', doc: 'aggregate rows (SELECT ... GROUP BY ...)', scheme: projectionScheme },
+    { name: 'group_by', category: 'query-step', doc: 'group rows without aggregates (SELECT ... GROUP BY ...)', scheme: projectionScheme },
     { name: 'sort', category: 'query-step', doc: 'ORDER BY — the lambda must return asc/desc items', scheme: u => poly(u, [rowVar, tVar], (r, t) => fun(fun(r, t), fun(queryOf(r), queryOf(r)))) },
     { name: 'take', category: 'query-step', doc: 'LIMIT n', scheme: u => poly(u, [rowVar], r => fun(p('int'), fun(queryOf(r), queryOf(r)))) },
     { name: 'drop', category: 'query-step', doc: 'OFFSET n — skip the first n rows', scheme: u => poly(u, [rowVar], r => fun(p('int'), fun(queryOf(r), queryOf(r)))) },
@@ -267,4 +268,4 @@ export const LIST_ARITY = {
 } as Readonly<Record<string, readonly [number, number]>>;
 
 /** Target type names accepted by cast/try_cast. */
-export const CAST_TYPES = ['int', 'float', 'string', 'bool', 'date', 'timestamp'] as const;
+export const CAST_TYPES = ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp'] as const;

@@ -222,3 +222,15 @@ describe('services singleton', () => {
         expect(services.validation.ValidationRegistry).toBeDefined();
     });
 });
+
+describe('literal validation', () => {
+    test('date and timestamp literals are ISO-checked at compile time', () => {
+        expect(errors('q = date "not-a-date"').join('\n')).toContain('date expects an ISO date string literal (YYYY-MM-DD)');
+        expect(errors('q = timestamp "2024-01-01"').join('\n')).toContain('timestamp expects an ISO timestamp string literal');
+    });
+
+    test('empty parameter and table names are rejected', () => {
+        expect(errors('q = param ""').join('\n')).toContain('non-empty parameter name');
+        expect(errors('q = table ""').join('\n')).toContain('non-empty table name');
+    });
+});

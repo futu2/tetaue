@@ -639,3 +639,63 @@ q = users & map (u => extend u)`;
         expect(messages.join('\n')).toContain('cannot apply a function of type query { age: int } -> query { age: int }');
     });
 });
+
+describe('post-review design fixes', () => {
+    function typeOf(text: string, binding: string): string | undefined {
+        const model = parseModel(text);
+        const result = inferProject([{ model, uri: undefined, imports: [] }]);
+        const b = model.bindings.find(x => x.name === binding);
+        return b ? result.typeOf(b) : undefined;
+    }
+
+    test('param names share one project-wide type', () => {
+        const src = `users: query { id: int, name: string } = table "users"
+q = users & map (u => { n = param "x" + 1, s = upper (param "x") })`;
+        expect(allErrors(src).join('\n')).toContain('upper expects a string expression, got type int');
+        const ok = `users: query { id: int } = table "users"\nq = users & filter (u => u.id == param "x")`;
+        expect(allErrors(ok)).toEqual([]);
+    });
+
+    test('join ... merge keeps the full outer-join row and maybe types', () => {
+        const src = `a: query { id: int, x: string } = table "a"
+b: query { id: int, y: string } = table "b"
+q = a & join left b (l => r => l.id == r.id) merge`;
+        expect(typeErrors(src)).toEqual([]);
+        expect(typeOf(src, 'q')).toBe('query { id: (maybe int), x: (maybe string), y: (maybe string) }');
+    });
+
+    test('group_by allows grouping without aggregates', () => {
+        const src = `users: query { id: int, name: string } = table "users"
+q = users & group_by (u => { id = group u.id, name = group u.name })`;
+        expect(allErrors(src)).toEqual([]);
+        expect(render(src)).toContain('GROUP BY');
+    });
+
+    test('quoted field labels are decoded consistently', () => {
+        const src = `a: query { "weird name": string } = table "a"
+q = a & map (u => { y = u."weird name" })`;
+        expect(allErrors(src)).toEqual([]);
+        expect(render(src)).toContain('"weird name"');
+    });
+
+    test('decimal is a strict numeric primitive', () => {
+        const src = `a: query { price: decimal } = table "a"
+q = a & map (u => { p = u.price + u.price, c = cast u.price "decimal" })`;
+        expect(allErrors(src)).toEqual([]);
+        expect(render(src, 'postgresql')).toContain('CAST(price AS NUMERIC)');
+    });
+});
+
+describe('variadic coalesce list form', () => {
+    test('coalesce [maybe, maybe, just default] types as maybe and renders', () => {
+        const src = `a: query { x: (maybe string), y: (maybe string) } = table "a"
+q = a & map (u => { c = coalesce [u.x, u.y, just "fallback"] })`;
+        expect(allErrors(src)).toEqual([]);
+        expect(render(src, 'postgresql')).toContain(`COALESCE(x, y, 'fallback')`);
+    });
+
+    test('coalesce list items must all be nullable', () => {
+        const messages = typeErrors(`a: query { x: (maybe string) } = table "a"\nq = a & map (u => { c = coalesce [u.x, "fallback"] })`);
+        expect(messages.join('\n')).toContain('coalesce requires matching nullable (maybe T) types');
+    });
+});

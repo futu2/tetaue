@@ -30,6 +30,8 @@ export interface RenderResult {
     ok: boolean;
     /** Rendered SQL when `ok`. */
     sql?: string;
+    /** Named query parameters in encounter order when `ok`. */
+    parameters?: string[];
     /** Human-readable error (first diagnostic) when `!ok`. */
     message?: string;
 }
@@ -100,7 +102,7 @@ export function startTetaueServer(): void {
         const dialect = typeof params?.dialect === 'string' && isDialect(params.dialect) ? params.dialect : 'sqlite';
         const outcome = compileModuleText(uri, text, tetaue, { dialect });
         if (outcome.ok) {
-            return { ok: true, sql: outcome.sql };
+            return { ok: true, sql: outcome.sql, parameters: outcome.parameters };
         }
         const first = outcome.diagnostics[0];
         const message = first

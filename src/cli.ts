@@ -1,7 +1,7 @@
 /******************************************************************************
  * tetaue CLI — render / check / parse / format / build / watch / lsp.
  *
- *   tetaue render <file> [--dialect sqlite|postgresql|mysql|trino|hive] [--format pretty|compact]
+ *   tetaue render <file> [--dialect sqlite|postgresql|mysql|trino|hive] [--format pretty|compact] [--cte] [--json] [--binding <name>]
  *   tetaue check <file>
  *   tetaue parse <file>
  *   tetaue format <file...> [--check] [--tabs] [--tab-width <n>]     (alias: fmt)
@@ -40,7 +40,7 @@ import type { Model } from './language/generated/ast.js';
 const HELP = `tetaue — a pure functional SQL query language
 
 Usage:
-  tetaue render <file.tetaue> [--dialect <name>] [--format pretty|compact] [--cte]
+  tetaue render <file.tetaue> [--dialect <name>] [--format pretty|compact] [--cte] [--json] [--binding <name>]
       Validate the module (and its imports) and render its query to SQL.
   tetaue check <file.tetaue>
       Validate the module and report all diagnostics.
@@ -100,6 +100,8 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
     let dialect = 'sqlite';
     let format: RenderFormat = 'pretty';
     let cte = false;
+    let json = false;
+    let binding: string | undefined;
     const files: string[] = [];
     while (args.length > 0) {
         const arg = args.shift()!;
@@ -109,6 +111,12 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
             dialect = value;
         } else if (arg === '--cte') {
             cte = true;
+        } else if (arg === '--json') {
+            json = true;
+        } else if (arg === '--binding') {
+            const value = args.shift();
+            if (value === undefined) return usage(`--binding expects a binding name`);
+            binding = value;
         } else if (arg === '--format') {
             const value = args.shift();
             if (value !== 'pretty' && value !== 'compact') return usage(`--format expects 'pretty' or 'compact'`);
@@ -136,16 +144,20 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
         console.error(`error: cannot read ${file}: ${msg(err)}`);
         return 1;
     }
-    const outcome = compileModuleText(rootUri, rootText, services, { dialect, format, cte });
+    const outcome = compileModuleText(rootUri, rootText, services, { dialect, format, cte, binding });
     if (!outcome.ok) {
         printCompileDiagnostics(outcome.diagnostics);
         return 1;
     }
     printWarnings(outcome.warnings ?? []);
     if (command === 'render') {
-        console.log(outcome.sql);
+        console.log(json
+            ? JSON.stringify({ sql: outcome.sql, parameters: outcome.parameters }, null, 2)
+            : outcome.sql);
     } else {
-        console.log(`OK — ${file} is a valid tetaue module`);
+        console.log(json
+            ? JSON.stringify({ ok: true, file }, null, 2)
+            : `OK — ${file} is a valid tetaue module`);
     }
     return 0;
 }

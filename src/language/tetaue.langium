@@ -109,7 +109,7 @@ QueryType:
     {infer QueryType} 'query' '{' (fields+=RecordField (',' fields+=RecordField)* ','?)? ('|' tail=(ID | ARG_ID | HOLE))? '}';
 
 RecordField:
-    key=(ID | ARG_ID) ':' type=Type;
+    key=(ID | ARG_ID | STRING) ':' type=Type;
 
 // Operator precedence, tightest first:
 //   >>> <<<  (function composition, PureScript-style, right-assoc)
@@ -146,7 +146,7 @@ LambdaLetExpression:
 
 infix LambdaBinaryExpression on UnaryExpression:
     right assoc '>>>' | '<<<'
-    > '*' | '/' | '%'
+    > '*' | '/'
     > '+' | '-' | '<>'
     > '==' | '!=' | '<' | '<=' | '>' | '>='
     > '&&'
@@ -157,7 +157,7 @@ UnaryExpression:
     | AccessExpression;
 
 AccessExpression infers Expr:
-    Application ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID))*;
+    Application ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | STRING))*;
 
 // Juxtaposition application: `filter (u => u.age >= 18)` is filter applied
 // to a lambda; `table "users"` is table applied to the table name.
@@ -176,7 +176,7 @@ Application infers Expr:
 // form (use `$1`/`$2` for implicit parameters instead).
 Argument infers Expr:
     {infer Lambda} '(' param=LambdaParam ')' '=>' body=LambdaBody
-    | Atom ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID))+
+    | Atom ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | STRING))+
     | {infer Identifier} name=ARG_ID
     | {infer NumberLiteral} value=NUMBER
     | {infer StringLiteral} value=STRING
@@ -226,7 +226,7 @@ LambdaParam:
 // `{ id = expr, name }` — a missing `= expr` is FIELD PUNNING sugar:
 // inside a lambda body, `{ id }` means `{ id = <lambda param>.id }`.
 MapEntry:
-    key=(ID | ARG_ID) ('=' value=Expression)?;
+    key=(ID | ARG_ID | STRING) ('=' value=Expression)?;
 
 hidden terminal WS: /\s+/;
 hidden terminal COMMENT: /#[^\r\n]*/;

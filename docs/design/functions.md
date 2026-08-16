@@ -137,9 +137,10 @@ numerics: int and float do not mix, like everywhere else in the language).
 | `try_cast x "int"` | `TRY_CAST(...)` — **Trino only**, error elsewhere |
 
 `cast` target types: `int` (INTEGER / SIGNED mysql / INT hive), `float`
-(DOUBLE / DOUBLE PRECISION pg / REAL sqlite), `string` (VARCHAR / CHAR mysql /
-TEXT sqlite / STRING hive), `bool` (BOOLEAN; **error** on sqlite), `date`
-(DATE), `timestamp` (TIMESTAMP). The result type is the target type, so
+(DOUBLE / DOUBLE PRECISION pg / REAL sqlite), `decimal` (NUMERIC pg /
+DECIMAL elsewhere), `string` (VARCHAR / CHAR mysql / TEXT sqlite / STRING hive),
+`bool` (BOOLEAN; **error** on sqlite), `date` (DATE), `timestamp` (TIMESTAMP).
+The result type is the target type, so
 `cast u.x "int" == 5` type-checks.
 
 ## `case` / CASE WHEN expressions

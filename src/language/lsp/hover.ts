@@ -18,6 +18,7 @@ import type { ProjectModule } from '../imports.js';
 import { isAccessExpression, isBinding, isIdentifier } from '../generated/ast.js';
 import type { Binding, Model } from '../generated/ast.js';
 import { moduleQualifiedBinding } from './module-access.js';
+import { labelName } from '../strings.js';
 
 export class TetaueHoverProvider implements HoverProvider {
     constructor(private readonly services: TetaueServices) {}
@@ -101,7 +102,7 @@ export class TetaueHoverProvider implements HoverProvider {
 function labelFor(document: LangiumDocument, node: AstNode, typeText: string): string {
     if (isAccessExpression(node)) {
         const receiver = node.receiver?.$cstNode?.text ?? '?';
-        return `${receiver}.${node.property} : ${typeText}`;
+        return `${receiver}.${labelName(node.property)} : ${typeText}`;
     }
     if (isIdentifier(node) || isBinding(node)) {
         return `${node.name} : ${typeText}`;

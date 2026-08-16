@@ -311,7 +311,7 @@ describe('cast / try_cast', () => {
     });
 
     test('cast validates the target type', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { i = cast u.id "integer" })`).join('\n')).toContain('cast expects a target type as a string literal — one of: int, float, string, bool, date, timestamp');
+        expect(errors(`${USERS}\nq = users & map (u => { i = cast u.id "integer" })`).join('\n')).toContain('cast expects a target type as a string literal — one of: int, float, decimal, string, bool, date, timestamp');
     });
 });
 

@@ -47,7 +47,7 @@ users: s.UserRow = table "users"
 Type       ::= FunType | TypeAtom
 FunType    ::= TypeAtom '->' Type            -- right-associative
 TypeAtom   ::= '(maybe' Type ')' | BaseType
-BaseType   ::= int | float | string | bool | date | timestamp
+BaseType   ::= int | float | decimal | string | bool | date | timestamp
              | '{' (Field (',' Field)* ','?)? ('|' tail)? '}'
              | 'query' '{' (Field (',' Field)* ','?)? ('|' tail)? '}'
              | '[' Type ']'
@@ -137,6 +137,7 @@ just        : forall a. a -> (maybe a)
 nothing     : forall a. (maybe a)
 from_maybe  : forall a. a -> (maybe a) -> a
 coalesce    : forall a. (maybe a) -> (maybe a) -> (maybe a)
+             | forall a. [(maybe a)] -> (maybe a)   -- list form: coalesce [x, y, z]
 is_null     : forall a. (maybe a) -> bool
 is_not_null : forall a. (maybe a) -> bool
 

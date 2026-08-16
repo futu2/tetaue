@@ -378,3 +378,55 @@ describe('tetaue lsp', () => {
         }
     });
 });
+
+describe('render entrypoint and parameter metadata', () => {
+    test('--binding renders a named root binding instead of the last one', async () => {
+        const dir = tempDir('tetaue-binding-');
+        try {
+            const file = write(dir, 'multi.tetaue', `a: query { id: int } = table "a"\nhelper = 42\nb: query { id: int } = table "b"\n`);
+            const cap = captureConsole();
+            try {
+                expect(await main(['render', file, '--binding', 'a', '--format', 'compact'])).toBe(0);
+                expect(cap.log.join('\n')).toContain('SELECT * FROM a');
+            } finally {
+                cap.restore();
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test('--binding rejects non-query bindings', async () => {
+        const dir = tempDir('tetaue-binding-bad-');
+        try {
+            const file = write(dir, 'multi.tetaue', `a: query { id: int } = table "a"\nhelper = 42\n`);
+            const cap = captureConsole();
+            try {
+                expect(await main(['render', file, '--binding', 'helper'])).toBe(1);
+                expect(cap.error.join('\n')).toContain("binding 'helper' must be a query");
+            } finally {
+                cap.restore();
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test('render --json exposes sql and named parameters', async () => {
+        const dir = tempDir('tetaue-json-');
+        try {
+            const file = write(dir, 'param.tetaue', `a: query { id: int } = table "a"\nq = a & filter (u => u.id == param "user_id")\n`);
+            const cap = captureConsole();
+            try {
+                expect(await main(['render', file, '--json'])).toBe(0);
+                const parsed = JSON.parse(cap.log.join('\n')) as { sql: string; parameters: string[] };
+                expect(parsed.sql).toContain('WHERE');
+                expect(parsed.parameters).toEqual(['user_id']);
+            } finally {
+                cap.restore();
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});

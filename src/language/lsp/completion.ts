@@ -31,7 +31,7 @@ import type { ProjectModule } from '../imports.js';
 /** Synthetic property inserted after the dot so the access parses. */
 const DUMMY = '_tetaue_field';
 
-const STEP_NAMES = new Set(['filter', 'filtered', 'map', 'sort', 'take', 'distinct', 'fold', 'join']);
+const STEP_NAMES = new Set(['filter', 'filtered', 'map', 'sort', 'take', 'distinct', 'fold', 'group_by', 'join', 'join_lateral', 'select']);
 const AGG_NAMES = new Set(['count', 'sum', 'avg', 'min', 'max', 'list', 'group']);
 const JOIN_KIND_NAMES = new Set(['inner', 'left', 'right', 'full']);
 
