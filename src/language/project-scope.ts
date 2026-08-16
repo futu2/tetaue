@@ -39,6 +39,7 @@ export function resolveImportScope<T>(
     module: ProjectModule,
     imports: readonly ResolvedImportEdge[],
     exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, T>>,
+    typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, import('./generated/ast.js').Type>> = new Map(),
 ): ImportScope<T> {
     const flat = new Map<string, T>();
     const namespaces = new Map<string, ReadonlyMap<string, T>>();
@@ -52,23 +53,25 @@ export function resolveImportScope<T>(
         if (!targetExports) continue; // cyclic/missing target — already diagnosed
         const spec = parseStringLiteral(importNode.path);
 
-        // A selective name list `(users, orders)` restricts what is visible
-        // to exactly those exports; every listed name must be exported.
+        // A selective name list `(users, orders as sales)` restricts what is
+        // visible to exactly those exports; every listed name must be
+        // exported. `a as b` brings `a` into scope under local name `b`.
         let selected: ReadonlyMap<string, T> = targetExports;
         if (importNode.names && importNode.names.length > 0) {
-            for (const n of importNode.names) {
-                if (!targetExports.has(n)) {
-                    const keys = [...targetExports.keys()];
+            const targetTypes = typeExportsByModule.get(target);
+            for (const item of importNode.names) {
+                if (!targetExports.has(item.name) && !targetTypes?.has(item.name)) {
+                    const keys = [...targetExports.keys(), ...(targetTypes?.keys() ?? [])];
                     diagnostics.push({
                         node: importNode,
-                        message: `'${n}' is not exported by '${spec}' — exported: ${keys.length > 0 ? keys.join(', ') : '(none)'}`,
+                        message: `'${item.name}' is not exported by '${spec}' — exported: ${keys.length > 0 ? keys.join(', ') : '(none)'}`,
                     });
                 }
             }
             selected = new Map(
                 importNode.names
-                    .filter(name => targetExports.has(name))
-                    .map(name => [name, targetExports.get(name)!]),
+                    .filter(item => targetExports.has(item.name))
+                    .map(item => [item.renamed ?? item.name, targetExports.get(item.name)!]),
             );
         }
 
@@ -95,4 +98,51 @@ export function resolveImportScope<T>(
     }
 
     return { flat, namespaces, scope, diagnostics };
+}
+
+
+/** Type-alias imports: flat names plus namespace aliases for `t.Name` syntax. */
+export function resolveTypeImportScope(
+    module: ProjectModule,
+    imports: readonly ResolvedImportEdge[],
+    typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, import('./generated/ast.js').Type>>,
+): {
+    flat: ReadonlyMap<string, import('./generated/ast.js').Type>;
+    namespaces: ReadonlyMap<string, ReadonlyMap<string, import('./generated/ast.js').Type>>;
+    diagnostics: Diagnostic[];
+} {
+    const flat = new Map<string, import('./generated/ast.js').Type>();
+    const namespaces = new Map<string, ReadonlyMap<string, import('./generated/ast.js').Type>>();
+    const namespaceScope = new Map<string, string>();
+    const diagnostics: Diagnostic[] = [];
+    for (const { alias, target, importNode } of imports) {
+        const targetTypes = typeExportsByModule.get(target);
+        if (!targetTypes) continue;
+        const spec = parseStringLiteral(importNode.path);
+        let selected: ReadonlyMap<string, import('./generated/ast.js').Type> = targetTypes;
+        if (importNode.names.length > 0) {
+            selected = new Map(
+                importNode.names
+                    .filter(item => targetTypes.has(item.name))
+                    .map(item => [item.renamed ?? item.name, targetTypes.get(item.name)!]),
+            );
+        }
+        if (alias !== undefined) {
+            if (namespaceScope.has(alias)) {
+                diagnostics.push({ node: importNode, message: `type namespace '${alias}' conflicts with ${namespaceScope.get(alias)!}` });
+                continue;
+            }
+            namespaceScope.set(alias, `type namespace '${alias}'`);
+            namespaces.set(alias, selected);
+            continue;
+        }
+        for (const [name, type] of selected) {
+            if (flat.has(name)) {
+                diagnostics.push({ node: importNode, message: `type alias '${name}' imported from '${spec}' conflicts with a previously imported type alias` });
+                continue;
+            }
+            flat.set(name, type);
+        }
+    }
+    return { flat, namespaces, diagnostics };
 }

@@ -4,7 +4,7 @@
  * Dialects are capability-driven (like teta's backend): identifier quoting,
  * boolean literals and function-name mappings are resolved at render time.
  ******************************************************************************/
-import type { JoinKind, Query, SqlNode } from './interpreter.js';
+import { querySchema, type JoinKind, type Query, type SqlNode } from './interpreter.js';
 import type { BuiltinName } from './builtin.js';
 
 export interface DialectSpec {
@@ -20,6 +20,18 @@ export interface DialectSpec {
     stringLiteral: (value: string) => string;
     /** canonical builtin name → SQL function name */
     functions: Partial<Record<BuiltinName, string>>;
+    /** Join kinds the dialect can render natively (default: all four). */
+    joinKinds?: readonly JoinKind[];
+    /**
+     * How to render OFFSET without LIMIT: 'standard' (OFFSET n alone),
+     * 'mysql' (enormous LIMIT), 'sqlite' (LIMIT -1 OFFSET n), or
+     * 'none' (no native OFFSET support — Hive).
+     */
+    offset?: 'standard' | 'mysql' | 'sqlite' | 'none';
+    /** WITH RECURSIVE support (default: true; Hive does not support it). */
+    recursive?: boolean;
+    /** LATERAL derived-table support (default: true; SQLite/Trino/Hive lack the standard form). */
+    lateral?: boolean;
 }
 
 /**
@@ -80,6 +92,8 @@ function quoteMysql(value: string): string {
 export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
     sqlite: {
         name: 'sqlite',
+        offset: 'sqlite',
+        lateral: false,
         quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
         boolLiteral: b => (b ? '1' : '0'),
         stringLiteral: quoteSingleQuoted,
@@ -103,6 +117,10 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
     },
     mysql: {
         name: 'mysql',
+        // MySQL has no FULL OUTER JOIN; users must emulate it (union of
+        // left join and anti-join) in the source language.
+        joinKinds: ['inner', 'left', 'right'],
+        offset: 'mysql',
         quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteBacktickQuoted),
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteMysql,
@@ -114,6 +132,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
     },
     trino: {
         name: 'trino',
+        lateral: false,
         quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteSingleQuoted,
@@ -125,6 +144,9 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
     },
     hive: {
         name: 'hive',
+        offset: 'none',
+        recursive: false,
+        lateral: false,
         quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteBacktickQuoted),
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteMysql,
@@ -198,10 +220,19 @@ function renderPredicateClause(kw: string, conds: SqlNode[], ctx: RenderCtx, pre
         : `${kw} ${rendered.map(w => `(${w})`).join(' AND ')}`;
 }
 
+export type ParameterState = Map<string, number>;
+type CteMap = ReadonlyMap<Query, string>;
+
 interface RenderCtx {
     dialect: DialectSpec;
     qualify: boolean;
     readonly diagnostics: RenderDiagnostic[];
+    readonly parameters: ParameterState;
+    readonly ctes: CteMap;
+    /** Table aliases visible from enclosing query scopes. */
+    readonly outerAliases: ReadonlySet<string>;
+    /** Table aliases introduced by the query currently being rendered. */
+    readonly innerAliases: ReadonlySet<string>;
 }
 
 function renderFailure(ctx: RenderCtx, node: SqlNode, message: string): string {
@@ -250,6 +281,50 @@ function escapeString(value: string, dialect: DialectSpec): string {
 
 export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): string {
     switch (node.kind) {
+        case 'in-query': {
+            const sub = renderQueryWithDiagnostics(
+                node.query,
+                ctx.dialect,
+                'compact',
+                ctx.diagnostics,
+                ctx.ctes,
+                ctx.parameters,
+                new Set([...ctx.outerAliases, ...ctx.innerAliases]),
+            );
+            const text = `${renderExpr(node.expr, ctx, precOf('IN'))} ${node.negated ? 'NOT ' : ''}IN (${sub})`;
+            return parenIf(text, precOf('IN'), parentPrec);
+        }
+        case 'scalar': {
+            const sub = renderQueryWithDiagnostics(
+                node.query,
+                ctx.dialect,
+                'compact',
+                ctx.diagnostics,
+                ctx.ctes,
+                ctx.parameters,
+                new Set([...ctx.outerAliases, ...ctx.innerAliases]),
+            );
+            return parenIf(`(${sub})`, precOf('ATOM'), parentPrec);
+        }
+        case 'exists': {
+            const sub = renderQueryWithDiagnostics(
+                node.query,
+                ctx.dialect,
+                'compact',
+                ctx.diagnostics,
+                ctx.ctes,
+                ctx.parameters,
+                new Set([...ctx.outerAliases, ...ctx.innerAliases]),
+            );
+            return parenIf(`EXISTS (${sub})`, precOf('ATOM'), parentPrec);
+        }
+        case 'param': {
+            const existing = ctx.parameters.get(node.name);
+            const index = existing ?? ctx.parameters.size + 1;
+            if (existing === undefined) ctx.parameters.set(node.name, index);
+            const text = ctx.dialect.name === 'postgresql' ? '$' + index : '?';
+            return parenIf(text, precOf('ATOM'), parentPrec);
+        }
         case 'lit': {
             let text: string;
             if (node.value === null) text = 'NULL';
@@ -259,7 +334,12 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
             return parenIf(text, precOf('ATOM'), parentPrec);
         }
         case 'col': {
-            const q = ctx.qualify && node.table ? `${quoteQualifiedName(node.table, ctx.dialect)}.` : '';
+            const correlated = node.table !== null
+                && ctx.outerAliases.has(node.table)
+                && !ctx.innerAliases.has(node.table);
+            const q = (ctx.qualify || correlated) && node.table
+                ? `${quoteQualifiedName(node.table, ctx.dialect)}.`
+                : '';
             return parenIf(`${q}${ctx.dialect.quoteIdentifier(node.name)}`, precOf('ATOM'), parentPrec);
         }
         case 'bin': {
@@ -292,6 +372,22 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
         }
         case 'current-date':
             return parenIf('CURRENT_DATE', precOf('ATOM'), parentPrec);
+        case 'date-literal':
+            return parenIf(
+                ctx.dialect.name === 'sqlite'
+                    ? ctx.dialect.stringLiteral(node.value)
+                    : `DATE ${ctx.dialect.stringLiteral(node.value)}`,
+                precOf('ATOM'),
+                parentPrec,
+            );
+        case 'timestamp-literal':
+            return parenIf(
+                ctx.dialect.name === 'sqlite'
+                    ? ctx.dialect.stringLiteral(node.value)
+                    : `TIMESTAMP ${ctx.dialect.stringLiteral(node.value)}`,
+                precOf('ATOM'),
+                parentPrec,
+            );
         case 'current-timestamp':
             return parenIf('CURRENT_TIMESTAMP', precOf('ATOM'), parentPrec);
         case 'in': {
@@ -300,8 +396,24 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
             return parenIf(text, precOf('IN'), parentPrec);
         }
         case 'agg': {
-            const name = ctx.dialect.functions[node.name as BuiltinName] ?? node.name.toUpperCase();
-            const text = `${name}(${renderExpr(node.arg, ctx)})`;
+            const arg = renderExpr(node.arg, ctx);
+            if (node.name === 'count_distinct') {
+                const text = node.filter
+                    ? `COUNT(DISTINCT CASE WHEN ${renderExpr(node.filter, ctx)} THEN ${arg} END)`
+                    : `COUNT(DISTINCT ${arg})`;
+                return parenIf(text, precOf('CALL'), parentPrec);
+            }
+            const baseName = node.name.endsWith('_where') ? node.name.slice(0, -6) : node.name;
+            const name = ctx.dialect.functions[baseName as BuiltinName] ?? baseName.toUpperCase();
+            if (!node.filter) {
+                const text = `${name}(${arg})`;
+                return parenIf(text, precOf('CALL'), parentPrec);
+            }
+            const cond = renderExpr(node.filter, ctx);
+            const filteredArg = `CASE WHEN ${cond} THEN ${arg} END`;
+            const text = ctx.dialect.name === 'postgresql' || ctx.dialect.name === 'trino' || ctx.dialect.name === 'sqlite'
+                ? `${name}(${arg}) FILTER (WHERE ${cond})`
+                : `${name}(${filteredArg})`;
             return parenIf(text, precOf('CALL'), parentPrec);
         }
         case 'group':
@@ -316,6 +428,12 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
             }
             if (node.order.length > 0) {
                 inner.push(`ORDER BY ${node.order.map(o => `${renderExpr(o.node, ctx)} ${o.dir}`).join(', ')}`);
+            }
+            if (node.frame) {
+                const to = node.frame.end === 0
+                    ? 'CURRENT ROW'
+                    : `${node.frame.end} FOLLOWING`;
+                inner.push(`ROWS BETWEEN ${node.frame.start} PRECEDING AND ${to}`);
             }
             const over = inner.length > 0 ? ` OVER (${inner.join(' ')})` : ' OVER ()';
             return parenIf(`${fn}${over}`, precOf('CALL'), parentPrec);
@@ -364,6 +482,7 @@ const SPECIAL_CALLS = new Set<BuiltinName>([
     // scalar family
     'concat', 'greatest', 'least', 'substring', 'position', 'reverse', 'left_substring', 'right_substring',
     'lpad', 'rpad', 'regex_like', 'regex_replace', 'regex_extract', 'cast', 'try_cast',
+    'from_maybe', 'div',
 ]);
 
 function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): string | null {
@@ -440,6 +559,14 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
             if (d === 'trino') return groupNode ? `REGEXP_EXTRACT(${x()}, ${x(1)}, ${x(2)})` : `REGEXP_EXTRACT(${x()}, ${x(1)})`;
             return null;
         }
+        case 'from_maybe':
+            return `COALESCE(${x()}, ${x(1)})`;
+        case 'div':
+            // Haskell `div` is integral division. PostgreSQL, SQLite and
+            // Trino already integer-divide when both operands are ints;
+            // MySQL and Hive need the DIV operator.
+            if (d === 'mysql' || d === 'hive') return `${x()} DIV ${x(1)}`;
+            return `${x()} / ${x(1)}`;
         case 'cast': case 'try_cast': {
             if (node.name === 'try_cast' && d !== 'trino') return renderFailure(ctx, node, `try_cast is not supported for the ${d} dialect`);
             const type = node.args[1]?.kind === 'lit' ? sqlTypeName(String(node.args[1]!.value), d, ctx, node) : 'INTEGER';
@@ -664,10 +791,9 @@ function renderFromUnixtime(d: string, x: string): string {
 
 // --- set-operation rendering ------------------------------------------------
 
-type CteMap = ReadonlyMap<Query, string>;
 const NO_CTES: CteMap = new Map();
 
-function renderSetQuery(q: Query, dialect: DialectSpec, format: RenderFormat, diagnostics: RenderDiagnostic[], ctes: CteMap): string {
+function renderSetQuery(q: Query, dialect: DialectSpec, format: RenderFormat, diagnostics: RenderDiagnostic[], ctes: CteMap, parameters: ParameterState, outerAliases: ReadonlySet<string>): string {
     const index = q.steps.findIndex(s => s.kind === 'set');
     const step = q.steps[index]!;
     if (step.kind !== 'set') {
@@ -676,27 +802,73 @@ function renderSetQuery(q: Query, dialect: DialectSpec, format: RenderFormat, di
     }
     const left: Query = { ...q, steps: q.steps.slice(0, index) };
     const right = step.right;
+
+    // SQL set operations match columns POSITIONALLY, while tetaue rows are
+    // unordered records. Never rely on `SELECT *` here: project an explicit,
+    // shared column order on both operands. A dynamic (un-annotated) table
+    // has no known order and cannot be rendered safely as a set operand.
+    if (!left.known || !right.known) {
+        diagnostics.push({
+            message: `${step.op} requires known schemas on both operands — annotate each table or project it with map first`,
+            node: step,
+        });
+        return 'SELECT NULL';
+    }
+    const labels = [...querySchema(left).keys()];
+    const rightLabels = new Set(querySchema(right).keys());
+    for (const label of labels) {
+        if (!rightLabels.has(label)) {
+            diagnostics.push({
+                message: `${step.op} requires matching columns — right operand is missing '${label}'`,
+                node: step,
+            });
+            return 'SELECT NULL';
+        }
+    }
+
     const innerFormat: RenderFormat = format === 'pretty' ? 'pretty' : 'compact';
-    const leftSql = renderQueryWithDiagnostics(left, dialect, innerFormat, diagnostics, ctes);
-    const rightSql = renderQueryWithDiagnostics(right, dialect, innerFormat, diagnostics, ctes);
-    const wrap = (sql: string): string => format === 'pretty'
-        ? `SELECT * FROM (\n${indentLines(sql, INDENT)}\n)`
-        : `SELECT * FROM (${sql})`;
-    const leftOp = wrap(leftSql);
-    const rightOp = wrap(rightSql);
+    const leftSql = renderQueryWithDiagnostics(left, dialect, innerFormat, diagnostics, ctes, parameters, outerAliases);
+    const rightSql = renderQueryWithDiagnostics(right, dialect, innerFormat, diagnostics, ctes, parameters, outerAliases);
+    const columns = labels.map(label => dialect.quoteIdentifier(label)).join(', ');
+    const wrap = (sql: string, alias: string): string => {
+        const aliasSql = dialect.quoteIdentifier(alias);
+        return format === 'pretty'
+            ? `SELECT ${columns}\nFROM (\n${indentLines(sql, INDENT)}\n) AS ${aliasSql}`
+            : `SELECT ${columns} FROM (${sql}) AS ${aliasSql}`;
+    };
+    const leftOp = wrap(leftSql, '_tetaue_left');
+    const rightOp = wrap(rightSql, '_tetaue_right');
     return format === 'pretty' ? `${leftOp}\n${step.op}\n${rightOp}` : `${leftOp} ${step.op} ${rightOp}`;
 }
 
 // --- query rendering -------------------------------------------------------
 
-function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: RenderFormat, diagnostics: RenderDiagnostic[], ctes: CteMap = NO_CTES): string {
+function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: RenderFormat, diagnostics: RenderDiagnostic[], ctes: CteMap = NO_CTES, parameters: ParameterState = new Map(), outerAliases: ReadonlySet<string> = new Set()): string {
     // A set step is a complete relational operation, not a clause in the
     // surrounding SELECT: render it as operand-wrapped UNION/INTERSECT/EXCEPT.
-    if (q.steps.some(s => s.kind === 'set')) return renderSetQuery(q, dialect, format, diagnostics, ctes);
+    if (q.steps.some(s => s.kind === 'set')) return renderSetQuery(q, dialect, format, diagnostics, ctes, parameters, outerAliases);
 
-    const ctx: RenderCtx = { dialect, qualify: countTables(q) > 1, diagnostics };
+    const innerAliases = new Set(q.aliases);
+    const ctx: RenderCtx = { dialect, qualify: countTables(q) > 1, diagnostics, parameters, ctes, innerAliases, outerAliases };
     const pretty = format === 'pretty';
     const clauses: string[] = [];
+
+    let recursivePrefix = '';
+    if (q.recursive) {
+        if (dialect.recursive === false) {
+            diagnostics.push({ message: `recursive CTEs are not supported for the ${dialect.name} dialect`, node: q.recursive });
+            return 'SELECT NULL';
+        }
+        const rec = q.recursive;
+        const baseSql = renderQueryWithDiagnostics(q.root.from!, dialect, 'compact', diagnostics, ctes, parameters, outerAliases);
+        const termSql = renderQueryWithDiagnostics(rec.term, dialect, 'compact', diagnostics, ctes, parameters, outerAliases);
+        const name = dialect.quoteIdentifier(rec.name);
+        if (pretty) {
+            recursivePrefix = `WITH RECURSIVE ${name} AS (\n${indentLines(baseSql, INDENT)}\nUNION ALL\n${indentLines(termSql, INDENT)}\n)\n`;
+        } else {
+            recursivePrefix = `WITH RECURSIVE ${name} AS (${baseSql} UNION ALL ${termSql}) `;
+        }
+    }
 
     // SELECT
     const projection = lastProjection(q);
@@ -723,14 +895,18 @@ function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: Rend
     // A derived-table root (a fold wrapped by a later map/join) renders as a
     // subquery with its own alias.
     if (q.root.from) {
-        const cteName = ctes.get(q.root.from);
-        if (cteName !== undefined) {
-            clauses.push(`FROM ${dialect.quoteIdentifier(cteName)}`);
+        if (q.recursive) {
+            clauses.push(`FROM ${dialect.quoteIdentifier(q.recursive.name)}`);
         } else {
-            const derivedAlias = q.aliases[0] ?? q.root.name;
-            clauses.push(pretty
-                ? `FROM (\n${indentLines(renderQueryWithDiagnostics(q.root.from, dialect, 'pretty', ctx.diagnostics, ctes), INDENT)}\n) AS ${dialect.quoteIdentifier(derivedAlias)}`
-                : `FROM (${renderQueryWithDiagnostics(q.root.from, dialect, 'compact', ctx.diagnostics, ctes)}) AS ${dialect.quoteIdentifier(derivedAlias)}`);
+            const cteName = ctes.get(q.root.from);
+            if (cteName !== undefined) {
+                clauses.push(`FROM ${dialect.quoteIdentifier(cteName)}`);
+            } else {
+                const derivedAlias = q.aliases[0] ?? q.root.name;
+                clauses.push(pretty
+                    ? `FROM (\n${indentLines(renderQueryWithDiagnostics(q.root.from, dialect, 'pretty', ctx.diagnostics, ctes, ctx.parameters, outerAliases), INDENT)}\n) AS ${dialect.quoteIdentifier(derivedAlias)}`
+                    : `FROM (${renderQueryWithDiagnostics(q.root.from, dialect, 'compact', ctx.diagnostics, ctes, ctx.parameters, outerAliases)}) AS ${dialect.quoteIdentifier(derivedAlias)}`);
+            }
         }
     } else {
         const rootAlias = q.aliases[0] ?? q.root.name;
@@ -743,9 +919,13 @@ function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: Rend
     // JOINs
     for (const step of q.steps) {
         if (step.kind === 'join') {
+            if (step.lateral && dialect.lateral === false) {
+                ctx.diagnostics.push({ message: `lateral joins are not supported for the ${dialect.name} dialect`, node: step });
+                continue;
+            }
             const right = step.right;
             const rightAlias = right.aliases[0] ?? right.root.name;
-            const plainTable = right.steps.length === 0 && !right.distinct && !right.root.from;
+            const plainTable = !step.lateral && right.steps.length === 0 && !right.distinct && !right.root.from;
             let rightSql: string;
             if (plainTable) {
                 // plain table: `JOIN orders [AS orders_1]`
@@ -760,15 +940,23 @@ function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: Rend
                 rightSql = cteName !== undefined
                     ? dialect.quoteIdentifier(cteName)
                     : pretty
-                        ? `(\n${indentLines(renderQueryWithDiagnostics(right, dialect, 'pretty', ctx.diagnostics, ctes), INDENT)}\n) AS ${dialect.quoteIdentifier(rightAlias)}`
-                        : `(${renderQueryWithDiagnostics(right, dialect, 'compact', ctx.diagnostics, ctes)}) AS ${dialect.quoteIdentifier(rightAlias)}`;
+                        ? `(\n${indentLines(renderQueryWithDiagnostics(right, dialect, 'pretty', ctx.diagnostics, ctes, ctx.parameters, step.lateral ? new Set([...ctx.outerAliases, ...ctx.innerAliases]) : outerAliases), INDENT)}\n) AS ${dialect.quoteIdentifier(rightAlias)}`
+                        : `(${renderQueryWithDiagnostics(right, dialect, 'compact', ctx.diagnostics, ctes, ctx.parameters, step.lateral ? new Set([...ctx.outerAliases, ...ctx.innerAliases]) : outerAliases)}) AS ${dialect.quoteIdentifier(rightAlias)}`;
+            }
+            if (dialect.joinKinds && !dialect.joinKinds.includes(step.joinKind)) {
+                ctx.diagnostics.push({
+                    message: `${step.joinKind} join is not supported for the ${dialect.name} dialect`,
+                    node: step,
+                });
+                continue;
             }
             const onClause = `ON ${renderExpr(step.on, ctx)}`;
             // In pretty mode a subquery join is laid out vertically so the
             // ON condition sits on its own indented line.
+            const joinKeyword = step.lateral ? 'INNER JOIN LATERAL' : JOIN_SQL[step.joinKind];
             clauses.push(pretty && !plainTable
-                ? `${JOIN_SQL[step.joinKind]} ${rightSql}\n${INDENT}${onClause}`
-                : `${JOIN_SQL[step.joinKind]} ${rightSql} ${onClause}`);
+                ? `${joinKeyword} ${rightSql}\n${INDENT}${onClause}`
+                : `${joinKeyword} ${rightSql} ${onClause}`);
         }
     }
 
@@ -805,14 +993,34 @@ function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: Rend
         clauses.push(renderListClause('ORDER BY', sorts.map(s => `${renderExpr(s.node, ctx)} ${s.dir}`), pretty));
     }
 
-    // LIMIT
+    // LIMIT / OFFSET
+    // Within one Query object, interpreter boundaries guarantee that all
+    // drop steps precede all take steps. SQL's clause order is exactly that:
+    // OFFSET skips first, LIMIT keeps the next rows.
+    const drops = q.steps.filter(s => s.kind === 'drop');
     const takes = q.steps.filter(s => s.kind === 'take');
-    if (takes.length > 0) {
+    const offset = drops.reduce((sum, s) => sum + s.n, 0);
+    if (offset > 0) {
+        const offsetMode = dialect.offset ?? 'standard';
+        if (offsetMode === 'none') {
+            ctx.diagnostics.push({ message: `OFFSET (drop) is not supported for the ${dialect.name} dialect`, node: drops[0] });
+        } else if (takes.length > 0) {
+            const last = takes[takes.length - 1]!;
+            clauses.push(`LIMIT ${last.n} OFFSET ${offset}`);
+        } else if (offsetMode === 'mysql') {
+            clauses.push(`LIMIT 18446744073709551615 OFFSET ${offset}`);
+        } else if (offsetMode === 'sqlite') {
+            clauses.push(`LIMIT -1 OFFSET ${offset}`);
+        } else {
+            clauses.push(`OFFSET ${offset}`);
+        }
+    } else if (takes.length > 0) {
         const last = takes[takes.length - 1]!;
         clauses.push(`LIMIT ${last.n}`);
     }
 
-    return pretty ? clauses.join('\n') : clauses.join(' ');
+    const body = pretty ? clauses.join('\n') : clauses.join(' ');
+    return recursivePrefix + body;
 }
 
 export interface RenderDiagnostic {
@@ -822,7 +1030,7 @@ export interface RenderDiagnostic {
 }
 
 export type RenderResult =
-    | { ok: true; sql: string }
+    | { ok: true; sql: string; parameters: string[] }
     | { ok: false; diagnostics: RenderDiagnostic[] };
 
 /**
@@ -855,18 +1063,19 @@ function collectCtes(top: Query, dialect: DialectSpec): CteMap {
 /** Render with named intermediates emitted as `WITH name AS (...)` CTEs. */
 export function renderQueryWithCtes(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
     const diagnostics: RenderDiagnostic[] = [];
+    const parameters: ParameterState = new Map();
     try {
         const ctes = collectCtes(q, dialect);
         const bodies = [...ctes].map(([query, name]) => {
-            const sql = renderQueryWithDiagnostics(query, dialect, format === 'pretty' ? 'compact' : 'compact', diagnostics, ctes);
+            const sql = renderQueryWithDiagnostics(query, dialect, 'compact', diagnostics, ctes, parameters);
             return { name, sql };
         });
-        const body = renderQueryWithDiagnostics(q, dialect, format, diagnostics, ctes);
+        const body = renderQueryWithDiagnostics(q, dialect, format, diagnostics, ctes, parameters);
         if (diagnostics.length > 0) return { ok: false, diagnostics };
         const withClause = bodies.length > 0
             ? `WITH ${bodies.map((b, i) => `${dialect.quoteIdentifier(b.name)} AS (\n${indentLines(b.sql, INDENT)}\n)${i < bodies.length - 1 ? ',' : ''}`).join('\n')}\n`
             : '';
-        return { ok: true, sql: withClause + body };
+        return { ok: true, sql: withClause + body, parameters: [...parameters.keys()] };
     } catch (err) {
         return {
             ok: false,
@@ -882,9 +1091,10 @@ export function renderQueryWithCtes(q: Query, dialect: DialectSpec, format: Rend
  */
 export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
     const diagnostics: RenderDiagnostic[] = [];
+    const parameters: ParameterState = new Map();
     try {
-        const sql = renderQueryWithDiagnostics(q, dialect, format, diagnostics);
-        return diagnostics.length > 0 ? { ok: false, diagnostics } : { ok: true, sql };
+        const sql = renderQueryWithDiagnostics(q, dialect, format, diagnostics, new Map(), parameters);
+        return diagnostics.length > 0 ? { ok: false, diagnostics } : { ok: true, sql, parameters: [...parameters.keys()] };
     } catch (err) {
         return {
             ok: false,

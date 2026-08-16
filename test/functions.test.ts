@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { render, errors, typeErrors, parseModel } from './helpers.ts';
+import { render, errors, typeErrors, allErrors, parseModel } from './helpers.ts';
 
 const USERS = `users: query {
     id: int,
@@ -188,8 +188,8 @@ describe('case / CASE WHEN', () => {
     });
 
     test('case without a fallback renders CASE ... END (no ELSE clause)', () => {
-        const sql = render(`${USERS}\nq = users & map (u => { maybe = case { u.balance > 100 => u.name } })`);
-        expect(sql).toContain('CASE WHEN balance > 100 THEN name END AS maybe');
+        const sql = render(`${USERS}\nq = users & map (u => { maybe_label = case { u.balance > 100 => u.name } })`);
+        expect(sql).toContain('CASE WHEN balance > 100 THEN name END AS maybe_label');
     });
 
     test('case works in filter predicates and nests', () => {
@@ -236,9 +236,12 @@ describe('case / CASE WHEN', () => {
         expect(errors(`${USERS}\nq = users & map (u => { x = case {} })`).join('\n')).toContain('case requires at least one branch');
     });
 
-    test('case cannot wrap aggregates', () => {
-        const orders = `orders: query { total: float } = table "orders"`;
-        expect(errors(`${orders}\nq = orders & fold (o => { x = case { o.total > 100.0 => (sum o.total), _ => 0 } })`).join('\n')).toContain('case cannot contain aggregates');
+    test('case may wrap aggregates in fold only with grouped/constant conditions', () => {
+        const orders = `orders: query { status: string, total: float } = table "orders"`;
+        const grouped = `${orders}\nq = orders & fold (o => { status = group o.status, x = case { o.status == "paid" => sum o.total, _ => 0.0 } })`;
+        expect(errors(grouped)).toEqual([]);
+        const ungrouped = `${orders}\nq = orders & fold (o => { x = case { o.status == "paid" => sum o.total, _ => 0.0 } })`;
+        expect(errors(ungrouped).join('\n')).toContain("case conditions must be constant or use grouped columns");
     });
 
     test('_ is a reserved word', () => {
@@ -345,6 +348,197 @@ describe('validation', () => {
     });
 });
 
+describe('fmap over maybe', () => {
+    test('fmap lifts a function over a nullable SQL expression', () => {
+        const src = `t: query { email: (maybe string), age: (maybe int) } = table "t"
+q = t & map (u => { e = fmap upper u.email, a = fmap (x => x + 1) u.age })`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'postgresql', 'compact');
+        expect(sql).toContain('UPPER(email) AS e');
+        expect(sql).toContain('age + 1 AS a');
+    });
+
+    test('fmap type-checks only functions of the wrapped type', () => {
+        const bad = `t: query { age: (maybe int) } = table "t"
+q = t & map (u => { a = fmap upper u.age })`;
+        expect(typeErrors(bad).join('\n')).toContain('cannot apply');
+    });
+});
+
+describe('exists subqueries', () => {
+    test('correlated EXISTS renders and type-checks', () => {
+        const src = `users: query { id: int } = table "users"
+orders: query { user_id: int } = table "orders"
+q = users & filter (u => exists (orders & filter (o => o.user_id == u.id)))`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'postgresql', 'compact');
+        expect(sql).toContain('WHERE EXISTS (SELECT * FROM orders WHERE user_id = users.id)');
+    });
+
+    test('EXISTS executes with outer-column correlation', () => {
+        const { Database } = require('bun:sqlite') as typeof import('bun:sqlite');
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE users (id int)');
+        db.run('CREATE TABLE orders (user_id int)');
+        db.run('INSERT INTO users VALUES (1), (2)');
+        db.run('INSERT INTO orders VALUES (1)');
+        const sql = render(`users: query { id: int } = table "users"
+orders: query { user_id: int } = table "orders"
+q = users & filter (u => exists (orders & filter (o => o.user_id == u.id))) & map (u => { id })`);
+        expect(db.query(sql).all()).toEqual([{ id: 1 }]);
+    });
+});
+
+describe('IN subqueries', () => {
+    test('in_query renders and executes IN (SELECT ...)', () => {
+        const src = `users: query { id: int } = table "users"
+orders: query { user_id: int } = table "orders"
+q = users & filter (u => in_query u.id (orders & map (o => { user_id = o.user_id }))) & map (u => { id })`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'sqlite', 'compact');
+        expect(sql).toContain('id IN (SELECT user_id FROM orders)');
+        const { Database } = require('bun:sqlite') as typeof import('bun:sqlite');
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE users (id int)');
+        db.run('CREATE TABLE orders (user_id int)');
+        db.run('INSERT INTO users VALUES (1), (2)');
+        db.run('INSERT INTO orders VALUES (1)');
+        expect(db.query(sql).all()).toEqual([{ id: 1 }]);
+    });
+
+    test('not_in_query is correlated like exists', () => {
+        const src = `users: query { id: int } = table "users"
+orders: query { user_id: int } = table "orders"
+q = users & filter (u => not_in_query u.id (orders & filter (o => o.user_id == u.id) & map (o => { user_id = o.user_id })))`;
+        const sql = render(src, 'postgresql', 'compact');
+        expect(sql).toContain('id NOT IN (SELECT user_id FROM orders WHERE user_id = users.id)');
+    });
+});
+
+describe('scalar subqueries', () => {
+    test('correlated scalar subquery renders and types as maybe', () => {
+        const src = `users: query { id: int } = table "users"
+orders: query { user_id: int } = table "orders"
+q = users & map (u => { id, last_user = scalar (orders & filter (o => o.user_id == u.id) & take 1) })`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'postgresql', 'compact');
+        expect(sql).toContain('(SELECT * FROM orders WHERE user_id = users.id LIMIT 1)');
+    });
+
+    test('scalar requires exactly one output column', () => {
+        const bad = `t: query { a: int, b: int } = table "t"
+q = t & map (u => { x = scalar t })`;
+        expect(typeErrors(bad).join('\n')).toContain('scalar subquery must return exactly one column');
+    });
+});
+
+describe('lateral joins', () => {
+    test('join_lateral renders a correlated LATERAL subquery', () => {
+        const src = `users: query { id: int, name: string } = table "users"
+orders: query { user_id: int, total: float } = table "orders"
+q = users & join_lateral (l => (orders & filter (o => o.user_id == l.id) & sort (o => desc o.total) & take 1)) (l => r => true) (l => r => { id = l.id, name = l.name, total = r.total })`;
+        expect(typeErrors(src)).toEqual([]);
+        const pg = render(src, 'postgresql', 'compact');
+        expect(pg).toContain('INNER JOIN LATERAL');
+        expect(pg).toContain('WHERE user_id = users.id');
+        expect(pg).toContain('ORDER BY total DESC LIMIT 1');
+    });
+
+    test('lateral is capability-gated for SQLite', () => {
+        const src = `users: query { id: int } = table "users"
+orders: query { user_id: int } = table "orders"
+q = users & join_lateral (l => orders) (l => r => l.id == r.user_id) (l => r => { id = l.id })`;
+        expect(() => render(src, 'sqlite')).toThrow(/lateral joins are not supported/);
+    });
+});
+
+describe('filtered aggregates', () => {
+    test('sum_where / count_where type-check and execute', () => {
+        const src = `orders: query { status: string, total: float } = table "orders"
+q = orders & fold (o => { paid_total = sum_where (o.status == "paid") o.total, n = count_where (o.status == "paid") o.total })`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'sqlite', 'compact');
+        expect(sql).toContain('SUM(total) FILTER (WHERE status = \'paid\')');
+        const { Database } = require('bun:sqlite') as typeof import('bun:sqlite');
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE orders(status text, total real)');
+        db.run("INSERT INTO orders VALUES ('paid', 10), ('x', 20), ('paid', 30)");
+        expect(db.query(sql).get()).toEqual({ paid_total: 40, n: 2 });
+    });
+
+    test('MySQL/Hive lower FILTER to CASE WHEN', () => {
+        const src = `t: query { flag: bool, x: int } = table "t"
+q = t & fold (u => { s = sum_where u.flag u.x })`;
+        expect(render(src, 'mysql', 'compact')).toContain('SUM(CASE WHEN flag THEN x END)');
+        expect(render(src, 'hive', 'compact')).toContain('SUM(CASE WHEN flag THEN x END)');
+    });
+});
+
+describe('case-wrapped aggregates', () => {
+    test('fold accepts CASE WHEN ... THEN SUM(...) ELSE SUM(...) END', () => {
+        const src = `t: query { status: string, a: float, b: float } = table "t"
+q = t & fold (o => { status = group o.status, x = case { o.status == "paid" => sum o.a, _ => sum o.b } })`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'sqlite', 'compact');
+        expect(sql).toContain('CASE WHEN status = \'paid\' THEN SUM(a) ELSE SUM(b) END');
+        const { Database } = require('bun:sqlite') as typeof import('bun:sqlite');
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE t(status text, a real, b real)');
+        db.run("INSERT INTO t VALUES ('paid', 10, 1), ('x', 20, 2)");
+        expect(db.query(sql).all()).toEqual([{ status: 'paid', x: 10 }, { status: 'x', x: 2 }]);
+    });
+
+    test('plain columns still cannot hide inside a case aggregate', () => {
+        const src = `t: query { status: string, a: float } = table "t"
+q = t & fold (o => { x = case { o.status == "paid" => sum o.a, _ => o.a } })`;
+        expect(typeErrors(src).join('\n')).toContain("fold entry 'x' case conditions must be constant or use grouped columns");
+        expect(allErrors(src).join('\n')).toContain("fold entry 'x' case conditions must be constant or use grouped columns");
+    });
+});
+
+describe('recursive CTEs', () => {
+    test('recursive computes transitive closure', () => {
+        const src = `edges: query { src: int, dst: int } = table "edges"
+q = edges & recursive (self => (edges & join inner self (l => r => l.dst == r.src) (l => r => { src = l.src, dst = r.dst }))) & map (u => { src, dst })`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'sqlite', 'compact');
+        expect(sql).toContain('WITH RECURSIVE');
+        expect(sql).toContain('UNION ALL');
+        const { Database } = require('bun:sqlite') as typeof import('bun:sqlite');
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE edges(src int, dst int)');
+        db.run('INSERT INTO edges VALUES (1,2),(2,3),(3,4)');
+        expect(db.query(sql).all()).toHaveLength(6);
+    });
+
+    test('recursive CTEs are capability-gated for Hive', () => {
+        const src = `edges: query { src: int, dst: int } = table "edges"
+q = edges & recursive (self => (edges & join inner self (l => r => l.dst == r.src) (l => r => { src = l.src, dst = r.dst })))`;
+        expect(() => render(src, 'hive')).toThrow(/recursive CTEs are not supported/);
+    });
+});
+
+describe('query parameters', () => {
+    test('param renders dialect-native placeholders and PostgreSQL numbers them', () => {
+        const src = `t: query { id: int, name: string } = table "t"
+q = t & filter (u => u.id == (param "id" : int) && u.name == (param "name" : string))`;
+        expect(render(src, 'sqlite', 'compact')).toContain('id = ?');
+        const pg = render(src, 'postgresql', 'compact');
+        expect(pg).toContain('id = $1');
+        expect(pg).toContain('name = $2');
+        expect(typeErrors(src)).toEqual([]);
+    });
+
+    test('the same parameter name is one numbered placeholder', () => {
+        const src = `t: query { id: int } = table "t"
+q = t & filter (u => u.id >= (param "x" : int) && u.id <= (param "x" : int))`;
+        const pg = render(src, 'postgresql', 'compact');
+        expect(pg).toContain('id >= $1');
+        expect(pg).toContain('id <= $1');
+        expect(pg).not.toContain('$2');
+    });
+});
+
 describe('type inference', () => {
     test('a module using the scalar catalog type-checks', () => {
         const src = `
@@ -359,11 +553,20 @@ describe('type inference', () => {
                 sub = substring [u.name, 1, 3],
                 pos = position u.name "a",
                 li = like u.name "a%",
-                nf = null_if u.name "",
+                nf = null_if (just u.name) (just ""),
                 ci = cast u.id "string",
             })
         `;
         expect(typeErrors(src)).toEqual([]);
+    });
+
+    test('division follows Haskell base: / is float, div is integral', () => {
+        expect(typeErrors(`${USERS}\nq = users & map (u => { x = u.balance / 2.0 })`)).toEqual([]);
+        expect(typeErrors(`${USERS}\nq = users & map (u => { x = u.id / 2 })`).join('\n')).toContain("'/' requires float operands");
+        const sql = render(`${USERS}\nq = users & map (u => { d = div u.id 3, m = mod u.id 3, r = u.balance / 2.0 })`, 'mysql');
+        expect(sql).toContain('id DIV 3 AS d');
+        expect(sql).toContain('MOD(id, 3) AS m');
+        expect(sql).toContain('balance / 2 AS r');
     });
 
     test('pow does not unify its operands (no type pollution)', () => {

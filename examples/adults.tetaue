@@ -15,7 +15,7 @@
 # signature: `{ active: bool, age: int | r }` says "at least these fields",
 # `r` is a row variable, and free variables in a signature are implicitly
 # `forall`-quantified. Nullability is written explicitly: `age: int` is a
-# non-null column; write `age: int?` for one that may be NULL.
+# non-null column; write `age: (maybe int)` for one that may be NULL.
 
 users: query {
     id: int,

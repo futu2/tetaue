@@ -71,6 +71,14 @@ describe('window functions', () => {
         expect(sql).toContain('ROW_NUMBER() OVER () AS e');
     });
 
+    test('rows frames render ROWS BETWEEN ... PRECEDING/FOLLOWING', () => {
+        const src = `${USERS}\nq = users & map (u => { r = over (sum u.salary) { partition = [u.dept], order = [asc u.salary], rows = [2] } })`;
+        const sql = render(src, 'postgresql', 'compact');
+        expect(sql).toContain('ROWS BETWEEN 2 PRECEDING AND CURRENT ROW');
+        const centered = render(`${USERS}\nq = users & map (u => { c = over (avg u.salary) { rows = [1, 1] } })`, 'postgresql', 'compact');
+        expect(centered).toContain('ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING');
+    });
+
     test('single (non-list) partition and order values are accepted', () => {
         const sql = render(`${USERS}\nq = users & map (u => { rn = over (row_number) { partition = u.dept, order = desc u.salary } })`, 'trino');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn');

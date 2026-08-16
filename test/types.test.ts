@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { parseModel, typeErrors, allErrors, render } from './helpers.ts';
 import {
     TypeUniverse, UnifyError, type Type,
-    fun, listOf, nullable, prim, queryOf, rowOf,
+    fun, listOf, maybeOf, prim, queryOf, rowOf,
 } from '../src/language/types.ts';
 import { inferProject } from '../src/language/inference.ts';
 import type { ProjectModule } from '../src/language/imports.ts';
@@ -26,13 +26,14 @@ describe('type engine', () => {
         expect(() => u.unify(prim('int'), prim('float'))).toThrow(UnifyError);
     });
 
-    test('`?` absorption is symmetric and result-carrying', () => {
+    test('maybe is a distinct type constructor: no implicit absorption', () => {
         const u = new TypeUniverse();
-        expect(u.unify(nullable(prim('int')), prim('int')).kind).toBe('nullable');
-        u.unify(prim('int'), nullable(prim('int')));
-        expect(() => u.unify(nullable(prim('int')), prim('string'))).toThrow(UnifyError);
+        expect(u.unify(maybeOf(prim('int')), maybeOf(prim('int'))).kind).toBe('maybe');
+        expect(() => u.unify(maybeOf(prim('int')), prim('int'))).toThrow(UnifyError);
+        expect(() => u.unify(prim('int'), maybeOf(prim('int')))).toThrow(UnifyError);
+        expect(() => u.unify(maybeOf(prim('int')), maybeOf(prim('string')))).toThrow(UnifyError);
         const a = u.fresh();
-        u.unify(a, nullable(a)); // α ~ α? is fine
+        expect(() => u.unify(a, maybeOf(a))).toThrow(UnifyError); // occurs check, no α ~ maybe α
     });
 
     test('open rows absorb extra fields from closed rows', () => {
@@ -179,18 +180,21 @@ describe('strict numerics', () => {
 // ---------------------------------------------------------------------------
 
 describe('nullability', () => {
-    test('null unifies with any type in comparisons and coalesce', () => {
-        expect(typeErrors(`${USERS}\nq = users & filter (u => u.name == null)`)).toEqual([]);
-        expect(typeErrors(`${USERS}\nq = users & filter (u => u.name != null && u.age >= 18)`)).toEqual([]);
-        expect(typeErrors(`${USERS}\nq = users & map (u => { x = coalesce u.name null })`)).toEqual([]);
+    test('null only unifies with maybe values (no implicit conversion)', () => {
+        // A non-null string column cannot be compared with null — is_null is
+        // the explicit way to ask "is this nullable value missing?".
+        expect(typeErrors(`${USERS}\nq = users & filter (u => u.name == null)`)).not.toEqual([]);
+        expect(typeErrors(`users: query { name: (maybe string) } = table "users"\nq = users & filter (u => is_null u.name)`)).toEqual([]);
+        expect(typeErrors(`users: query { name: (maybe string), fallback: string } = table "users"\nq = users & map (u => { x = coalesce u.name (just u.fallback) })`)).toEqual([]);
     });
 
     test('nullable columns work in arithmetic and projections', () => {
         expect(typeErrors(`${USERS}\nq = users & map (u => { x = u.age + 1 }) & filter (r => r.x > 18)`)).toEqual([]);
     });
 
-    test('nullable types are expressible in annotations', () => {
-        expect(typeErrors(`${USERS}\nq = users & filter (u: { age: int? | r }) => u.age >= 18`)).toEqual([]);
+    test('nullable types are expressible in annotations and require explicit unwrapping', () => {
+        expect(typeErrors(`${USERS}\nq = users & filter (u: { age: (maybe int) | r }) => u.age >= 18`).join('\n')).toContain('cannot compare');
+        expect(typeErrors(`users_maybe: query { age: (maybe int), name: string } = table "users_maybe"\nq = users_maybe & filter (u: { age: (maybe int) | r }) => from_maybe 0 u.age >= 18`)).toEqual([]);
     });
 
     test('null == null stays an interpreter (semantic) error', () => {
@@ -201,6 +205,25 @@ describe('nullability', () => {
 // ---------------------------------------------------------------------------
 // Type annotations
 // ---------------------------------------------------------------------------
+
+describe('type aliases', () => {
+    test('module-local aliases expand in query schemas and signatures', () => {
+        const src = `type UserRow = query { id: int, name: string, age: int }
+type AdultRow = { age: int | r }
+adult: AdultRow -> bool = u => u.age >= 18
+users: UserRow = table "users"
+q = users & filter (adult) & map (u => { id, name })`;
+        expect(typeErrors(src)).toEqual([]);
+        const model = parseModel(src);
+        const result = inferProject([{ model, uri: undefined, imports: [] }]);
+        const usersBinding = model.bindings.find(b => b.name === 'users')!;
+        expect(result.typeOf(usersBinding)).toBe('query { age: int, id: int, name: string }');
+    });
+
+    test('recursive aliases are diagnosed, not expanded forever', () => {
+        expect(typeErrors(`type A = A\nt: A = table "t"\nq = t`).join('\n')).toContain("recursive type alias 'A'");
+    });
+});
 
 describe('annotations and ascription', () => {
     test('binding annotation with an open row', () => {
@@ -243,6 +266,11 @@ describe('annotations and ascription', () => {
 
     test('non-scalar table columns are rejected at runtime', () => {
         expect(allErrors(`q: query { id: int, f: int -> int } = table "users"`).join('\n')).toContain("schema entry 'f' must be a scalar type");
+    });
+
+    test('duplicate fields in type annotations are errors', () => {
+        const messages = typeErrors(`t: query { a: int, a: string } = table "t"`);
+        expect(messages.join('\n')).toContain("duplicate field 'a' in query type");
     });
 
     test('unknown type names are errors', () => {
@@ -318,6 +346,23 @@ describe('type errors', () => {
 // ---------------------------------------------------------------------------
 
 describe('table schemas are types', () => {
+    test('dynamic tables are shared holes, not forall rows', () => {
+        // q1 binds id:int; q2 later requires id:string — the two uses of the
+        // same table hole are unified together, so the conflict is reported.
+        const conflict = typeErrors(`t = table "t"
+q1 = t & map (u => { a = u.id + 1 })
+q2 = t & map (u => { b = u.id == "x" })`);
+        expect(conflict.join('\n')).toContain('cannot apply');
+        // A user-written hole annotation is a named metavariable.
+        const holes = `f: ?a -> ?a = x => x
+users: query { id: int } = table "users"
+q = users & map (u => { id = f u.id })`;
+        expect(typeErrors(holes)).toEqual([]);
+        const model = parseModel('t = table "users"');
+        const result = inferProject([{ model, uri: undefined, imports: [] }]);
+        expect(result.typeOf(model.bindings[0]!)).toBe('query ?table_users');
+    });
+
     test('un-annotated tables are dynamic: the row type is inferred from use', () => {
         const src = `users = table "users"\nq = users & filter (u => u.age >= 18) & take 5`;
         expect(typeErrors(src)).toEqual([]);
@@ -362,7 +407,7 @@ describe('table schemas are types', () => {
     });
 
     test('nullable columns are written explicitly with `?`', () => {
-        expect(typeErrors(`users: query { id: int, email: string? } = table "users"\nq = users & filter (u => u.email == null)`)).toEqual([]);
+        expect(typeErrors(`users: query { id: int, email: (maybe string) } = table "users"\nq = users & filter (u => u.email == null)`)).toEqual([]);
     });
 
     test('open schemas are rejected at runtime', () => {
@@ -545,7 +590,7 @@ describe('DSL modes are static types', () => {
     });
 
     test('a fold result row is plain: HAVING filters and ORDER BY on aggregate columns work', () => {
-        const src = `${USERS}\norders: query { user_id: int, total: float } = table "orders"\nq = users\n    & join inner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, total = r.total })\n    & fold (r => { uid = group r.uid, total = sum r.total })\n    & filter (r => r.total > 100.0)\n    & sort (r => [desc r.total])`;
+        const src = `${USERS}\norders: query { user_id: int, total: float } = table "orders"\nq = users\n    & join inner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, total = r.total })\n    & fold (r => { uid = group r.uid, total = sum r.total })\n    & filter (r => from_maybe 0.0 r.total > 100.0)\n    & sort (r => [desc r.total])`;
         expect(typeErrors(src)).toEqual([]);
     });
 
@@ -569,7 +614,7 @@ describe('review fixes: composition types, merge partials, shadowing, case nulla
     }
 
     test('composition infers a function type, not its result type', () => {
-        expect(typeOf('f = upper <<< lower', 'f')).toBe('string? -> string?');
+        expect(typeOf('f = upper <<< lower', 'f')).toBe('string -> string');
     });
 
     test('partial application of merge keeps the row union', () => {
@@ -582,7 +627,7 @@ q = users & map (u => extend u)`;
 
     test('case is nullable only when it has no fallback branch', () => {
         expect(typeOf('q = case { true => 1, _ => 2 }', 'q')).toBe('int');
-        expect(typeOf('q = case { true => 1 }', 'q')).toBe('int?');
+        expect(typeOf('q = case { true => 1 }', 'q')).toBe('(maybe int)');
     });
 
     test('special builtin typing is disabled when the prelude name is shadowed', () => {

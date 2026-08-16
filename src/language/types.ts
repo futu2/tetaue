@@ -4,8 +4,9 @@
  * Types are Hindley–Milner monotypes extended with:
  *   - row types `{ a: int, b: string | r }` (record rows with an optional
  *     row variable tail) — the engine of row polymorphism;
- *   - Maybe-style nullability `t?` ("a t or NULL"), transparent in
- *     unification (absorption: t <: t?);
+ *   - Haskell-style `maybe T` ("a t or SQL NULL"). Maybe is a
+ *     distinct type constructor: `T` and `maybe T` never unify, so
+ *     nullability is always explicit;
  *   - the parameterized `query { row }` type for tables/pipelines.
  *
  * Variables are kind-flexible (a fresh variable becomes a row variable the
@@ -20,7 +21,7 @@ export type PrimName = 'int' | 'float' | 'string' | 'bool' | 'date' | 'timestamp
 export type Type =
     | { kind: 'var'; id: number }
     | { kind: 'prim'; name: PrimName }
-    | { kind: 'nullable'; of: Type }
+    | { kind: 'maybe'; of: Type }
     | { kind: 'fun'; from: Type; to: Type }
     | { kind: 'list'; of: Type }
     /** A record row: unordered label → type map, plus an optional tail variable. */
@@ -39,7 +40,7 @@ export type Type =
     | { kind: 'builtin'; name: string; of: Type }
     /**
      * An aggregate-mode expression (`sum o.total`, `count o.id`, ...) — "the
-     * value of type `t`, aggregated". Transparent in unification (like `?`),
+     * value of type `t`, aggregated". Transparent in unification (like `maybe`),
      * so comparisons/arithmetic on aggregate results work; the mode is
      * enforced by the fold/map mode checks in inference, which inspect the
      * raw (pre-unification) field types.
@@ -59,6 +60,11 @@ export interface VarInfo {
     rigid: boolean;
     /** User-facing name from an annotation, or a generated name for messages. */
     name: string | null;
+    /**
+     * A named hole (`?name`): never generalized, so every use of the same
+     * binding shares one unsolved metavariable until unification fills it.
+     */
+    hole: boolean;
 }
 
 export interface Scheme {
@@ -87,9 +93,10 @@ export function prim(name: PrimName): Type {
     return { kind: 'prim', name };
 }
 
-export function nullable(t: Type): Type {
-    // `?` is idempotent: `t??` is `t?`.
-    return t.kind === 'nullable' ? t : { kind: 'nullable', of: t };
+export function maybeOf(t: Type): Type {
+    // Unlike the old `maybe T` design, Maybe is NOT transparent: `maybe T`
+    // never unifies with `T`. Nesting is meaningful (Haskell-style).
+    return { kind: 'maybe', of: t };
 }
 
 export function fun(from: Type, to: Type): Type {
@@ -145,7 +152,14 @@ export class TypeUniverse {
 
     fresh(kind: 'flex' | 'type' | 'row' = 'flex', name: string | null = null): Type {
         const id = this.nextId++;
-        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name });
+        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name, hole: false });
+        return { kind: 'var', id };
+    }
+
+    /** Create a hole (`?name`): flexible, named, and never generalized. */
+    freshHole(kind: 'flex' | 'type' | 'row' = 'flex', name: string): Type {
+        const id = this.nextId++;
+        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name, hole: true });
         return { kind: 'var', id };
     }
 
@@ -180,18 +194,9 @@ export class TypeUniverse {
         return r;
     }
 
-    /** Resolve, then normalize `?`: strip wrappers around vars that resolve to nullable. */
+        /** Resolve a type through variable bindings. */
     normalize(t: Type): Type {
-        const r = this.resolve(t);
-        if (r.kind === 'nullable') {
-            const inner = this.normalize(r.of);
-            return inner.kind === 'nullable' ? inner : nullable(inner);
-        }
-        if (r.kind === 'var') {
-            const bound = this.bindings.get(r.id);
-            if (bound) return this.normalize(bound);
-        }
-        return r;
+        return this.resolve(t);
     }
 
     /** Free (unbound) variable ids reachable from `t`, resolving bindings. */
@@ -201,7 +206,7 @@ export class TypeUniverse {
             const r = this.resolve(x);
             switch (r.kind) {
                 case 'var': out.add(r.id); break;
-                case 'nullable': visit(r.of); break;
+                case 'maybe': visit(r.of); break;
                 case 'fun': visit(r.from); visit(r.to); break;
                 case 'list': visit(r.of); break;
                 case 'row':
@@ -290,7 +295,7 @@ export class TypeUniverse {
         this.nextId = snapshot.nextId;
     }
 
-    /** Unify two types (with `?` absorption). Returns the unified type. Throws UnifyError. */
+    /** Unify two types structurally (no implicit Maybe conversion). Throws UnifyError. */
     private unifyInternal(a: Type, b: Type): Type {
         a = this.resolve(a);
         b = this.resolve(b);
@@ -303,32 +308,15 @@ export class TypeUniverse {
         if (b.kind === 'builtin') return this.unifyInternal(a, b.of);
 
         if (a.kind === 'var') {
-            // `α` vs `α?` is fine: `?` is transparent (occurs check strips it).
-            if (b.kind === 'nullable') {
-                const inner = this.resolve(b.of);
-                if (inner.kind === 'var' && inner.id === a.id) return b;
-            }
             this.bind(a.id, b);
             return b;
         }
         if (b.kind === 'var') {
-            if (a.kind === 'nullable') {
-                const inner = this.resolve(a.of);
-                if (inner.kind === 'var' && inner.id === b.id) return a;
-            }
             this.bind(b.id, a);
             return a;
         }
 
-        // `?` absorption: strip wrappers, re-unify, re-wrap.
-        const aNull = a.kind === 'nullable' ? a.of : null;
-        const bNull = b.kind === 'nullable' ? b.of : null;
-        if (aNull !== null || bNull !== null) {
-            const inner = this.unifyInternal(aNull ?? a, bNull ?? b);
-            return nullable(inner);
-        }
-
-        // `agg`/`group` mode absorption (transparent, like `?`): unify the
+        // `agg`/`group` mode absorption (transparent): unify the
         // payloads and re-wrap. Mixed modes never unify (an aggregate result
         // is not a GROUP BY key and vice versa).
         const aAgg = a.kind === 'agg' ? a.of : null;
@@ -356,6 +344,12 @@ export class TypeUniverse {
                 break;
             case 'list':
                 if (b.kind === 'list') {
+                    this.unifyInternal(a.of, b.of);
+                    return a;
+                }
+                break;
+            case 'maybe':
+                if (b.kind === 'maybe') {
                     this.unifyInternal(a.of, b.of);
                     return a;
                 }
@@ -539,13 +533,17 @@ export class TypeUniverse {
     // Schemes
     // -----------------------------------------------------------------------
 
-    /** Generalize `t` over variables not free in `envTypes`. */
+    /** Generalize `t` over variables not free in `envTypes` and not holes. */
     generalize(envTypes: Type[], t: Type): Scheme {
         const envFree = new Set<number>();
         for (const e of envTypes) {
             for (const v of this.freeVars(e)) envFree.add(v);
         }
-        const free = [...this.freeVars(t)].filter(v => !envFree.has(v));
+        const free = [...this.freeVars(t)].filter(v => {
+            if (envFree.has(v)) return false;
+            const info = this.infos.get(v);
+            return info !== undefined && !info.hole;
+        });
         return {
             vars: free.map(id => {
                 const info = this.infos.get(id)!;
@@ -588,7 +586,7 @@ export class TypeUniverse {
             return subst.get(r.id) ?? r;
         }
         switch (r.kind) {
-            case 'nullable': return nullable(this.substitute(subst, r.of));
+            case 'maybe': return maybeOf(this.substitute(subst, r.of));
             case 'fun': return fun(this.substitute(subst, r.from), this.substitute(subst, r.to));
             case 'list': return listOf(this.substitute(subst, r.of));
             case 'row': {
@@ -611,8 +609,8 @@ export class TypeUniverse {
     // -----------------------------------------------------------------------
 
     /**
-     * Render a type for messages. When `nullable` is false (phase 1), `?`
-     * is stripped so inference messages match the interpreter's exactly.
+     * Render a type for messages. Maybe is always visible as
+     * `(maybe T)`; holes render as `?name`.
      *
      * Rows are flattened through their open-tail chain (an open row is a
      * linked list of single-field rows after unification) and shown as one
@@ -627,13 +625,14 @@ export class TypeUniverse {
             switch (r.kind) {
                 case 'var': {
                     const info = this.infos.get(r.id)!;
+                    if (info.hole) return `?${info.name ?? `h${r.id}`}`;
                     if (info.name) return info.name;
                     if (friendlyVars) return info.kind === 'row' ? 'r' : 't';
                     return info.kind === 'row' ? `r${r.id}` : `t${r.id}`;
                 }
                 case 'prim': return PRIM_NAMES[r.name];
-                case 'nullable':
-                    return showNullable ? `${p(r.of, false)}?` : p(r.of, false);
+                case 'maybe':
+                    return `(maybe ${p(r.of, false)})`;
                 case 'list': return `[${p(r.of, false)}]`;
                 case 'row': {
                     const { fields, tail } = this.resolveRow(r);

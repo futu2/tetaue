@@ -28,6 +28,7 @@ import type { TetaueServices } from './language/tetaue-module.js';
 import { DIALECTS, isDialect } from './language/render.js';
 import type { RenderFormat } from './language/render.js';
 import { compileModuleText } from './language/compile.js';
+import { inferProject } from './language/inference.js';
 import type { CompileDiagnostic, CompileOutcome } from './language/compile.js';
 import { collectModuleTree, moduleOf } from './language/imports.js';
 import type { ProjectModule } from './language/imports.js';
@@ -43,6 +44,8 @@ Usage:
       Validate the module (and its imports) and render its query to SQL.
   tetaue check <file.tetaue>
       Validate the module and report all diagnostics.
+  tetaue types <file.tetaue>
+      Print the inferred type of every binding in the module (imports resolved).
   tetaue parse <file.tetaue>
       Parse the module and print its AST as JSON.
   tetaue format <file.tetaue...> [--check] [--tabs] [--tab-width <n>]   (alias: fmt)
@@ -151,7 +154,7 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
 // parse
 // ---------------------------------------------------------------------------
 
-function loadProject(file: string, services: TetaueServices): { modules: readonly ProjectModule[]; main: ProjectModule } {
+function loadProject(file: string, services: TetaueServices): { modules: readonly ProjectModule[]; main: ProjectModule; importsByModule: ReadonlyMap<ProjectModule, readonly import('./language/imports.js').ResolvedImportEdge[]> } {
     const rootUri = URI.file(path.resolve(file)).toString();
     const rootText = readFileSync(URI.parse(rootUri).fsPath, 'utf8');
 
@@ -187,7 +190,7 @@ function loadProject(file: string, services: TetaueServices): { modules: readonl
     });
 
     // Prepend import-resolution errors onto the main module's analysis.
-    const { modules, diagnostics: treeDiagnostics } = tree;
+    const { modules, importsByModule, diagnostics: treeDiagnostics } = tree;
     if (treeDiagnostics.length > 0) {
         console.error(`error: failed to resolve imports in ${file}`);
         for (const d of treeDiagnostics) {
@@ -198,7 +201,7 @@ function loadProject(file: string, services: TetaueServices): { modules: readonl
         }
         process.exit(1);
     }
-    return { modules, main };
+    return { modules, main, importsByModule };
 }
 
 async function cmdParse(args: string[]): Promise<number> {
@@ -215,6 +218,31 @@ async function cmdParse(args: string[]): Promise<number> {
     }
     console.log(JSON.stringify(dumpAst(main.model), null, 2));
     return 0;
+}
+
+async function cmdTypes(args: string[]): Promise<number> {
+    if (args.some(a => a.startsWith('-'))) return usage(`types takes no options`);
+    if (args.length !== 1) return usage(`exactly one file expected, got ${args.length}`);
+    const file = args[0]!;
+    const services = createTetaueServices(NodeFileSystem).tetaue;
+    let project: ReturnType<typeof loadProject>;
+    try {
+        project = loadProject(file, services);
+    } catch (err) {
+        console.error(`error: ${msg(err)}`);
+        return 1;
+    }
+    const result = inferProject(project.modules, project.importsByModule);
+    for (const d of result.diagnostics) {
+        const m = moduleOf(d.node, project.modules) ?? project.main;
+        const pos = d.node?.$cstNode?.range.start;
+        const where = pos ? `${m.uri ?? file}:${pos.line + 1}:${pos.character + 1}` : (m.uri ?? file);
+        console.error(`${where}: error: ${d.message}`);
+    }
+    for (const binding of project.main.model.bindings) {
+        console.log(`${binding.name} : ${result.typeOf(binding) ?? '?'}`);
+    }
+    return result.diagnostics.length > 0 ? 1 : 0;
 }
 
 function dumpAst(node: { $type: string }): unknown {
@@ -725,6 +753,8 @@ export async function main(argv: string[]): Promise<number> {
         case 'render':
         case 'check':
             return cmdRenderCheck(command, args);
+        case 'types':
+            return cmdTypes(args);
         case 'parse':
             return cmdParse(args);
         case 'format':

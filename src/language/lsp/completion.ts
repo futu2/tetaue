@@ -187,6 +187,9 @@ function moduleAliasExports(receiver: AstNode | undefined, modules: readonly Pro
     const root = modules[modules.length - 1];
     const edge = (root ? importsByModule.get(root) ?? root.imports ?? [] : []).find(e => e.alias === alias);
     if (!edge) return undefined;
+    if (edge.importNode.names.length > 0) {
+        return edge.importNode.names.map(item => item.renamed ?? item.name);
+    }
     return edge.target.model.bindings.filter(b => b.export).map(b => b.name);
 }
 

@@ -26,5 +26,8 @@ export function moduleQualifiedBinding(e: AccessExpression, modules: readonly Pr
     const root = modules[modules.length - 1];
     const edge = (root ? importsByModule.get(root) ?? root.imports ?? [] : []).find(imp => imp.alias === alias);
     if (!edge) return undefined;
-    return edge.target.model.bindings.find(b => b.name === e.property);
+    // Selective imports may rename: `import "x" as t (users as u)` exposes
+    // `t.u` for exported binding `users`.
+    const selected = edge.importNode.names.find(item => (item.renamed ?? item.name) === e.property);
+    return edge.target.model.bindings.find(b => b.name === (selected?.name ?? e.property));
 }

@@ -8,30 +8,31 @@
  * aggregation layer can dedupe by (node, message).
  *
  * Row polymorphism: a row lambda is typed once against fresh row variables
- * (`u => u.age >= 18` : `forall r. { age: int? | r } -> bool`) and
- * instantiated at each use. Nullability is Maybe-style (`t?`, absorbed in
- * unification); numerics are strict (int and float are unrelated). See
- * docs/design/type-system.md.
+ * (`u => u.age >= 18` : `forall r. { age: int | r } -> bool`) and
+ * instantiated at each use. Nullability is explicit Haskell-style
+ * `(maybe T)` — there is NO implicit T -> maybe T conversion. Holes
+ * (`?name`) are unsolved metavariables shared through the module, never
+ * generalized. Numerics are strict. See docs/design/type-system.md.
  ******************************************************************************/
 import type { AstNode } from 'langium';
 import {
     isAccessExpression, isAscription, isApplication, isBinaryExpression,
     isBooleanLiteral, isCaseExpression, isDollarParam, isFunType, isIdentifier, isLambda,
     isLambdaBinaryExpression, isLambdaLetExpression, isLetExpression, isListLiteral, isListType,
-    isMapLiteral, isNullLiteral, isNullType,
-    isNumberLiteral, isQueryType, isRecordType, isStringLiteral, isTypeParen,
+    isMapLiteral, isNullLiteral,
+    isNumberLiteral, isQualifiedTypeName, isQueryType, isRecordType, isStringLiteral, isTypeAtom, isTypeHole, isTypeParen,
     isTypeVar, isUnaryMinus,
-    type Binding, type CaseExpression, type Expr, type Model,
+    type Binding, type CaseExpression, type Expr, type Lambda, type MapEntry, type Model,
 } from './generated/ast.js';
 import type { Type as LangiumType } from './generated/ast.js';
 import {
     TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
-    builtinOf, fun, listOf, nullable, prim, queryOf, rowOf,
+    builtinOf, fun, listOf, maybeOf, prim, queryOf, rowOf,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
 import { moduleOf } from './imports.js';
-import { resolveImportScope } from './project-scope.js';
+import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
 import { parseStringLiteral } from './interpreter.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
 import { CAST_TYPES, LIST_ARITY } from './builtin.js';
@@ -106,6 +107,12 @@ class Inferencer {
      * preserved through a namespace). Reset per module.
      */
     modules = new Map<string, Map<string, Scheme>>();
+    /** Module-local type aliases (name -> type AST), reset per module. */
+    private typeAliases = new Map<string, LangiumType>();
+    /** Namespace aliases for qualified type names (`t.UserRow`). */
+    private typeNamespaces = new Map<string, Map<string, LangiumType>>();
+    /** Alias names currently being expanded (cycle detection). */
+    private activeTypeAliases = new Set<string>();
     diagnostics: InferDiagnostic[] = [];
     /**
      * Checks that must run after the whole project has been unified (for
@@ -128,7 +135,7 @@ class Inferencer {
     private flushDeferred(): void {
         const strip = (t: Type): Type => {
             let r = this.u.peel(t);
-            while (r.kind === 'nullable') r = this.u.peel(r.of);
+            while (r.kind === 'maybe') r = this.u.peel(r.of);
             return r;
         };
         const nameOf = (t: Type): string => {
@@ -196,15 +203,27 @@ class Inferencer {
     inferProject(modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map()): void {
         this.prelude();
         const exportsByModule = new Map<ProjectModule, Map<string, Scheme>>();
+        const typeExportsByModule = new Map<ProjectModule, Map<string, LangiumType>>();
         for (const module of modules) {
             this.env = new Map(this.preludeEnv);
             this.modules = new Map<string, Map<string, Scheme>>();
-            const imported = resolveImportScope(module, importsByModule.get(module) ?? module.imports ?? [], exportsByModule);
+            const imported = resolveImportScope(module, importsByModule.get(module) ?? module.imports ?? [], exportsByModule, typeExportsByModule);
+            const importedTypes = resolveTypeImportScope(module, importsByModule.get(module) ?? module.imports ?? [], typeExportsByModule);
+            for (const d of importedTypes.diagnostics) this.diag(d.node, d.message);
             for (const d of imported.diagnostics) this.diag(d.node, d.message);
             for (const [name, scheme] of imported.flat) this.env.set(name, scheme);
             for (const [alias, selected] of imported.namespaces) this.modules.set(alias, new Map(selected));
             const scope = new Map(imported.scope);
             const exported = new Map<string, Scheme>();
+            this.typeAliases = new Map(importedTypes.flat);
+            this.typeNamespaces = new Map([...importedTypes.namespaces].map(([k, v]) => [k, new Map(v)]));
+            for (const alias of module.model.types) {
+                if (this.typeAliases.has(alias.name)) {
+                    this.diag(alias, `type alias '${alias.name}' conflicts with an imported type alias`);
+                    continue;
+                }
+                this.typeAliases.set(alias.name, alias.type);
+            }
             for (const binding of module.model.bindings) {
                 if (scope.has(binding.name)) {
                     this.diag(binding, conflictMessage(binding.name, scope.get(binding.name)!, 'a local binding'));
@@ -219,6 +238,9 @@ class Inferencer {
                 this.inferBinding(binding, exported);
             }
             exportsByModule.set(module, exported);
+            typeExportsByModule.set(module, new Map(
+                module.model.types.filter(a => a.export).map(a => [a.name, a.type]),
+            ));
         }
         this.flushDeferred();
     }
@@ -348,7 +370,7 @@ class Inferencer {
         if (isNumberLiteral(e)) return prim(numberLiteralType(e));
         if (isStringLiteral(e)) return prim('string');
         if (isBooleanLiteral(e)) return prim('bool');
-        if (isNullLiteral(e)) return nullable(this.u.fresh()); // ∀a. a?
+        if (isNullLiteral(e)) return maybeOf(this.u.fresh()); // ∀a. maybe a
         if (isCaseExpression(e)) return this.inferCase(e, env);
         if (isListLiteral(e)) {
             let item: Type | null = null;
@@ -378,7 +400,12 @@ class Inferencer {
         if (isMapLiteral(e)) {
             const fields: [string, Type][] = [];
             for (const entry of e.entries) {
-                fields.push([entry.key, this.inferExpr(entry.value, env)]);
+                if (entry.value) {
+                    fields.push([entry.key, this.inferExpr(entry.value, env)]);
+                } else {
+                    const t = this.inferFieldPun(entry, env);
+                    fields.push([entry.key, t]);
+                }
             }
             const updated = rowOf(fields);
             if (!e.receiver) return updated;
@@ -565,8 +592,22 @@ class Inferencer {
         const lt = this.inferExpr(e.left, env);
         const rt = this.inferExpr(e.right, env);
         if (op === '==' || op === '!=' || op === '<' || op === '<=' || op === '>' || op === '>=') {
+            const leftNull = this.isNullLiteralNode(e.left);
+            const rightNull = this.isNullLiteralNode(e.right);
             try {
-                this.u.unify(nullable(lt), nullable(rt));
+                if (leftNull || rightNull) {
+                    // null : forall a. maybe a — comparing a nullable value with
+                    // null is fine and lowers to IS [NOT] NULL.
+                    this.u.unify(lt, rt);
+                } else {
+                    this.u.unify(lt, rt);
+                    const rl = this.u.peel(lt);
+                    const rr = this.u.peel(rt);
+                    if (rl.kind === 'maybe' || rr.kind === 'maybe') {
+                        this.diag(e, `comparison expects non-null values — use is_null/is_not_null or from_maybe, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                        return prim('bool');
+                    }
+                }
             } catch (err) {
                 if (err instanceof UnifyError) {
                     this.diag(e, `cannot compare ${this.u.pretty(lt)} with ${this.u.pretty(rt)}`);
@@ -594,7 +635,23 @@ class Inferencer {
         if (op === '<>') {
             return this.inferMerge(lt, rt, e);
         }
-        // + - * / %
+        // Haskell-base numerics: + - * require the same numeric type; / is
+        // fractional division and requires float; use div/mod for integrals.
+        if (op === '/') {
+            try {
+                this.u.unify(lt, prim('float'));
+                this.u.unify(rt, prim('float'));
+            } catch (err) {
+                if (err instanceof UnifyError) {
+                    this.diag(e, `'/' requires float operands — use div for integral division, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                } else {
+                    throw err;
+                }
+                return this.u.fresh();
+            }
+            return prim('float');
+        }
+        // + - *
         try {
             const unified = this.u.unify(lt, rt);
             const rl = this.u.peel(lt);
@@ -636,11 +693,29 @@ class Inferencer {
         // application of zero arguments: keep the builtin tag so its special
         // typing rules survive first-class bindings.
         if (e.arguments.length === 0) return rawF;
+        // `table "users"` — an un-annotated table is a fresh ROW HOLE, not
+        // `forall r. query r`: the hole is excluded from generalization, so
+        // every use of the same binding feeds one shared metavariable and the
+        // schema is inferred from all use sites together.
+        if (funcName === 'table' && e.arguments.length === 1) {
+            this.inferArg(e.arguments[0]!, env);
+            let holeName = 'table';
+            const tableArg = e.arguments[0]!;
+            if (isStringLiteral(tableArg)) {
+                const parsed = parseStringLiteral(tableArg.value);
+                holeName = `table_${parsed.replace(/[^A-Za-z0-9_]/g, '_')}`;
+            }
+            return queryOf(this.u.freshHole('row', holeName));
+        }
         // `fold`/`map` — the DSL's mode checks: fold entries must be
         // aggregate/group mode (a plain column is a type error), and the
         // result row strips the modes so downstream sees plain columns.
+        if (funcName === 'join' && e.arguments.length === 4) return this.inferJoin(e, env);
+        if (funcName === 'scalar' && e.arguments.length === 1) return this.inferScalar(e, env);
+        if ((funcName === 'in_query' || funcName === 'not_in_query') && e.arguments.length === 2) return this.inferInQuery(e, env);
         if (funcName === 'fold' && e.arguments.length === 1) return this.inferFold(e, env);
         if (funcName === 'map' && e.arguments.length === 1) return this.inferMap(e, env);
+        if (funcName === 'select' && e.arguments.length === 1) return this.inferSelect(e, env);
         // `merge` — the result row is the union of both rows (the right
         // record wins on overlapping fields), which the generic fun-type
         // application path cannot express; compute the union directly.
@@ -744,6 +819,160 @@ class Inferencer {
     }
 
     /**
+     * `join kind right on merger` — for LEFT/RIGHT/FULL joins the
+     * null-extended side can produce SQL NULLs, so the merger's output row is
+     * explicitly `maybe` on every projected field. INNER joins keep the
+     * merger's exact row type.
+     */
+    private inferJoin(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
+        const kindName = this.joinKindNameOf(e.arguments[0]);
+        if (kindName === null) {
+            this.argError('join', 0, e.arguments[0]!, this.inferArg(e.arguments[0]!, env), undefined, undefined);
+            return this.u.fresh();
+        }
+        const r = this.u.fresh('row');
+        const s = this.u.fresh('row');
+        const t = this.u.fresh('flex');
+        const rightT = this.inferArg(e.arguments[1]!, env);
+        const onT = this.inferArg(e.arguments[2]!, env);
+        const mergerT = this.inferArg(e.arguments[3]!, env);
+        try {
+            this.u.unify(rightT, queryOf(s));
+            this.u.unify(onT, fun(r, fun(s, prim('bool'))));
+            this.u.unify(mergerT, fun(r, fun(s, t)));
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.diag(e, `cannot apply a function of type ${this.u.pretty(mergerT)} to the join arguments`);
+            } else {
+                throw err;
+            }
+            return this.u.fresh();
+        }
+        let row = this.u.peel(t);
+        if (row.kind === 'var') {
+            const tail = this.u.fresh('row');
+            try { this.u.bind(row.id, { kind: 'row', fields: new Map(), tail }); } catch { /* leave open */ }
+            row = this.u.peel(t);
+        }
+        if (row.kind !== 'row') {
+            this.argError('join', 3, e.arguments[3]!, mergerT, undefined, undefined);
+            return this.u.fresh();
+        }
+        if (kindName === 'inner') return fun(queryOf(r), queryOf(row));
+
+        // Null-extended columns are nullable in the result. We conservatively
+        // wrap every projected field; a future provenance analysis can narrow
+        // this to only the fields read from the null-extended side.
+        const resolved = this.u.resolveRow(row);
+        const fields: [string, Type][] = [...resolved.fields].map(([key, ft]) => {
+            const rt = this.u.peel(ft);
+            return [key, rt.kind === 'maybe' ? ft : maybeOf(ft)];
+        });
+        return fun(queryOf(r), queryOf({ kind: 'row', fields: new Map(fields), tail: resolved.tail }));
+    }
+
+    private joinKindNameOf(node: AstNode | undefined): string | null {
+        let cur = node;
+        while (cur && isApplication(cur) && cur.arguments.length === 0) cur = cur.func;
+        if (cur && isIdentifier(cur)) {
+            const name = cur.name;
+            return name === 'inner' || name === 'left' || name === 'right' || name === 'full' ? name : null;
+        }
+        return null;
+    }
+
+    /**
+     * `scalar q` — a scalar subquery. SQL allows exactly one output column;
+     * the result is maybe because an empty subquery yields NULL.
+     */
+    private inferScalar(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
+        const argT = this.inferArg(e.arguments[0]!, env);
+        const r = this.u.peel(argT);
+        if (r.kind !== 'query') {
+            this.diag(e, `scalar expects a query argument, got type ${this.u.pretty(argT)}`);
+            return this.u.fresh();
+        }
+        const row = this.u.peel(r.row);
+        if (row.kind === 'var') {
+            const tail = this.u.fresh('row');
+            try { this.u.bind(row.id, { kind: 'row', fields: new Map(), tail }); } catch { /* leave open */ }
+            return maybeOf(this.u.fresh());
+        }
+        if (row.kind !== 'row') {
+            this.diag(e, `scalar expects a query argument, got type ${this.u.pretty(argT)}`);
+            return this.u.fresh();
+        }
+        const fields = [...this.u.resolveRow(row).fields];
+        if (fields.length !== 1) {
+            this.diag(e, `scalar subquery must return exactly one column, got ${fields.length}`);
+            return this.u.fresh();
+        }
+        return maybeOf(fields[0]![1]);
+    }
+
+    /** `in_query x q` / `not_in_query x q` — IN (SELECT ...). */
+    private inferInQuery(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
+        const valueT = this.inferArg(e.arguments[0]!, env);
+        const queryT = this.inferArg(e.arguments[1]!, env);
+        const r = this.u.peel(queryT);
+        if (r.kind !== 'query') {
+            this.diag(e, `${e.func && isApplication(e.func) && e.func.arguments.length === 0 && isIdentifier(e.func.func) ? e.func.func.name : 'in_query'} expects a query as its second argument, got type ${this.u.pretty(queryT)}`);
+            return this.u.fresh();
+        }
+        const row = this.u.peel(r.row);
+        if (row.kind !== 'row') return prim('bool'); // interpreter reports the shape
+        const fields = [...this.u.resolveRow(row).fields];
+        if (fields.length !== 1) {
+            this.diag(e, `in_query subquery must return exactly one column, got ${fields.length}`);
+            return prim('bool');
+        }
+        try {
+            this.u.unify(valueT, fields[0]![1]);
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.diag(e, `in_query requires matching types, got ${this.u.pretty(valueT)} and ${this.u.pretty(fields[0]![1])}`);
+            } else {
+                throw err;
+            }
+        }
+        return prim('bool');
+    }
+
+    /** `select ["id", "name"]` — a projection narrowing to the listed fields. */
+    private inferSelect(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
+        const listExpr = e.arguments[0]!;
+        this.inferArg(listExpr, env);
+        if (!isListLiteral(listExpr)) {
+            this.diag(listExpr, `select expects a list of column-name strings, e.g. select ["id", "name"]`);
+            return this.u.fresh();
+        }
+        const labels: string[] = [];
+        const seen = new Set<string>();
+        for (const item of listExpr.elements) {
+            let strNode: AstNode | undefined = item;
+            while (strNode && isApplication(strNode) && strNode.arguments.length === 0) strNode = strNode.func;
+            if (!isStringLiteral(strNode)) {
+                this.diag(item, `select entries must be string literals`);
+                continue;
+            }
+            const label = parseStringLiteral(strNode.value);
+            if (seen.has(label)) this.diag(item, `duplicate column '${label}' in select`);
+            seen.add(label);
+            labels.push(label);
+        }
+        if (labels.length === 0) {
+            this.diag(listExpr, `select expects at least one column name, e.g. select ["id"]`);
+        }
+        const r = this.u.fresh('row');
+        const fields: [string, Type][] = [];
+        for (const label of labels) {
+            const field = this.u.fieldOf(r, label);
+            fields.push([label, field?.type ?? this.u.fresh()]);
+        }
+        return fun(queryOf(r), queryOf(rowOf(fields)));
+    }
+
+    /**
      * `fold (o => { k = group o.k, s = sum o.v })` — the DSL's aggregate-mode
      * check. The lambda's result must be a record whose fields are ALL in
      * aggregate or group mode (`agg t` / `group t`), with at least one
@@ -777,11 +1006,27 @@ class Inferencer {
         }
         const res = this.u.resolveRow(ret);
         const entryNodes = this.entryNodesOf(argExpr);
+        const groupSigs = new Set<string>();
+        for (const [key, ft] of res.fields) {
+            if (this.u.peel(ft).kind !== 'group') continue;
+            const groupArg = this.groupArgumentOf(entryNodes?.get(key));
+            const sig = this.accessSignature(groupArg);
+            if (sig) groupSigs.add(sig);
+        }
         const out: [string, Type][] = [];
         let aggregates = 0;
         for (const [key, ft] of res.fields) {
             const raw = this.u.peel(ft);
             if (raw.kind === 'agg') {
+                const entry = entryNodes?.get(key);
+                const caseNode = this.unwrapApplicationExpr(entry);
+                if (caseNode && isCaseExpression(caseNode)) {
+                    const conditionSigs = this.conditionAccessSignatures(caseNode);
+                    const ungrouped = [...conditionSigs].some(sig => !groupSigs.has(sig));
+                    if (ungrouped) {
+                        this.diag(entry ?? argExpr, `fold entry '${key}' case conditions must be constant or use grouped columns`);
+                    }
+                }
                 aggregates++;
                 out.push([key, raw.of]);
             } else if (raw.kind === 'group') {
@@ -851,7 +1096,60 @@ class Inferencer {
         return fun(queryOf(r.from), queryOf(rowOf(out, res.tail)));
     }
 
-    /** The map-literal entry VALUE nodes of a lambda body, for anchored messages. */
+    /** Unwrap zero-argument Application wrappers around an expression node. */
+    /** Unwrap zero-argument Application wrappers around an expression node. */
+    /** Unwrap zero-argument Application wrappers around an expression node. */
+    private unwrapApplicationExpr(node: AstNode | undefined): AstNode | undefined {
+        let cur = node;
+        while (cur && isApplication(cur) && cur.arguments.length === 0) cur = cur.func;
+        return cur;
+    }
+
+    /** The `u.field` argument of a `group u.field` entry, for condition checks. */
+    private groupArgumentOf(node: AstNode | undefined): AstNode | undefined {
+        const app = this.unwrapApplicationExpr(node);
+        if (app && isApplication(app) && app.arguments.length === 1) {
+            return this.unwrapApplicationExpr(app.arguments[0]);
+        }
+        return undefined;
+    }
+
+    private accessSignature(node: AstNode | undefined): string | null {
+        const access = this.unwrapApplicationExpr(node);
+        if (!access || !isAccessExpression(access)) return null;
+        const receiver = access.receiver?.$cstNode?.text ?? '';
+        return `${receiver}.${access.property}`;
+    }
+
+    /** Access signatures (`u.status`) used in a CASE expression's conditions. */
+    private conditionAccessSignatures(caseNode: CaseExpression): Set<string> {
+        const sigs = new Set<string>();
+        for (const branch of caseNode.branches) {
+            if (!branch.cond) continue;
+            const stack: AstNode[] = [branch.cond];
+            while (stack.length > 0) {
+                const cur = stack.pop()!;
+                const access = this.unwrapApplicationExpr(cur);
+                if (access && isAccessExpression(access)) {
+                    const sig = this.accessSignature(access);
+                    if (sig) sigs.add(sig);
+                }
+                for (const key of Object.keys(cur)) {
+                    if (key.startsWith('$')) continue;
+                    const value = (cur as unknown as Record<string, unknown>)[key];
+                    if (Array.isArray(value)) {
+                        for (const v of value) {
+                            if (v && typeof v === 'object' && '$type' in (v as object)) stack.push(v as AstNode);
+                        }
+                    } else if (value && typeof value === 'object' && '$type' in (value as object)) {
+                        stack.push(value as AstNode);
+                    }
+                }
+            }
+        }
+        return sigs;
+    }
+
     private entryNodesOf(argExpr: Expr): Map<string, AstNode> | null {
         let node: Expr | null = argExpr;
         // `(o => { ... })` parses as a 0-argument Application wrapping the
@@ -862,7 +1160,7 @@ class Inferencer {
         let body: Expr | null = isLambda(node) ? (node.body as unknown as Expr) : node;
         while (body && isApplication(body) && body.arguments.length === 0) body = body.func;
         if (!body || !isMapLiteral(body)) return null;
-        return new Map(body.entries.map(en => [en.key, en.value]));
+        return new Map(body.entries.filter(en => en.value !== undefined).map(en => [en.key, en.value as AstNode]));
     }
 
     /**
@@ -890,7 +1188,7 @@ class Inferencer {
                 return;
             }
             try {
-                this.u.unify(nullable(kind === 'string' ? prim('string') : prim('int')), t);
+                this.u.unify(kind === 'string' ? prim('string') : prim('int'), t);
             } catch (err) {
                 if (err instanceof UnifyError) {
                     this.diag(elements[i]!, `${name} expects ${kind === 'string' ? 'string' : 'numeric'} expressions, got type ${this.u.pretty(t)}`);
@@ -970,7 +1268,7 @@ class Inferencer {
                 base = valueT;
             } else {
                 try {
-                    this.u.unify(nullable(base), valueT);
+                    this.u.unify(base, valueT);
                 } catch (err) {
                     if (err instanceof UnifyError) {
                         this.diag(b.value, `case requires matching value types, got ${this.u.pretty(base)} and ${this.u.pretty(valueT)}`);
@@ -980,7 +1278,7 @@ class Inferencer {
                 }
             }
         }
-        return hasFallback ? (base ?? this.u.fresh()) : nullable(base ?? this.u.fresh());
+        return hasFallback ? (base ?? this.u.fresh()) : maybeOf(base ?? this.u.fresh());
     }
 
     /**
@@ -1122,10 +1420,10 @@ class Inferencer {
         return false;
     }
 
-    /** Resolve through variable bindings and `?` wrappers to the base type. */
+    /** Resolve through variable bindings and `maybe` wrappers to the base type. */
     private resolveBase(t: Type): Type {
         let r = this.u.peel(t);
-        while (r.kind === 'nullable') r = this.u.peel(r.of);
+        while (r.kind === 'maybe') r = this.u.peel(r.of);
         return r;
     }
 
@@ -1223,15 +1521,21 @@ class Inferencer {
             }
             return;
         }
+        if ((name === 'sum_where' || name === 'avg_where') && index === 1) {
+            if (r.kind === 'prim' && !isNumericPrim(r)) {
+                this.diag(node, `${name} expects a numeric expression, got type ${this.u.pretty(argType)}`);
+            }
+            return;
+        }
         if ((name === 'pow' || name === 'mod') && (index === 0 || index === 1)) {
             if (r.kind === 'prim' && !isNumericPrim(r)) {
                 this.diag(node, `${name} expects a numeric expression, got type ${this.u.pretty(argType)}`);
             }
             return;
         }
-        if (name === 'take' && index === 0) {
+        if ((name === 'take' || name === 'drop') && index === 0) {
             const okLiteral = isNumberLiteral(argExpr) && Number.isInteger(argExpr.value) && argExpr.value >= 0;
-            if (!okLiteral) this.diag(node, `take expects a non-negative integer literal`);
+            if (!okLiteral) this.diag(node, `${name} expects a non-negative integer literal`);
             return;
         }
         if (name === 'sort' && index === 0) {
@@ -1292,25 +1596,51 @@ class Inferencer {
 
     private translateType(t: LangiumType, rigid: boolean = false, names: Map<string, Type> = new Map(), rigidVars: number[] = []): Type {
         if (isTypeParen(t)) return this.translateType(t.type, rigid, names, rigidVars);
-        if (isNullType(t)) {
-            const base = this.translateType(t.base, rigid, names, rigidVars);
-            return t.nullable ? nullable(base) : base;
+        if (isTypeAtom(t)) {
+            if (t.maybeType) return maybeOf(this.translateType(t.maybeType, rigid, names, rigidVars));
+            if (t.base) return this.translateType(t.base, rigid, names, rigidVars);
+            return this.u.fresh();
         }
+        if (isTypeHole(t)) return this.typeHole(t.name);
         if (isFunType(t)) return fun(this.translateType(t.left, rigid, names, rigidVars), this.translateType(t.right, rigid, names, rigidVars));
         if (isListType(t)) return listOf(this.translateType(t.type, rigid, names, rigidVars));
         if (isRecordType(t)) {
+            this.checkDuplicateTypeFields(t.fields, 'record type');
             const fields: [string, Type][] = t.fields.map(f => [f.key, this.translateType(f.type, rigid, names, rigidVars)]);
-            const tail = t.tail ? this.typeOrRowVar(t.tail, 'row', rigid, names, rigidVars) : null;
+            const tail = t.tail ? this.typeTailVar(t.tail, rigid, names, rigidVars) : null;
             return rowOf(fields, tail);
         }
         if (isQueryType(t)) {
+            this.checkDuplicateTypeFields(t.fields, 'query type');
             const fields: [string, Type][] = t.fields.map(f => [f.key, this.translateType(f.type, rigid, names, rigidVars)]);
-            const tail = t.tail ? this.typeOrRowVar(t.tail, 'row', rigid, names, rigidVars) : null;
+            const tail = t.tail ? this.typeTailVar(t.tail, rigid, names, rigidVars) : null;
             return queryOf(rowOf(fields, tail));
+        }
+        if (isQualifiedTypeName(t)) {
+            const ns = this.typeNamespaces.get(t.receiver);
+            const alias = ns?.get(t.name);
+            if (!alias) {
+                this.diag(t, `unknown type '${t.receiver}.${t.name}'`);
+                return this.u.fresh();
+            }
+            return this.translateType(alias, rigid, names, rigidVars);
         }
         if (isTypeVar(t)) {
             const name = t.name;
             if (isPrimName(name)) return prim(name);
+            const alias = this.typeAliases.get(name);
+            if (alias) {
+                if (this.activeTypeAliases.has(name)) {
+                    this.diag(t, `recursive type alias '${name}'`);
+                    return this.u.fresh();
+                }
+                this.activeTypeAliases.add(name);
+                try {
+                    return this.translateType(alias, rigid, names, rigidVars);
+                } finally {
+                    this.activeTypeAliases.delete(name);
+                }
+            }
             if (!/^[a-z]/.test(name)) {
                 this.diag(t, `unknown type '${name}'`);
                 return this.u.fresh();
@@ -1320,17 +1650,91 @@ class Inferencer {
         return this.u.fresh();
     }
 
+    /** `null` parses as a zero-argument Application wrapping NullLiteral. */
+    private isNullLiteralNode(node: AstNode | undefined): boolean {
+        let cur: AstNode | undefined = node;
+        while (cur && isApplication(cur) && cur.arguments.length === 0) cur = cur.func;
+        return isNullLiteral(cur);
+    }
+
+    /**
+     * `{ id, name }` inside a lambda body is sugar for
+     * `{ id = u.id, name = u.name }` where `u` is the lambda parameter.
+     */
+    private inferFieldPun(entry: MapEntry, env: Map<string, Scheme>): Type {
+        const lambda = this.enclosingLambda(entry);
+        const paramName = lambda?.param?.name;
+        if (!paramName) {
+            this.diag(entry, `field pun '${entry.key}' requires an enclosing lambda parameter, e.g. map (u => { ${entry.key} })`);
+            return this.u.fresh();
+        }
+        const source = env.get(paramName)?.type;
+        if (!source) {
+            this.diag(entry, `field pun '${entry.key}' cannot find lambda parameter '${paramName}'`);
+            return this.u.fresh();
+        }
+        const r = this.u.peel(source);
+        if (r.kind !== 'row' && r.kind !== 'var') {
+            this.diag(entry, `field pun '${entry.key}' expects a row parameter, got type ${this.u.pretty(source)}`);
+            return this.u.fresh();
+        }
+        const field = this.u.fieldOf(source, entry.key);
+        return field?.type ?? this.u.fresh();
+    }
+
+    private enclosingLambda(node: AstNode): Lambda | null {
+        let cur: AstNode | undefined = node;
+        let child: AstNode | undefined;
+        while (cur) {
+            const parent: AstNode | undefined = cur.$container;
+            if (parent && isLambda(parent) && (parent.body as unknown as AstNode) === cur) return parent;
+            child = cur;
+            cur = parent;
+        }
+        return null;
+    }
+
+    /** Duplicate labels in a record/query type collapse silently in a Map — diagnose them. */
+    private checkDuplicateTypeFields(fields: readonly { key: string }[], what: string): void {
+        const seen = new Set<string>();
+        for (const field of fields) {
+            if (seen.has(field.key)) {
+                this.diag(field as unknown as AstNode, `duplicate field '${field.key}' in ${what}`);
+            }
+            seen.add(field.key);
+        }
+    }
+
     /** A lowercase type name is a variable; the same name reuses the same var within one annotation. */
     private typeOrRowVar(name: string, kind: VarKind, rigid: boolean, names: Map<string, Type>, rigidVars: number[]): Type {
-        const existing = names.get(name);
+        const key = `${kind}:${name}`;
+        const existing = names.get(key);
         if (existing) return existing;
         const fresh = this.u.fresh(kind === 'row' ? 'row' : 'flex', name);
         if (fresh.kind === 'var' && rigid) {
             this.u.setVarRigid(fresh.id, true);
             rigidVars.push(fresh.id);
         }
-        names.set(name, fresh);
+        names.set(key, fresh);
         return fresh;
+    }
+
+    /** `?name` in a row-tail position is a row hole; elsewhere it is a type hole. */
+    private typeTailVar(name: string, rigid: boolean, names: Map<string, Type>, rigidVars: number[]): Type {
+        if (name.startsWith('?')) {
+            const key = `row-hole:${name}`;
+            const existing = names.get(key);
+            if (existing) return existing;
+            const hole = this.u.freshHole('row', name.slice(1));
+            names.set(key, hole);
+            return hole;
+        }
+        return this.typeOrRowVar(name, 'row', rigid, names, rigidVars);
+    }
+
+    /** A non-tail `?name` annotation: a named type hole shared within the annotation. */
+    private typeHole(name: string): Type {
+        return this.u.freshHole('flex', name);
     }
 
     /** Rendered, resolved type text of a recorded node (friendly var names for hover). */
@@ -1339,12 +1743,12 @@ class Inferencer {
         return t ? this.u.pretty(this.u.peel(t), true, true) : undefined;
     }
 
-    /** Row fields (sorted) of a recorded node's type, unwrapping `?` wrappers. */
+    /** Row fields (sorted) of a recorded node's type, unwrapping `maybe` wrappers. */
     fieldsOf(node: AstNode): { name: string; type: string }[] | undefined {
         const t = this.nodeTypes.get(node);
         if (!t) return undefined;
         let r = this.u.peel(t);
-        while (r.kind === 'nullable') r = this.u.peel(r.of);
+        while (r.kind === 'maybe') r = this.u.peel(r.of);
         if (r.kind !== 'row') return undefined;
         return this.u.rowLabels(r).map(name => {
             const field = this.u.lookupField(r, name);

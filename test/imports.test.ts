@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { collectModuleTree } from '../src/language/imports.ts';
 import { analyzeProject } from '../src/language/interpreter.ts';
+import { inferProject } from '../src/language/inference.ts';
 import { renderQuery, DIALECTS } from '../src/language/render.ts';
 import { parseModel, services } from './helpers.ts';
 
@@ -309,6 +310,60 @@ describe('selective imports', () => {
         }, 'main.tetaue');
         expect(sql).toContain('FROM users');
         expect(sql).toContain('LIMIT 3');
+    });
+
+    test('qualified type aliases work through a namespace import', () => {
+        const sql = renderFiles({
+            'schema.tetaue': `export type UserRow = query { id: int, name: string }`,
+            'main.tetaue': `import "schema.tetaue" as s\nusers: s.UserRow = table "users"\nq = users & take 1`,
+        }, 'main.tetaue');
+        expect(sql).toContain('FROM users');
+        const renamed = renderFiles({
+            'schema.tetaue': `export type UserRow = query { id: int }`,
+            'main.tetaue': `import "schema.tetaue" as s (UserRow as Row)\nusers: s.Row = table "users"\nq = users & take 1`,
+        }, 'main.tetaue');
+        expect(renamed).toContain('FROM users');
+        const missing = analyzeFiles({
+            'schema.tetaue': `export type UserRow = query { id: int }`,
+            'main.tetaue': `import "schema.tetaue" as s\nusers: s.Nope = table "users"\nq = users & take 1`,
+        }, 'main.tetaue');
+        const typeDiags = inferProject(missing.tree.modules, missing.tree.importsByModule).diagnostics.map(d => d.message).join('\n');
+        expect(typeDiags).toContain("unknown type 's.Nope'");
+    });
+
+    test('exported type aliases are imported flat and can be renamed', () => {
+        const sql = renderFiles({
+            'schema.tetaue': `export type UserRow = query { id: int, name: string }`,
+            'main.tetaue': `import "schema.tetaue" (UserRow as Row)\nusers: Row = table "users"\nq = users & take 1`,
+        }, 'main.tetaue');
+        expect(sql).toContain('FROM users');
+        const { result } = analyzeFiles({
+            'schema.tetaue': `export type UserRow = query { id: int }`,
+            'main.tetaue': `import "schema.tetaue"\nusers: UserRow = table "users"\nq = users & take 1`,
+        }, 'main.tetaue');
+        expect(result.diagnostics).toEqual([]);
+    });
+
+    test('import "x" (a as b) renames a flat selective import', () => {
+        const sql = renderFiles({
+            'tables.tetaue': `export users: query { id: int } = table "users"`,
+            'main.tetaue': `import "tables.tetaue" (users as people)\nq = people & take 1`,
+        }, 'main.tetaue');
+        expect(sql).toContain('FROM users');
+        expect(sql).toContain('LIMIT 1');
+    });
+
+    test('namespaced selective import renaming exposes the new name', () => {
+        const { result } = analyzeFiles({
+            'tables.tetaue': `export users: query { id: int } = table "users"`,
+            'main.tetaue': `import "tables.tetaue" as t (users as people)\nq = t.people & take 1`,
+        }, 'main.tetaue');
+        expect(result.diagnostics).toEqual([]);
+        const missing = analyzeFiles({
+            'tables.tetaue': `export users: query { id: int } = table "users"`,
+            'main.tetaue': `import "tables.tetaue" as t (users as people)\nq = t.users & take 1`,
+        }, 'main.tetaue');
+        expect(missing.result.diagnostics.map(d => d.message).join('\n')).toContain("module 't' has no exported binding 'users'");
     });
 
     test('an unlisted export stays invisible', () => {

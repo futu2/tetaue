@@ -60,6 +60,7 @@ bun run src/cli.ts render examples/report.tetaue --dialect sqlite
 ```
 tetaue render <file.tetaue> [--dialect sqlite|postgresql|mysql|trino|hive] [--format pretty|compact]
 tetaue check <file.tetaue>
+tetaue types <file.tetaue>
 tetaue parse <file.tetaue>
 tetaue format <file.tetaue...> [--check] [--tabs] [--tab-width <n>]   (alias: fmt)
 tetaue format --stdin [--check]
@@ -71,7 +72,8 @@ tetaue lsp [--stdio | --node-ipc | --socket=<port> | --pipe=<name>]
 
 - `render` validates the module (and its imports) and prints the rendered SQL.
   `--cte` emits named intermediate queries as `WITH ... AS` clauses.
-- `check` prints diagnostics (or `OK`). `parse` dumps the AST as JSON.
+- `check` prints diagnostics (or `OK`). `types` prints the inferred type
+  of every binding. `parse` dumps the AST as JSON.
 - `format` (alias `fmt`) runs the same token-stream formatter the editor uses:
   files are rewritten in place (default 4-space indent; `--tabs` / `--tab-width
   <n>` to change it). `--check` only reports files that would change and exits
@@ -238,7 +240,10 @@ report: query {
 - **Selective imports**: `import "tables.tetaue" (users, orders)` (or
   `import "tables.tetaue" as t (users)`) brings exactly those exports —
   unlisted names stay invisible, and a listed name that is not exported is
-  an error.
+  an error. Rename while importing with `a as b`:
+  `import "tables.tetaue" (users as people)` /
+  `import "tables.tetaue" as t (users as people)` expose `people` /
+  `t.people`.
 - Each module is its own scope: the prelude, its own imports, its own
   bindings — no module can see a sibling module's bindings or imports.
 - Paths resolve relative to the importing file; nested imports work; cycles,
@@ -304,7 +309,24 @@ null          # SQL NULL
 [1, 2, 3]     # list (IN lists, sort items)
 { a = 1 }     # record (projections)
 $1, $2        # implicit lambda parameters: ($1 + 3) ≡ u => u + 3
+param "id"    # query parameter placeholder (SQL bind parameter)
+date "2024-01-01" / timestamp "2024-01-01 12:00:00"  # ISO literals
 ```
+
+### Query parameters
+
+`param "name"` is an ordinary scalar expression: annotate it to fix its
+static type, and the renderer emits a dialect-native bind placeholder.
+
+```
+id = (param "user_id") : int
+q = users & filter (u => u.id == id)
+# PostgreSQL → WHERE id = $1
+# SQLite/MySQL/Trino/Hive → WHERE id = ?
+```
+
+The same parameter name is rendered as one PostgreSQL `$n` placeholder no
+matter how many times it appears.
 
 ### Queries and records
 
@@ -319,7 +341,9 @@ u & filter ...        # pipeline: apply the step to the query
 
 - A **record** is `{ k = v, ... }` (a projection); a table schema is a query
   TYPE annotation: `users: query { id: int, name: string } = table "users"`.
-  An un-annotated table is dynamic — its row type is inferred from use.
+  Inside a row lambda, `{ id, name }` is field punning sugar for
+  `{ id = u.id, name = u.name }`. An un-annotated table is dynamic — its row
+  type is inferred from use.
 - Steps apply in source order: when `take`, `distinct` or a window
   projection is followed by another step, the renderer wraps the earlier
   query as a derived table so `q & take 2 & sort ...` really limits first
@@ -364,13 +388,32 @@ u & filter ...        # pipeline: apply the step to the query
 ### Types
 
 `int`, `float`, `string`, `bool`, `date`, `timestamp` — used in table schemas
-and checked statically against every operation. `t?` is the Maybe-style
-nullable type ("a `t` or NULL") — write `email: string?` for a column that
-may be NULL. `null` has type `forall a. a?`, so `u.email == null`,
-`coalesce u.nickname u.email`, and arithmetic on nullable columns all just
-work. `int` and `float` are distinct — no implicit promotion:
-`u.age >= 18` is fine, but `u.age >= 18.0` (int column vs float literal) is a
-type error; write `18.0` against a `float` column.
+and checked statically against every operation. `(maybe T)` is Haskell-style
+Maybe ("a `T` or SQL NULL") — write `email: (maybe string)` for a nullable
+column. There is **no implicit `T` -> `(maybe T)` conversion**: `null` has
+type `forall a. (maybe a)`, `is_null`/`is_not_null` test a maybe value,
+and `from_maybe default x` unwraps it (`COALESCE`). `just x` lifts a
+non-null value into maybe, `nothing` is the maybe constant, and
+`fmap f x` lifts a function over maybe (`fmap upper email`). `int` and
+`float` are distinct — no implicit promotion: `u.age >= 18` is fine, but
+`u.age >= 18.0` (int column vs float literal) is a type error; write
+`18.0` against a `float` column. Haskell-base numerics: `/` is fractional
+division (`float -> float -> float`), `div`/`mod` are integral.
+
+Type aliases are declarations before bindings; prefix with `export` to
+share them with importing modules (flat imports and selective renaming):
+
+```
+type UserRow = query { id: int, name: string }
+type AdultRow = { age: int | r }
+users: UserRow = table "users"
+adult: AdultRow -> bool = u => u.age >= 18
+```
+
+Aliases are expanded in annotations and schemas; recursive aliases are
+compile errors. `import "schema.tetaue" (UserRow as Row)` imports an
+exported alias under a local name. Namespaced imports expose qualified
+types as `t.UserRow`.
 
 ### Types and annotations
 
@@ -379,7 +422,7 @@ polymorphism**: a row lambda is typed once against row variables and reused on
 any schema that has the fields it touches.
 
 ```
-adult = u => u.age >= 18          # : forall r. { age: int? | r } -> bool
+adult = u => u.age >= 18          # : forall r. { age: int | r } -> bool
 users & filter (adult)            # users has { id, name, age, active }
 kids  & filter (adult)            # kids  has { id, age, guardian }
 ```
@@ -409,7 +452,7 @@ are static errors, not runtime surprises:
 - **Join kinds** (`inner`, `left`, `right`, `full`) are a dedicated `join kind`
   type — `join "inner" ...` is a type error, the kind is a constant, not a
   string.
-- **Aggregates** (`count`, `sum`, `avg`, `min`, `max`, `list`) have aggregate
+- **Aggregates** (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `list`) have aggregate
   mode (`sum o.total : agg float`) and `group` has group mode
   (`group o.user_id : group int`). A `fold` entry that is neither is a type
   error — no more "must be wrapped in an aggregate" surprises:
@@ -431,11 +474,15 @@ are static errors, not runtime surprises:
 | `table "name"` | query root; schema from the binding annotation (`t: query { col: type } = table "name"`) or inferred | `FROM name` |
 | `filter (u => boolExpr)` | keep rows matching a predicate (alias: `filtered`) | `WHERE ...` / `HAVING ...` |
 | `map (u => { a = expr, ... })` | project one record per row | `SELECT ...` |
+| `select ["id", "name"]` | project only the listed columns | `SELECT id, name` |
 | `sort (u => [asc u.a, desc u.b])` | ORDER BY | `ORDER BY ... ASC, ... DESC` |
 | `take n` | LIMIT | `LIMIT n` |
+| `drop n` | OFFSET | `LIMIT n OFFSET n` / dialect-specific |
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
 | `fold (o => { k = group o.k, s = sum o.v })` | aggregation | `SELECT ... GROUP BY ...` |
 | `join inner table ($1.id == $2.user_id) { uid = $1.id }` | join | `... JOIN ... ON ...` |
+| `join_lateral (l => right) (l => r => on) (l => r => row)` | lateral join | `INNER JOIN LATERAL (...) ON ...` (PG/MySQL) |
+| `recursive (self => termQuery)` | fixed point | `WITH RECURSIVE ... UNION ALL ...` |
 
 Everything is curried: `filter (u => ...)` is a *step* value; applying it to a query
 (`users & filter (u => ...)`) builds a new query. Steps are first-class values, so you
@@ -469,11 +516,17 @@ u.name != null                 # → "name" IS NOT NULL
 not u.active                   # NOT
 is_in u.id [1, 2, 3]           # IN
 is_not_in u.id [4, 5]          # NOT IN
+exists (orders & filter ...)   # correlated EXISTS subquery
+scalar (orders & ... & take 1) # scalar subquery, one nullable column
+in_query u.id (orders & map ...) # IN (SELECT ...)
+fmap upper u.email             # lift a function over (maybe T)
+param "user_id"                # SQL bind parameter
 upper u.name  lower u.name     # UPPER / LOWER
 length u.name                  # LENGTH
 coalesce u.nickname u.email    # COALESCE
 abs u.balance                  # ABS
 count o.id  sum o.total  avg o.total  min o.x  max o.x   # aggregates (in fold)
+sum_where cond o.total  count_where cond o.id              # filtered aggregates
 list o.tag                      # collect values into a list: ARRAY_AGG (trino/pg), COLLECT_LIST (hive), JSON_ARRAYAGG (mysql), JSON_GROUP_ARRAY (sqlite)
 current_date  current_timestamp   # CURRENT_DATE / CURRENT_TIMESTAMP (bare keywords)
 year u.created_at  month u.created_at  day u.created_at  day_of_week u.created_at
@@ -658,7 +711,7 @@ src/language/
   builtin.ts            # single source of truth: builtin names, schemes, aliases
   catalog.ts            # compatibility re-export of builtin.ts
   interpreter.ts        # symbolic evaluator: curried builtins, query steps, diagnostics
-  types.ts              # type engine: HM unification with rows and `t?` nullability
+  types.ts              # type engine: HM unification, rows, `(maybe T)`, `?hole`s
   inference.ts          # type inference pass: prelude schemes, annotations, diagnostics
   imports.ts            # multi-file module resolution (cycles, missing files)
   render.ts             # SQL renderer + dialect specs
@@ -667,7 +720,7 @@ src/language/
   tetaue-validator.ts   # maps interpreter + inference diagnostics to Langium validation
   index.ts              # public API
 src/language-server.ts  # LSP entry: startTetaueServer() + tetaue/render request
-src/cli.ts              # render / check / parse / format / build / watch / lsp commands
+src/cli.ts              # render / check / types / parse / format / build / watch / lsp commands
 bin/tetaue.ts           # `tetaue` executable (bun shebang)
 extension/              # VS Code extension (client, manifest, grammar, packaging)
 test/                   # bun test suite (incl. an end-to-end LSP test)
@@ -682,10 +735,10 @@ dedupe — so `check` and `render` never disagree.
 ## Roadmap
 
 - `values(...)` inline row literals, `union` / `unionAll` set operations
-- `prepare`-style parameters, more of teta's catalog
+- named parameter APIs on top of `param` placeholders, more of teta's catalog
 - more of teta's catalog: `case` inside `fold` with aggregates, more array
   functions (indexing, element-wise — `list` aggregation and `[T]` column
-  annotations landed), lateral joins / recursive CTEs
+  annotations landed), lateral joins
 - LSP polish: completion for `$n` implicit lambdas, hover types for qualified
   access across libs. (Go-to-definition across imports, `t.` completion, lib
   doc hover, builtin-name completion, and importer revalidation on

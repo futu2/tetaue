@@ -3,36 +3,34 @@
 # `map` projects one record per row — here the `email` column is lowered in
 # place while computed columns (contact, email_upper, email_len) are added.
 #
-# `== null` renders as IS NULL; `!= null` renders as IS NOT NULL.
+# Nullable columns are written explicitly with Haskell-style `(maybe T)`.
+# There is no implicit `T` -> `(maybe T)` conversion: `null` has type
+# `forall a. (maybe a)`, and it only unifies with other maybe values.
 #
-# NULL is the Maybe-style nullable type `t?` ("t or NULL"): `null` has type
-# `forall a. a?`, and comparing with null is always well-typed. Nullable
-# columns are written explicitly (`email: string?`). Nullable values flow
-# through expressions the same way: `length u.email: int?`,
-# `coalesce u.nickname u.email: string?`.
+#   is_nothing u.nickname         → nickname IS NULL
+#   from_maybe "" u.nickname      → COALESCE(nickname, '')
+#   coalesce u.nickname u.email   → COALESCE(nickname, email)
 
-# `nickname` is the nullable column (`string?`): `u.nickname == null` and
-# `coalesce u.nickname u.email` both make sense because it may be NULL.
 users: query {
     id: int,
-    email: string,
-    nickname: string?,
+    email: (maybe string),
+    nickname: (maybe string),
     last_seen: timestamp,
 } = table "users"
 
 active = (users
-    & filter (u => u.email != null && u.nickname == null)
+    & filter (u => is_just u.email && is_nothing u.nickname)
     & map (u => {
         id = u.id,
-        email = lower u.email,
+        email = lower (from_maybe "" u.email),
         contact = coalesce u.nickname u.email,
-        email_upper = upper u.email,
-        email_len = length u.email,
+        email_upper = upper (from_maybe "" u.email),
+        email_len = length (from_maybe "" u.email),
     })
     & distinct) : query {
         id: int,
         email: string,
-        contact: string?,
+        contact: (maybe string),
         email_upper: string,
         email_len: int,
     }

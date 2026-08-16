@@ -29,7 +29,14 @@ grammar Tetaue
 
 entry Model:
     (imports+=Import)*
+    (types+=TypeAlias)*
     (bindings+=Binding)*;
+
+// `type Name = T` — a module-local type alias. Aliases are expanded during
+// type inference and schema decoding; declaration order matters and aliases
+// may not be recursive.
+TypeAlias:
+    (export?='export')? 'type' name=(ID | ARG_ID) '=' type=Type;
 
 // `import "path.tetaue"` brings the module's exported bindings into the
 // current scope; `import "path.tetaue" as t` binds only the namespace `t`,
@@ -37,7 +44,12 @@ entry Model:
 // either form to exactly those exports — unlisted names stay invisible.
 // (`as` is a reserved word, as is `export`.)
 Import:
-    'import' path=STRING ('as' alias=(ID | ARG_ID))? ('(' names+=(ID | ARG_ID) (',' names+=(ID | ARG_ID))* ')')?;
+    'import' path=STRING ('as' alias=(ID | ARG_ID))? ('(' names+=ImportName (',' names+=ImportName)* ')')?;
+
+// One selective import item. `a as b` imports export `a` under the local
+// name `b` (for flat imports) or as `t.b` (for namespaced imports).
+ImportName:
+    name=(ID | ARG_ID) ('as' renamed=(ID | ARG_ID))?;
 
 // `export` marks a binding as part of the module's public surface: only
 // exported bindings are visible to importers (flat or qualified). Within a
@@ -65,37 +77,43 @@ Ascription:
 
 // ---------------------------------------------------------------------------
 // Type annotations — `name: T = ...`, `(u: T) => ...`, and `e : T`.
-//   `t?` is the Maybe-style nullable type. Lowercase variables in record-tail
-//   position are ROW variables; everywhere else they are TYPE variables
-//   (kind by position, PureScript-style). `->` is right-associative.
-//   Unknown names in type position are errors reported by inference.
+//   `(maybe T)` is Haskell-style Maybe ("T or SQL NULL"); there is NO
+//   implicit `T` -> `maybe T` conversion. Lowercase variables in
+//   record-tail position are ROW variables; everywhere else they are TYPE
+//   variables (kind by position, PureScript-style). `?name` is a HOLE: an
+//   unsolved metavariable that must be filled by unification at a use site
+//   (a bare `table "t"` gets a fresh row hole per table expression).
+//   `->` is right-associative. Unknown names are errors reported by inference.
 // ---------------------------------------------------------------------------
 Type:
-    {infer FunType} left=NullType '->' right=Type
-    | NullType;
+    {infer FunType} left=TypeAtom '->' right=Type
+    | TypeAtom;
 
-NullType:
-    base=BaseType (nullable?='?')?;
+TypeAtom:
+    base=BaseType
+    | '(' 'maybe' maybeType=Type ')';
 
 BaseType infers Type:
     RecordType
     | QueryType
     | {infer ListType} '[' type=Type ']'
+    | {infer TypeHole} name=HOLE
     | {infer TypeVar} name=(ID | ARG_ID)
+    | {infer QualifiedTypeName} receiver=(ID | ARG_ID) '.' name=(ID | ARG_ID)
     | {infer TypeParen} '(' type=Type ')';
 
 RecordType:
-    {infer RecordType} '{' (fields+=RecordField (',' fields+=RecordField)* ','?)? ('|' tail=(ID | ARG_ID))? '}';
+    {infer RecordType} '{' (fields+=RecordField (',' fields+=RecordField)* ','?)? ('|' tail=(ID | ARG_ID | HOLE))? '}';
 
 QueryType:
-    {infer QueryType} 'query' '{' (fields+=RecordField (',' fields+=RecordField)* ','?)? ('|' tail=(ID | ARG_ID))? '}';
+    {infer QueryType} 'query' '{' (fields+=RecordField (',' fields+=RecordField)* ','?)? ('|' tail=(ID | ARG_ID | HOLE))? '}';
 
 RecordField:
     key=(ID | ARG_ID) ':' type=Type;
 
 // Operator precedence, tightest first:
 //   >>> <<<  (function composition, PureScript-style, right-assoc)
-//   * / %   (multiplicative)
+//   * /     (multiplicative)
 //   + - <>  (additive; `<>` is the record merge monoid, Haskell-style)
 //   == != < <= > >=  (comparison, non-chained)
 //   &&      (and)
@@ -108,7 +126,7 @@ RecordField:
 // is its flip. `.` is reserved for record field access (`u.age`).
 infix BinaryExpression on UnaryExpression:
     right assoc '>>>' | '<<<'
-    > '*' | '/' | '%'
+    > '*' | '/'
     > '+' | '-' | '<>'
     > '==' | '!=' | '<' | '<=' | '>' | '>='
     > '&&'
@@ -205,8 +223,10 @@ CaseBranch:
 LambdaParam:
     name=(ID | ARG_ID) (':' type=Type)?;
 
+// `{ id = expr, name }` — a missing `= expr` is FIELD PUNNING sugar:
+// inside a lambda body, `{ id }` means `{ id = <lambda param>.id }`.
 MapEntry:
-    key=(ID | ARG_ID) '=' value=Expression;
+    key=(ID | ARG_ID) ('=' value=Expression)?;
 
 hidden terminal WS: /\s+/;
 hidden terminal COMMENT: /#[^\r\n]*/;
@@ -222,3 +242,7 @@ terminal STRING: /"(\\.|[^"\\])*"/;
 // Implicit lambda parameters: `$1` is the first parameter, `$2` the second, ...
 // (longest match keeps `$` as the application operator and `$1` as a parameter).
 terminal LAMBDA_PARAM: /\$[0-9]+/;
+
+// A type hole: an unsolved metavariable named by the user (or the compiler),
+// e.g. `query ?schema`, `{ id: int | ?rest }`.
+terminal HOLE: /\?[_a-zA-Z][\w_]*/;

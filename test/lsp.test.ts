@@ -268,7 +268,7 @@ describe('tetaue language server (LSP over stdio)', () => {
             expect(result.ok).toBe(true);
             expect(result.sql).toContain('FROM users');
             expect(result.sql).toContain('SELECT DISTINCT');
-            expect(result.sql).toContain('LOWER(email)');
+            expect(result.sql).toContain("LOWER(COALESCE(email, ''))");
             expect(result.sql).toContain([
                 'WHERE',
                 '    email IS NOT NULL',
@@ -422,7 +422,7 @@ describe('tetaue language server (LSP over stdio)', () => {
                 'adult = u => u.active && u.age >= 18',
                 'adults = users & filter (adult) & map (u => { id = u.id, age = u.age })',
                 'q = adults & take ($1 + 3)',
-                'done: bool? = null',
+                'done: (maybe bool) = null',
                 'always = true',
                 'cased = map (u => { x = case { u.age > 18 => "adult", _ => "minor" } })',
             ].join('\n');
@@ -477,10 +477,10 @@ describe('tetaue language server (LSP over stdio)', () => {
             expect(at(1, 15).type).toBe('property');
             expect(at(1, 19).text).toBe('int');
             expect(at(1, 19).type).toBe('type');
-            expect(at(5, 6).text).toBe('bool');
-            expect(at(5, 6).type).toBe('type');
-            expect(at(5, 10).text).toBe('?');
-            expect(at(5, 10).type).toBe('operator');
+            expect(at(5, 7).text).toBe('maybe');
+            expect(at(5, 7).type).toBe('keyword');
+            expect(at(5, 13).text).toBe('bool');
+            expect(at(5, 13).type).toBe('type');
 
             // Builtins are functions with the defaultLibrary modifier.
             const table = at(1, 37);
@@ -527,8 +527,8 @@ describe('tetaue language server (LSP over stdio)', () => {
             expect(at(2, 34).type).toBe('number');
             expect(at(1, 43).text).toBe('"users"');
             expect(at(1, 43).type).toBe('string');
-            expect(at(5, 14).text).toBe('null');
-            expect(at(5, 14).type).toBe('keyword');
+            expect(at(5, 21).text).toBe('null');
+            expect(at(5, 21).type).toBe('keyword');
             expect(at(6, 9).text).toBe('true');
             expect(at(6, 9).type).toBe('keyword');
 

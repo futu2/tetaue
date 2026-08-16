@@ -13,7 +13,7 @@ report: query {
     user_id: int,
     name: string,
     order_count: int,
-    total_spent: float,
+    total_spent: (maybe float),
 } = adults
 # & map (u => { uid = u.id, name = u.name })
     & map { uid = $1.id, name = $1.name }

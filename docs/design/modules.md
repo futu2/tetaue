@@ -86,7 +86,9 @@ The redesign keeps the strengths and fixes the weaknesses:
 import "tables.tetaue"              # flat: exported bindings into current scope
 import "tables.tetaue" as t         # namespaced: qualified access t.users
 import "tables.tetaue" (users, orders)      # selective flat: exactly those exports
+import "tables.tetaue" (users as people)    # rename while importing
 import "tables.tetaue" as t (users)         # selective namespace: t.users only
+import "tables.tetaue" as t (users as people) # exposes t.people
 
 export users: query { id: int } = table "users"   # visible to importers
 helper = ...                                       # module-private

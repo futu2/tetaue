@@ -12,7 +12,8 @@
  * language tool, not a sandbox. Interpreter + inference diagnostics are
  * merged with exact dedupe, exactly like the CLI's `render`/`check`.
  ******************************************************************************/
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 import { URI } from 'langium';
 import type { TetaueServices } from './tetaue-module.js';
@@ -65,12 +66,55 @@ export function parseModel(text: string, uri: string, services: TetaueServices):
     return result.value as Model;
 }
 
+// ---------------------------------------------------------------------------
+// Small project-tree caches.
+//
+// Hover/completion/validation all call projectTreeFor on every keystroke.
+// The root document is the caller's live parse, but imported modules are
+// plain files: cache their text by mtime and their AST by text hash so a
+// large dependency tree is not re-read and re-parsed on each request.
+// ---------------------------------------------------------------------------
+
+const moduleTextCache = new Map<string, { mtimeMs: number; text: string }>();
+const moduleAstCache = new Map<string, { hash: string; model: Model }>();
+const CACHE_LIMIT = 256;
+
+function hashText(text: string): string {
+    return createHash('sha1').update(text).digest('hex');
+}
+
+function trimCache<K, V>(cache: Map<K, V>): void {
+    if (cache.size <= CACHE_LIMIT) return;
+    for (const key of cache.keys()) {
+        cache.delete(key);
+        if (cache.size <= CACHE_LIMIT / 2) return;
+    }
+}
+
 function readModule(uri: string): string | undefined {
     try {
-        return readFileSync(URI.parse(uri).fsPath, 'utf8');
+        const fsPath = URI.parse(uri).fsPath;
+        const mtimeMs = statSync(fsPath).mtimeMs;
+        const cached = moduleTextCache.get(fsPath);
+        if (cached && cached.mtimeMs === mtimeMs) return cached.text;
+        const text = readFileSync(fsPath, 'utf8');
+        trimCache(moduleTextCache);
+        moduleTextCache.set(fsPath, { mtimeMs, text });
+        return text;
     } catch {
         return undefined;
     }
+}
+
+function parseModuleCached(text: string, uri: string, services: TetaueServices): Model {
+    const hash = hashText(text);
+    const key = `${uri}\u0000${hash}`;
+    const cached = moduleAstCache.get(key);
+    if (cached && cached.hash === hash) return cached.model;
+    const model = parseModel(text, uri, services);
+    trimCache(moduleAstCache);
+    moduleAstCache.set(key, { hash, model });
+    return model;
 }
 
 /**
@@ -84,7 +128,7 @@ export function projectTreeFor(root: ProjectModule, services: TetaueServices): {
     const tree = collectModuleTree(root, {
         resolve: createImportResolver(),
         read: readModule,
-        parse: (text, uri) => parseModel(text, uri, services),
+        parse: (text, uri) => parseModuleCached(text, uri, services),
     });
     return { modules: tree.modules, importsByModule: tree.importsByModule, diagnostics: tree.diagnostics, warnings: tree.warnings };
 }

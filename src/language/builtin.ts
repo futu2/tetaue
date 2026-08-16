@@ -29,7 +29,7 @@
  ******************************************************************************/
 import {
     type PrimName, type Scheme, type Type, type TypeUniverse, type VarKind,
-    aggOf, fun, groupOf, jkindType, listOf, nullable, prim, queryOf, rowOf, windowOf,
+    aggOf, fun, groupOf, jkindType, listOf, maybeOf,prim, queryOf, rowOf, windowOf,
 } from './types.js';
 
 export type BuiltinCategory =
@@ -85,15 +85,25 @@ function projectionScheme(u: TypeUniverse): Scheme {
 
 export const BUILTIN_SPECS = [
     // --- query roots -----------------------------------------------------
+    { name: 'param', category: 'scalar', doc: 'param "name" — a query parameter placeholder', scheme: u => poly(u, [tVar], t => fun(p('string'), t)) },
     { name: 'table', category: 'query-root', doc: 'a query root: table "users"', scheme: u => poly(u, [rowVar], r => fun(p('string'), queryOf(r))) },
 
     // --- query steps -----------------------------------------------------
     { name: 'filter', category: 'query-step', doc: 'keep rows matching a predicate (WHERE / HAVING)', scheme: u => poly(u, [rowVar], r => fun(fun(r, p('bool')), fun(queryOf(r), queryOf(r)))) },
+    { name: 'select', category: 'query-step', doc: 'select ["id", "name"] — project only the listed columns', scheme: u => poly(u, [rowVar], r => fun(listOf(p('string')), fun(queryOf(r), queryOf(r)))) },
     { name: 'map', category: 'query-step', doc: 'project one record per row (SELECT)', scheme: projectionScheme },
     { name: 'fold', category: 'query-step', doc: 'aggregate rows (SELECT ... GROUP BY ...)', scheme: projectionScheme },
     { name: 'sort', category: 'query-step', doc: 'ORDER BY — the lambda must return asc/desc items', scheme: u => poly(u, [rowVar, tVar], (r, t) => fun(fun(r, t), fun(queryOf(r), queryOf(r)))) },
     { name: 'take', category: 'query-step', doc: 'LIMIT n', scheme: u => poly(u, [rowVar], r => fun(p('int'), fun(queryOf(r), queryOf(r)))) },
+    { name: 'drop', category: 'query-step', doc: 'OFFSET n — skip the first n rows', scheme: u => poly(u, [rowVar], r => fun(p('int'), fun(queryOf(r), queryOf(r)))) },
+    { name: 'recursive', category: 'query-step', doc: 'recursive f — WITH RECURSIVE fixed point (UNION ALL)', scheme: u => poly(u, [rowVar], r => fun(fun(queryOf(r), queryOf(r)), fun(queryOf(r), queryOf(r)))) },
     { name: 'distinct', category: 'query-step', doc: 'dedupe rows (SELECT DISTINCT)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), queryOf(r))) },
+    { name: 'join_lateral', category: 'query-step', doc: 'join_lateral right_fn on merger — LATERAL join (PG/MySQL)', scheme: u => poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
+        const rightFn = fun(r, queryOf(s));     // l => query over right rows
+        const on = fun(r, fun(s, p('bool')));   // l => r => bool
+        const merger = fun(r, fun(s, t));       // l => r => row t
+        return fun(rightFn, fun(on, fun(merger, fun(queryOf(r), queryOf(t)))));
+    }) },
     { name: 'join', category: 'query-step', doc: 'join <kind> <right> <on> <merger>', scheme: u => poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
         const on = fun(r, fun(s, p('bool')));       // l => r => bool
         const merger = fun(r, fun(s, t));           // l => r => row t
@@ -113,82 +123,98 @@ export const BUILTIN_SPECS = [
     { name: 'full', category: 'join-kind', doc: 'FULL JOIN', scheme: () => mono(jkindType()) },
 
     // --- ordering --------------------------------------------------------
-    { name: 'asc', category: 'order', doc: 'an ascending ORDER BY item', scheme: u => poly(u, [tVar], t => fun(nullable(t), { kind: 'order' })) },
-    { name: 'desc', category: 'order', doc: 'a descending ORDER BY item', scheme: u => poly(u, [tVar], t => fun(nullable(t), { kind: 'order' })) },
+    { name: 'asc', category: 'order', doc: 'an ascending ORDER BY item', scheme: u => poly(u, [tVar], t => fun(t, { kind: 'order' })) },
+    { name: 'desc', category: 'order', doc: 'a descending ORDER BY item', scheme: u => poly(u, [tVar], t => fun(t, { kind: 'order' })) },
 
     // --- aggregates & grouping (aggregate/group MODES) -------------------
-    { name: 'count', category: 'aggregate', doc: 'COUNT — aggregate mode', scheme: u => poly(u, [tVar], t => fun(nullable(t), aggOf(p('int')))) },
-    { name: 'sum', category: 'aggregate', doc: 'SUM — aggregate mode', scheme: u => poly(u, [tVar], t => fun(nullable(t), aggOf(t))) },
-    { name: 'avg', category: 'aggregate', doc: 'AVG — aggregate mode', scheme: u => poly(u, [tVar], t => fun(nullable(t), aggOf(p('float')))) },
-    { name: 'min', category: 'aggregate', doc: 'MIN — aggregate mode', scheme: u => poly(u, [tVar], t => fun(nullable(t), aggOf(t))) },
-    { name: 'max', category: 'aggregate', doc: 'MAX — aggregate mode', scheme: u => poly(u, [tVar], t => fun(nullable(t), aggOf(t))) },
-    { name: 'list', category: 'aggregate', doc: 'collect values into a list — aggregate mode', scheme: u => poly(u, [tVar], t => fun(nullable(t), aggOf(listOf(nullable(t))))) },
-    { name: 'group', category: 'group', doc: 'a GROUP BY key — group mode', scheme: u => poly(u, [tVar], t => fun(nullable(t), groupOf(t))) },
+    { name: 'count_distinct', category: 'aggregate', doc: 'COUNT(DISTINCT x) — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, aggOf(p('int')))) },
+    { name: 'count_where', category: 'aggregate', doc: 'count_where cond x — filtered COUNT', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(p('int'))))) },
+    { name: 'sum_where', category: 'aggregate', doc: 'sum_where cond x — filtered SUM', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(maybeOf(t))))) },
+    { name: 'avg_where', category: 'aggregate', doc: 'avg_where cond x — filtered AVG', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(maybeOf(p('float')))))) },
+    { name: 'min_where', category: 'aggregate', doc: 'min_where cond x — filtered MIN', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(maybeOf(t))))) },
+    { name: 'max_where', category: 'aggregate', doc: 'max_where cond x — filtered MAX', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(maybeOf(t))))) },
+    { name: 'count', category: 'aggregate', doc: 'COUNT — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, aggOf(p('int')))) },
+    { name: 'sum', category: 'aggregate', doc: 'SUM — aggregate mode (maybe result: empty/all-null input is NULL)', scheme: u => poly(u, [tVar], t => fun(t, aggOf(maybeOf(t)))) },
+    { name: 'avg', category: 'aggregate', doc: 'AVG — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, aggOf(maybeOf(p('float'))))) },
+    { name: 'min', category: 'aggregate', doc: 'MIN — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, aggOf(maybeOf(t)))) },
+    { name: 'max', category: 'aggregate', doc: 'MAX — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, aggOf(maybeOf(t)))) },
+    { name: 'list', category: 'aggregate', doc: 'collect values into a list — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, aggOf(listOf(t)))) },
+    { name: 'group', category: 'group', doc: 'a GROUP BY key — group mode', scheme: u => poly(u, [tVar], t => fun(t, groupOf(t))) },
 
     // --- records ---------------------------------------------------------
     { name: 'merge', category: 'record', doc: 'record union — the right record wins on overlap', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, u.fresh('row')))) },
 
     // --- logic -----------------------------------------------------------
+    { name: 'exists', category: 'logic', doc: 'exists query — correlated EXISTS subquery', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), p('bool'))) },
+    { name: 'scalar', category: 'logic', doc: 'scalar query — a correlated scalar subquery returning one nullable column', scheme: u => poly(u, [rowVar, tVar], (r, t) => fun(queryOf(r), t)) },
     { name: 'not', category: 'logic', doc: 'NOT', scheme: () => mono(fun(p('bool'), p('bool'))) },
-    { name: 'is_in', category: 'logic', doc: 'IN — is_in x [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(nullable(t), fun(listOf(nullable(t)), p('bool')))) },
+    { name: 'in_query', category: 'logic', doc: 'IN (SELECT ...) — in_query x subquery', scheme: u => poly(u, [tVar, rowVar], (t, r) => fun(t, fun(queryOf(r), p('bool')))) },
+    { name: 'is_in', category: 'logic', doc: 'IN — is_in x [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(t, fun(listOf(t), p('bool')))) },
 
     // --- scalar functions ------------------------------------------------
-    { name: 'upper', category: 'scalar', doc: 'UPPER', scheme: () => mono(fun(nullable(p('string')), nullable(p('string')))) },
-    { name: 'lower', category: 'scalar', doc: 'LOWER', scheme: () => mono(fun(nullable(p('string')), nullable(p('string')))) },
-    { name: 'length', category: 'scalar', doc: 'LENGTH', scheme: () => mono(fun(nullable(p('string')), nullable(p('int')))) },
-    { name: 'abs', category: 'math', doc: 'ABS', scheme: u => poly(u, [tVar], t => fun(nullable(t), nullable(t))) },
-    { name: 'coalesce', category: 'scalar', doc: 'COALESCE', scheme: u => poly(u, [tVar], t => fun(nullable(t), fun(nullable(t), nullable(t)))) },
+    { name: 'upper', category: 'scalar', doc: 'UPPER', scheme: () => mono(fun(p('string'), p('string'))) },
+    { name: 'lower', category: 'scalar', doc: 'LOWER', scheme: () => mono(fun(p('string'), p('string'))) },
+    { name: 'length', category: 'scalar', doc: 'LENGTH', scheme: () => mono(fun(p('string'), p('int'))) },
+    { name: 'abs', category: 'math', doc: 'ABS', scheme: u => poly(u, [tVar], t => fun(t, t)) },
+    { name: 'coalesce', category: 'scalar', doc: 'COALESCE', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))) },
 
     // --- date & time -----------------------------------------------------
+    { name: 'date', category: 'constant', doc: 'date "2024-01-01" — ISO date literal', scheme: () => mono(fun(p('string'), p('date'))) },
+    { name: 'timestamp', category: 'constant', doc: 'timestamp "2024-01-01 12:00:00" — ISO timestamp literal', scheme: () => mono(fun(p('string'), p('timestamp'))) },
     { name: 'current_date', category: 'date', doc: 'CURRENT_DATE', scheme: () => mono(p('date')) },
     { name: 'current_timestamp', category: 'constant', doc: 'CURRENT_TIMESTAMP', scheme: () => mono(p('timestamp')) },
-    { name: 'extract', category: 'date', doc: 'extract x "month"', scheme: u => poly(u, [tVar], t => fun(nullable(t), fun(p('string'), p('int')))) },
-    { name: 'year', category: 'date', doc: 'year of a date', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('int'))) },
-    { name: 'month', category: 'date', doc: 'month of a date', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('int'))) },
-    { name: 'day', category: 'date', doc: 'day of a date', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('int'))) },
-    { name: 'day_of_week', category: 'date', doc: 'day of week of a date', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('int'))) },
-    { name: 'hour', category: 'date', doc: 'hour of a timestamp', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('int'))) },
-    { name: 'minute', category: 'date', doc: 'minute of a timestamp', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('int'))) },
-    { name: 'second', category: 'date', doc: 'second of a timestamp', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('int'))) },
-    { name: 'date_add', category: 'date', doc: 'date_add x "day" 1', scheme: u => poly(u, [tVar, aVar], (t, n) => fun(nullable(t), fun(p('string'), fun(nullable(n), nullable(t))))) },
-    { name: 'date_diff', category: 'date', doc: 'date_diff x "day" other', scheme: u => poly(u, [tVar, aVar], (t, other) => fun(nullable(t), fun(p('string'), fun(nullable(other), p('int'))))) },
-    { name: 'date_trunc', category: 'date', doc: 'date_trunc x "month"', scheme: u => poly(u, [tVar], t => fun(nullable(t), fun(p('string'), p('timestamp')))) },
-    { name: 'date_format', category: 'date', doc: 'date_format x "%Y-%m-%d"', scheme: u => poly(u, [tVar], t => fun(nullable(t), fun(p('string'), nullable(p('string'))))) },
-    { name: 'date_parse', category: 'date', doc: 'date_parse x "%Y-%m-%d"', scheme: () => mono(fun(nullable(p('string')), fun(p('string'), p('date')))) },
-    { name: 'to_unixtime', category: 'date', doc: 'date to unix seconds', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('int'))) },
-    { name: 'from_unixtime', category: 'date', doc: 'unix seconds to timestamp', scheme: u => poly(u, [tVar], t => fun(nullable(p('int')), p('timestamp'))) },
+    { name: 'extract', category: 'date', doc: 'extract x "month"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('int')))) },
+    { name: 'year', category: 'date', doc: 'year of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'month', category: 'date', doc: 'month of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'day', category: 'date', doc: 'day of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'day_of_week', category: 'date', doc: 'day of week of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'hour', category: 'date', doc: 'hour of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'minute', category: 'date', doc: 'minute of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'second', category: 'date', doc: 'second of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'date_add', category: 'date', doc: 'date_add x "day" 1', scheme: u => poly(u, [tVar, aVar], (t, n) => fun(t, fun(p('string'), fun(n, t)))) },
+    { name: 'date_diff', category: 'date', doc: 'date_diff x "day" other', scheme: u => poly(u, [tVar, aVar], (t, other) => fun(t, fun(p('string'), fun(other, p('int'))))) },
+    { name: 'date_trunc', category: 'date', doc: 'date_trunc x "month"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('timestamp')))) },
+    { name: 'date_format', category: 'date', doc: 'date_format x "%Y-%m-%d"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('string')))) },
+    { name: 'date_parse', category: 'date', doc: 'date_parse x "%Y-%m-%d"', scheme: () => mono(fun(p('string'), fun(p('string'), p('date')))) },
+    { name: 'to_unixtime', category: 'date', doc: 'date to unix seconds', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'from_unixtime', category: 'date', doc: 'unix seconds to timestamp', scheme: u => poly(u, [tVar], t => fun(p('int'), p('timestamp'))) },
 
     // --- math ------------------------------------------------------------
-    { name: 'ceil', category: 'math', doc: 'CEIL', scheme: u => poly(u, [tVar], t => fun(nullable(t), nullable(t))) },
-    { name: 'floor', category: 'math', doc: 'FLOOR', scheme: u => poly(u, [tVar], t => fun(nullable(t), nullable(t))) },
-    { name: 'sqrt', category: 'math', doc: 'SQRT', scheme: u => poly(u, [tVar], t => fun(nullable(t), nullable(t))) },
-    { name: 'pow', category: 'math', doc: 'POW', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(nullable(a), fun(nullable(b), nullable(p('float'))))) },
-    { name: 'mod', category: 'math', doc: 'MOD (the % operator)', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(nullable(a), fun(nullable(b), nullable(a)))) },
+    { name: 'ceil', category: 'math', doc: 'CEIL', scheme: u => poly(u, [tVar], t => fun(t, t)) },
+    { name: 'floor', category: 'math', doc: 'FLOOR', scheme: u => poly(u, [tVar], t => fun(t, t)) },
+    { name: 'sqrt', category: 'math', doc: 'SQRT', scheme: u => poly(u, [tVar], t => fun(t, t)) },
+    { name: 'pow', category: 'math', doc: 'POW', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, p('float')))) },
+    { name: 'div', category: 'math', doc: 'div a b — integral division (Haskell base)', scheme: () => mono(fun(p('int'), fun(p('int'), p('int')))) },
+    { name: 'mod', category: 'math', doc: 'mod a b — integral modulo (Haskell base)', scheme: () => mono(fun(p('int'), fun(p('int'), p('int')))) },
 
     // --- strings ---------------------------------------------------------
-    { name: 'trim', category: 'string', doc: 'TRIM', scheme: () => mono(fun(nullable(p('string')), nullable(p('string')))) },
-    { name: 'reverse', category: 'string', doc: 'REVERSE (not sqlite)', scheme: () => mono(fun(nullable(p('string')), nullable(p('string')))) },
-    { name: 'position', category: 'string', doc: 'POSITION / LOCATE / INSTR', scheme: () => mono(fun(nullable(p('string')), fun(nullable(p('string')), p('int')))) },
-    { name: 'replace', category: 'string', doc: 'REPLACE', scheme: () => mono(fun(nullable(p('string')), fun(nullable(p('string')), fun(nullable(p('string')), nullable(p('string')))))) },
-    { name: 'left_substring', category: 'string', doc: 'LEFT / SUBSTR', scheme: () => mono(fun(nullable(p('string')), fun(nullable(p('int')), nullable(p('string'))))) },
-    { name: 'regex_like', category: 'string', doc: 'regex match', scheme: () => mono(fun(nullable(p('string')), fun(nullable(p('string')), p('bool')))) },
-    { name: 'regex_replace', category: 'string', doc: 'regex replace', scheme: () => mono(fun(nullable(p('string')), fun(nullable(p('string')), fun(nullable(p('string')), nullable(p('string')))))) },
+    { name: 'trim', category: 'string', doc: 'TRIM', scheme: () => mono(fun(p('string'), p('string'))) },
+    { name: 'reverse', category: 'string', doc: 'REVERSE (not sqlite)', scheme: () => mono(fun(p('string'), p('string'))) },
+    { name: 'position', category: 'string', doc: 'POSITION / LOCATE / INSTR', scheme: () => mono(fun(p('string'), fun(p('string'), p('int')))) },
+    { name: 'replace', category: 'string', doc: 'REPLACE', scheme: () => mono(fun(p('string'), fun(p('string'), fun(p('string'), p('string'))))) },
+    { name: 'left_substring', category: 'string', doc: 'LEFT / SUBSTR', scheme: () => mono(fun(p('string'), fun(p('int'), p('string')))) },
+    { name: 'regex_like', category: 'string', doc: 'regex match', scheme: () => mono(fun(p('string'), fun(p('string'), p('bool')))) },
+    { name: 'regex_replace', category: 'string', doc: 'regex replace', scheme: () => mono(fun(p('string'), fun(p('string'), fun(p('string'), p('string'))))) },
 
     // --- null handling ---------------------------------------------------
-    { name: 'null_if', category: 'scalar', doc: 'NULLIF', scheme: u => poly(u, [tVar], t => fun(nullable(t), fun(nullable(t), nullable(t)))) },
-    { name: 'is_null', category: 'logic', doc: 'IS NULL', scheme: u => poly(u, [tVar], t => fun(nullable(t), p('bool'))) },
+    { name: 'fmap', category: 'scalar', doc: 'fmap f maybe_value — Functor lift over maybe (SQL NULL propagates)', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(fun(a, b), fun(maybeOf(a), maybeOf(b)))) },
+    { name: 'just', category: 'scalar', doc: 'just x — lift a non-null SQL value into maybe', scheme: u => poly(u, [tVar], t => fun(t, maybeOf(t))) },
+    { name: 'nothing', category: 'constant', doc: 'nothing — SQL NULL as maybe', scheme: u => poly(u, [tVar], t => maybeOf(t)) },
+    { name: 'from_maybe', category: 'scalar', doc: 'from_maybe default maybe_value — COALESCE', scheme: u => poly(u, [tVar], t => fun(t, fun(maybeOf(t), t))) },
+    { name: 'null_if', category: 'scalar', doc: 'NULLIF', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))) },
+    { name: 'is_null', category: 'logic', doc: 'IS NULL', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
 
     // --- casts -----------------------------------------------------------
-    { name: 'cast', category: 'cast', doc: 'cast x "int"', scheme: u => poly(u, [tVar], t => fun(nullable(t), fun(p('string'), u.fresh()))) },
+    { name: 'cast', category: 'cast', doc: 'cast x "int"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))) },
 
     // --- list-argument builtins (single list argument, curried) ----------
-    { name: 'concat', category: 'string', doc: 'concat [a, b, ...]', scheme: () => mono(fun(listOf(nullable(p('string'))), nullable(p('string')))) },
-    { name: 'greatest', category: 'scalar', doc: 'greatest [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(listOf(nullable(t)), nullable(t))) },
-    { name: 'round', category: 'math', doc: 'round [x] or round [x, scale]', scheme: u => poly(u, [tVar], t => fun(listOf(nullable(t)), nullable(t))) },
-    { name: 'substring', category: 'string', doc: 'substring [s, start, length?]', scheme: () => mono(fun(listOf(nullable(p('string'))), nullable(p('string')))) },
-    { name: 'lpad', category: 'string', doc: 'lpad [s, n, pad?]', scheme: () => mono(fun(listOf(nullable(p('string'))), nullable(p('string')))) },
-    { name: 'regex_extract', category: 'string', doc: 'regex_extract [s, pattern, group?]', scheme: () => mono(fun(listOf(nullable(p('string'))), nullable(p('string')))) },
-    { name: 'lag', category: 'window', doc: 'lag [x, offset?, default?] — window-only', scheme: u => poly(u, [tVar], t => fun(listOf(nullable(t)), windowOf(nullable(t)))) },
+    { name: 'concat', category: 'string', doc: 'concat [a, b, ...]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
+    { name: 'greatest', category: 'scalar', doc: 'greatest [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(listOf(t), t)) },
+    { name: 'round', category: 'math', doc: 'round [x] or round [x, scale]', scheme: u => poly(u, [tVar], t => fun(listOf(t), t)) },
+    { name: 'substring', category: 'string', doc: 'substring [s, start, length?]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
+    { name: 'lpad', category: 'string', doc: 'lpad [s, n, pad?]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
+    { name: 'regex_extract', category: 'string', doc: 'regex_extract [s, pattern, group?]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
+    { name: 'lag', category: 'window', doc: 'lag [x, offset?, default?] — window-only', scheme: u => poly(u, [tVar], t => fun(listOf(t), windowOf(t))) },
 
     // --- window functions ------------------------------------------------
     { name: 'over', category: 'window', doc: 'over (fn) { partition = [...], order = [...] }', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, a))) },
@@ -196,7 +222,7 @@ export const BUILTIN_SPECS = [
     { name: 'rank', category: 'window', doc: 'RANK — window-only', scheme: () => mono(windowOf(p('int'))) },
     { name: 'dense_rank', category: 'window', doc: 'DENSE_RANK — window-only', scheme: () => mono(windowOf(p('int'))) },
     { name: 'percent_rank', category: 'window', doc: 'PERCENT_RANK — window-only', scheme: () => mono(windowOf(p('int'))) },
-    { name: 'ntile', category: 'window', doc: 'NTILE — window-only', scheme: () => mono(fun(nullable(p('int')), windowOf(p('int')))) },
+    { name: 'ntile', category: 'window', doc: 'NTILE — window-only', scheme: () => mono(fun(p('int'), windowOf(p('int')))) },
 ] as const satisfies readonly BuiltinSpec[];
 
 /**
@@ -210,10 +236,13 @@ export const BUILTIN_ALIASES = {
     right_substring: 'left_substring',
     like: 'regex_like',
     is_not_null: 'is_null',
+    is_nothing: 'is_null',
+    is_just: 'is_null',
     try_cast: 'cast',
     least: 'greatest',
     rpad: 'lpad',
     lead: 'lag',
+    not_in_query: 'in_query',
 } as const;
 
 /** Every builtin name the type system knows (specs + aliases). */

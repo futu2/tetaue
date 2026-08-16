@@ -43,6 +43,27 @@ describe('pipeline order is preserved by derived tables', () => {
         expect(db.query(sql).get()).toEqual({ total: 3 });
     });
 
+    test('drop before take skips first, then limits', () => {
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE t (a int)');
+        db.run('INSERT INTO t VALUES (1), (2), (3), (4), (5)');
+        const sql = render(`t: query { a: int } = table "t"\nq = t & sort (u => asc u.a) & drop 2 & take 2`);
+        expect(sql).toContain('LIMIT 2 OFFSET 2');
+        expect(db.query(sql).all()).toEqual([{ a: 3 }, { a: 4 }]);
+    });
+
+    test('take before drop limits first, then drops from the limited rows', () => {
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE t (a int)');
+        db.run('INSERT INTO t VALUES (1), (2), (3), (4), (5)');
+        const sql = render(`t: query { a: int } = table "t"\nq = t & sort (u => asc u.a) & take 3 & drop 1`);
+        expect(db.query(sql).all()).toEqual([{ a: 2 }, { a: 3 }]);
+    });
+
+    test('consecutive drops are additive', () => {
+        expect(render(`t: query { a: int } = table "t"\nq = t & drop 2 & drop 3`, 'postgresql')).toContain('OFFSET 5');
+    });
+
     test('repeated take uses the smaller limit', () => {
         expect(render(`t: query { a: int } = table "t"\nq = t & take 3 & take 5`)).toContain('LIMIT 3');
         expect(render(`t: query { a: int } = table "t"\nq = t & take 5 & take 3`)).toContain('LIMIT 3');
@@ -80,7 +101,7 @@ describe('dialect capability fixes execute on SQLite', () => {
         const db = new Database(':memory:');
         db.run('CREATE TABLE t (a text, b text)');
         db.run("INSERT INTO t VALUES ('x', NULL)");
-        const sql = render(`t: query { a: string?, b: string? } = table "t"\nq = t & map (u => { c = concat [u.a, u.b] })`);
+        const sql = render(`t: query { a: (maybe string), b: (maybe string) } = table "t"\nq = t & map (u => { c = concat [u.a, u.b] })`);
         expect(db.query(sql).get()).toEqual({ c: 'x' });
     });
 
@@ -88,6 +109,18 @@ describe('dialect capability fixes execute on SQLite', () => {
         const sql = render(`t: query { a: string, n: int } = table "t"\nq = t & map (u => { l = lpad [u.a, 3], r = rpad [u.a, 3] })`, 'postgresql');
         expect(sql).toContain(`LPAD(a, 3, ' ') AS l`);
         expect(sql).toContain(`RPAD(a, 3, ' ') AS r`);
+    });
+});
+
+describe('count_distinct aggregate', () => {
+    test('renders COUNT(DISTINCT ...) and type-checks as an aggregate', () => {
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE t (g int, v text)');
+        db.run("INSERT INTO t VALUES (1, 'a'), (1, 'a'), (1, 'b')");
+        const sql = render(`t: query { g: int, v: string } = table "t"\nq = t & fold (u => { g = group u.g, n = count_distinct u.v })`);
+        expect(sql).toContain('COUNT(DISTINCT v) AS n');
+        expect(db.query(sql).get()).toEqual({ g: 1, n: 2 });
+        expect(typeErrors(`t: query { g: int, v: string } = table "t"\nq = t & fold (u => { g = group u.g, n = count_distinct u.v })`)).toEqual([]);
     });
 });
 

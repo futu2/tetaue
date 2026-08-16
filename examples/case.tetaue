@@ -50,7 +50,7 @@ labels = users & map (u => {
 
 # Multi-branch ladder: branches are tried in order, `_` is the ELSE value.
 # A `case` without `_` (maybe_high) renders `CASE ... END` — NULL when no
-# branch matches, so its type is `bool?`.
+# branch matches, so its type is `(maybe bool)`.
 q = orders
     & filter (o => case { o.status == "cancelled" => false, _ => true })
     & map (o => {
@@ -60,19 +60,20 @@ q = orders
         # A string ladder over the same row.
         bucket = case { o.total < 100.0 => "low", o.total < 1000.0 => "mid", _ => "high" },
 
-        # status_label: string? — no `_` branch, so non-matching rows are NULL.
+        # status_label: (maybe string) — no `_` branch, so non-matching rows are NULL.
         status_label = case { o.status == "shipped" => "sent", o.status == "cancelled" => "no" },
 
         # SIMPLE case — subject before the braces; every branch condition is
-        # compared with it. `null` branches render as IS NULL.
-        shipped_at_all = case o.total { null => "unknown", _ => "known" },
+        # compared with it. `just` lifts the non-null subject into maybe so
+        # a `null` branch is well-typed; it renders as IS NULL.
+        shipped_at_all = case (just o.total) { null => "unknown", _ => "known" },
 
         # Nested case: the value of a branch is any expression, including
         # another `case`. The parens are needed so the inner case isn't read
         # as the next branch's value.
         kind = case { o.status == "cancelled" => "dead", _ => (case { o.total >= 500.0 => "big", _ => "small" }) },
 
-        # `null` in a branch absorbs like coalesce — the result stays string.
-        name_or_nothing = case { o.status == "shipped" => "sent", _ => null },
+        # A `null` branch is explicit: `just` makes the branches maybe.
+        name_or_nothing = case { o.status == "shipped" => just "sent", _ => null },
     })
     & sort (o => [desc o.is_big])

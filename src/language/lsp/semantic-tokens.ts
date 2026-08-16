@@ -27,8 +27,8 @@ import type { TetaueServices } from '../tetaue-module.js';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBinding, isBooleanLiteral,
     isCaseBranch, isCaseExpression, isDollarParam, isFunType, isIdentifier, isImport, isLambda, isLambdaBinaryExpression,
-    isLambdaParam, isMapEntry, isNullLiteral, isNullType, isNumberLiteral, isQueryType,
-    isRecordField, isStringLiteral, isTypeVar, isUnaryMinus,
+    isLambdaParam, isMapEntry, isNullLiteral, isNumberLiteral, isQueryType,
+    isRecordField, isStringLiteral, isTypeAtom, isTypeHole, isTypeVar, isUnaryMinus,
 } from '../generated/ast.js';
 import type { Model } from '../generated/ast.js';
 
@@ -77,8 +77,12 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
             acceptor({ node, keyword: '->', type: 'operator' });
             return;
         }
-        if (isNullType(node)) {
-            acceptor({ node, keyword: '?', type: 'operator' });
+        if (isTypeAtom(node) && node.maybeType) {
+            acceptor({ node, keyword: 'maybe', type: 'keyword' });
+            return;
+        }
+        if (isTypeHole(node)) {
+            acceptor({ node, property: 'name', type: 'type', modifier: 'declaration' });
             return;
         }
 

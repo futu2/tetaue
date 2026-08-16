@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { analyze, evalExpr, BUILTINS, type Value } from '../src/language/interpreter.ts';
 import { collectModuleTree } from '../src/language/imports.ts';
 import { renderQuery, renderQueryWithCtes, DIALECTS } from '../src/language/render.ts';
-import { allErrors, parseModel, render } from './helpers.ts';
+import { allErrors, parseModel, render, typeErrors } from './helpers.ts';
 
 describe('pure evaluation API', () => {
     test('evalExpr returns diagnostics instead of mutating shared state', () => {
@@ -76,6 +76,25 @@ describe('pure set combinators', () => {
         expect(render(`${USERS_A}\n${USERS_B}\nq = a & except b`, 'postgresql')).toContain('EXCEPT');
     });
 
+    test('set operands are projected in a shared explicit column order', () => {
+        const sql = render(
+            `a: query { id: int, name: string } = table "a"
+             b: query { name: string, id: int } = table "b"
+             q = a & union_all b`,
+            'postgresql',
+        );
+        expect(sql).toContain('SELECT id, name');
+        expect(sql.startsWith('SELECT id, name')).toBe(true);
+    });
+
+    test('dialect join capabilities are enforced', () => {
+        const src = `a: query { id: int } = table "a"
+b: query { id: int } = table "b"
+q = a & join full b (l => r => l.id == r.id) (l => r => { id = l.id })`;
+        expect(() => render(src, 'mysql')).toThrow(/full join is not supported/);
+        expect(render(src, 'postgresql')).toContain('FULL JOIN');
+    });
+
     test('set operand schemas must unify', () => {
         expect(allErrors(`${USERS_A}\nb: query { id: int, age: int } = table "b"\nq = a & union b`).join('\n')).toContain('cannot apply');
     });
@@ -93,6 +112,26 @@ describe('record update sugar', () => {
         expect(sql).toContain('id > 0 AS active');
         expect(sql).toContain('id');
         expect(sql).toContain('name');
+    });
+
+    test('select [columns] narrows a projection', () => {
+        const src = `t: query { id: int, name: string, secret: string } = table "t"\nq = t & select ["id", "name"] & filter (u => u.id > 0)`;
+        const sql = render(src, 'postgresql', 'compact');
+        expect(sql).toBe('SELECT id, name FROM t WHERE id > 0');
+        expect(typeErrors(src)).toEqual([]);
+    });
+
+    test('select validates its column list', () => {
+        expect(allErrors(`t: query { id: int } = table "t"\nq = t & select ["id", "id"]`).join('\n')).toContain("duplicate column 'id' in select");
+        expect(allErrors(`t: query { id: int } = table "t"\nq = t & select []`).join('\n')).toContain('at least one column');
+    });
+
+    test('field punning: { id, name } is { id = u.id, name = u.name }', () => {
+        const sql = render(`t: query { id: int, name: string } = table "t"\nq = t & map (u => { id, name }) & take 1`, 'postgresql');
+        expect(sql).toContain('id');
+        expect(sql).toContain('name');
+        const bad = allErrors('q = { id }');
+        expect(bad.join('\n')).toContain("field pun 'id' requires an enclosing lambda parameter");
     });
 
     test('record update rejects non-records consistently', () => {

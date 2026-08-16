@@ -30,11 +30,11 @@ interface Tok {
 }
 
 /** Continuation operators that indent a line one level when they start it. */
-const CONTINUATION = new Set(['&', '$', '|', '==', '!=', '<', '<=', '>', '>=', '&&', '||', '>>>', '<<<', '*', '/', '%', '+', '-']);
+const CONTINUATION = new Set(['&', '$', '|', '==', '!=', '<', '<=', '>', '>=', '&&', '||', '>>>', '<<<', '*', '/', '+', '-']);
 
 /** Word-like tokens that get a space between them and their neighbors. */
 const WORD_TOKEN_NAMES = new Set(['ID', 'ARG_ID', 'NUMBER', 'STRING', 'LAMBDA_PARAM']);
-const WORD_KEYWORDS = new Set(['query', 'true', 'false', 'null', 'let', 'in']);
+const WORD_KEYWORDS = new Set(['query', 'maybe', 'true', 'false', 'null', 'let', 'in']);
 
 function isComment(t: Tok): boolean {
     return t.tokenType?.name === 'COMMENT';
@@ -58,7 +58,7 @@ function spaceBetween(prev: Tok, cur: Tok, hadSpace: boolean): string {
     if (isWord(cur)) {
         return prev.image === '(' || prev.image === '[' || prev.image === '.' || prev.image === '?' ? '' : ' ';
     }
-    return ' '; // operators: = & $ | => -> == != < <= > >= && || >>> <<< * / % +
+    return ' '; // operators: = & $ | => -> == != < <= > >= && || >>> <<< * / +
 }
 
 function isName(t: Tok): boolean {
