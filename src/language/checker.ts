@@ -35,6 +35,8 @@ export interface CheckProjectResult {
     diagnostics: Diagnostic[];
     /** Static type of each expression / binding node, keyed by node identity. */
     nodeTypes: Map<AstNode, Type>;
+    /** Runtime IR Value produced for each expression node (best effort). */
+    nodeValues: Map<AstNode, Value>;
     /** Rendered (resolved) type text of a node, or undefined. */
     typeOf(node: AstNode): string | undefined;
     /** Row fields of a node's type (unwrapping `?`), with rendered types, or undefined. */
@@ -62,6 +64,7 @@ export function checkProject(
 
     const inferencer = new Inferencer();
     inferencer.prelude();
+    const nodeValues = new Map<AstNode, Value>();
 
     // Export maps are filled as each module is processed (diamond imports
     // reference the SAME target module object, so this stays deduplicated).
@@ -110,7 +113,7 @@ export function checkProject(
         let seen = new Set<string>();
         for (const binding of module.model.bindings) {
             const result = inferencer.typedBinding(
-                binding, exportedSchemes, scope, env, moduleBindings, seen,
+                binding, exportedSchemes, scope, env, moduleBindings, seen, nodeValues,
             );
             moduleDiagnostics.push(...result.diagnostics);
             env = result.env;
@@ -165,6 +168,7 @@ export function checkProject(
         value,
         diagnostics,
         nodeTypes: inferencer.nodeTypes,
+        nodeValues,
         typeOf: node => inferencer.typeOf(node),
         fieldsOf: node => inferencer.fieldsOf(node),
     };

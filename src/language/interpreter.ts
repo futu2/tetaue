@@ -180,6 +180,8 @@ export interface Ctx {
     typeNamespaces?: ReadonlyMap<string, ReadonlyMap<string, import('./generated/ast.js').Type>>;
     /** When evaluating a fold projection, CASE branches may wrap aggregates. */
     allowAggregatesInCase?: boolean;
+    /** Optional best-effort record of the runtime Value produced per AST node. */
+    nodeValues?: Map<AstNode, Value>;
 }
 
 /** The public, pure evaluation result: diagnostics are returned, never hidden. */
@@ -867,6 +869,12 @@ function dollarLambda(body: Expr, arity: number, ctx: Ctx): Value {
 }
 
 export function evalExprWith(e: Expr, ctx: Ctx): Value {
+    const value = evalExprWithInner(e, ctx);
+    ctx.nodeValues?.set(e, value);
+    return value;
+}
+
+function evalExprWithInner(e: Expr, ctx: Ctx): Value {
     if (isLetExpression(e) || isLambdaLetExpression(e)) {
         // `let x = value in body` — a pure lexical binding. Evaluation
         // extends the environment immutably; the value is not mutable state.
@@ -1046,6 +1054,12 @@ export function evalExprWith(e: Expr, ctx: Ctx): Value {
 
 /** Evaluate a UnaryExpression (a BinaryExpression operand): unary minus or a plain expression. */
 function evalUnary(u: UnaryExpression, ctx: Ctx): Value {
+    const value = evalUnaryInner(u, ctx);
+    ctx.nodeValues?.set(u, value);
+    return value;
+}
+
+function evalUnaryInner(u: UnaryExpression, ctx: Ctx): Value {
     if (isUnaryMinus(u)) {
         const v = evalUnary(u.operand, ctx);
         const node = exprNode(v);
@@ -3296,14 +3310,14 @@ function stampQueryTypeAnnotation(
     };
 }
 
-export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBindings: ReadonlySet<string>, seen: ReadonlySet<string>): BindingResult {
+export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBindings: ReadonlySet<string>, seen: ReadonlySet<string>, ctxExtras: Partial<Ctx> = {}): BindingResult {
     const diagnostics: Diagnostic[] = [];
     const nextSeen = new Set(seen);
     if (nextSeen.has(binding.name)) {
         diagnostics.push({ node: binding, message: `duplicate binding name '${binding.name}'` });
     }
     nextSeen.add(binding.name);
-    const ctx: Ctx = { env, diagnostics, moduleBindings: new Set(moduleBindings) };
+    const ctx: Ctx = { env, diagnostics, moduleBindings: new Set(moduleBindings), ...ctxExtras };
     let v = evalExprWith(binding.value, ctx);
     v = stampQueryTypeAnnotation(v, binding.type, binding, ctx);
     // Remember the binding name on query values so generated SQL aliases

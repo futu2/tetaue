@@ -356,6 +356,7 @@ export class Inferencer {
         valueEnv: Map<string, Value>,
         moduleBindings: ReadonlySet<string>,
         seen: ReadonlySet<string>,
+        nodeValues?: Map<AstNode, Value>,
     ): { env: Map<string, Value>; seen: Set<string>; value: Value; diagnostics: Diagnostic[] } {
         const diagnostics: Diagnostic[] = [];
         if (scope.has(b.name)) {
@@ -371,7 +372,7 @@ export class Inferencer {
         this.inferBinding(b, exported, scope, false);
         scope.set(b.name, `local binding '${b.name}'`);
 
-        const result = checkBinding(b, valueEnv, moduleBindings, seen);
+        const result = checkBinding(b, valueEnv, moduleBindings, seen, nodeValues ? { nodeValues } : {});
         diagnostics.push(...result.diagnostics);
         return { env: result.env, seen: result.seen, value: result.value, diagnostics };
     }

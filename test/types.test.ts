@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { parseModel, typeErrors, allErrors, render } from './helpers.ts';
+import { checkProject } from '../src/language/checker.ts';
 import {
     TypeUniverse, UnifyError, type Type,
     fun, listOf, maybeOf, prim, queryOf, rowOf,
@@ -697,5 +698,16 @@ q = a & map (u => { c = coalesce [u.x, u.y, just "fallback"] })`;
     test('coalesce list items must all be nullable', () => {
         const messages = typeErrors(`a: query { x: (maybe string) } = table "a"\nq = a & map (u => { c = coalesce [u.x, "fallback"] })`);
         expect(messages.join('\n')).toContain('coalesce requires matching nullable (maybe T) types');
+    });
+});
+
+describe('typed expression result recording', () => {
+    test('checkProject records both the inferred type and runtime value for expression nodes', () => {
+        const model = parseModel('x = 1 + 2\n');
+        const project = [{ model, uri: undefined, imports: [] }];
+        const result = checkProject(project, { requireQuery: false, importsByModule: new Map() });
+        const expr = model.bindings[0]!.value;
+        expect(result.typeOf(expr)).toBe('int');
+        expect(result.nodeValues.get(expr)?.kind).toBe('expr');
     });
 });
