@@ -116,6 +116,20 @@ export class Inferencer {
     /** Alias names currently being expanded (cycle detection). */
     private activeTypeAliases = new Set<string>();
     diagnostics: InferDiagnostic[] = [];
+
+    /** Pull and clear every pending inference diagnostic. */
+    takeDiagnostics(): InferDiagnostic[] {
+        const out = this.diagnostics;
+        this.diagnostics = [];
+        return out;
+    }
+
+    /** Pull diagnostics emitted after (and including) `start`. */
+    takeDiagnosticsFrom(start: number): InferDiagnostic[] {
+        const out = this.diagnostics.slice(start);
+        this.diagnostics.length = start;
+        return out;
+    }
     /**
      * Checks that must run after the whole project has been unified (for
      * example list-element compatibility when the element type is still a
@@ -369,7 +383,9 @@ export class Inferencer {
         // Type first against the ORIGINAL imported scope; the runtime
         // diagnostic above is authoritative, so inference only installs the
         // binding scheme and resolves namespace shadowing.
+        const inferenceStart = this.diagnostics.length;
         this.inferBinding(b, exported, scope, false);
+        diagnostics.push(...this.takeDiagnosticsFrom(inferenceStart));
         scope.set(b.name, `local binding '${b.name}'`);
 
         const result = checkBinding(b, valueEnv, moduleBindings, seen, nodeValues ? { nodeValues } : {});

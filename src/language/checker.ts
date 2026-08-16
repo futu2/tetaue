@@ -94,7 +94,9 @@ export function checkProject(
 
         let env = createPreludeEnv();
         const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
-        const moduleDiagnostics: Diagnostic[] = [];
+        const moduleDiagnostics: Diagnostic[] = [
+            ...inferencer.takeDiagnostics(),
+        ];
 
         const imported = resolveImportScope(module, moduleImports, valueExportsByModule, typeExportsByModule);
         moduleDiagnostics.push(...imported.diagnostics);
@@ -135,6 +137,7 @@ export function checkProject(
     }
 
     inferencer.flushDeferred();
+    interpreterDiagnostics.push(...inferencer.takeDiagnostics());
 
     // Query requirement. Default: the last binding, as before. With
     // `entryBinding`, render/check target any named root-module binding.
@@ -163,7 +166,7 @@ export function checkProject(
         }
     }
 
-    const diagnostics = mergeDiagnostics(modules, interpreterDiagnostics, inferencer.diagnostics);
+    const diagnostics = mergeDiagnostics(modules, interpreterDiagnostics);
     return {
         value,
         diagnostics,
