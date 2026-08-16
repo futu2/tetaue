@@ -1,12 +1,12 @@
 /******************************************************************************
  * tetaue checker — the single typed-IR/checking pass.
  *
- * `checkProject` runs ONE project traversal (imports first, root last). For
- * each module it resolves imports once for the value evaluator and once for
- * the type inferencer (project-scope.ts is shared and deterministic), then
- * checks each binding for BOTH runtime IR construction (the SQL `Value` /
- * `Query` IR used by the renderer) and static typing (the Hindley–Milner
- * row-polymorphic pass). The result is a checked project:
+ * `checkProject` runs ONE project traversal (imports first, root last).
+ * Each binding is advanced through the value evaluator and the type
+ * inferencer TOGETHER, sharing one lexical scope (`Inferencer.beginModule`),
+ * so runtime IR construction (the SQL `Value` / `Query` IR) and static typing
+ * (the Hindley-Milner row-polymorphic pass) stay in lockstep. The result is
+ * a checked project:
  *
  *   - `value`: the root module's final IR value (exactly what `analyzeProject`
  *     produced) — the renderer consumes this directly;
@@ -15,18 +15,18 @@
  *   - `nodeTypes` / `typeOf` / `fieldsOf`: the static types recorded for
  *     hover and completion.
  *
- * This replaces the old architecture where `compile.ts` and the validator ran
- * `analyzeProject` + `inferProject` as two separate whole-project passes and
- * merged them afterwards. The old functions still exist as compatibility
- * wrappers for tests and the CLI `types` command.
+ * `analyzeProject` / `inferProject` remain as compatibility wrappers for
+ * callers that only need one side, but production paths (`compile.ts`, the
+ * validator, hover/completion, and `tetaue types`) all use this pass.
  ******************************************************************************/
 import type { AstNode } from 'langium';
+import type { Binding } from './generated/ast.js';
 import {
     ERROR, checkBinding, createPreludeEnv, describe, type Diagnostic, type Value,
 } from './interpreter.js';
 import { Inferencer, mergeDiagnostics } from './inference.js';
 import type { Scheme, Type } from './types.js';
-import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
+import { resolveImportScope } from './project-scope.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
 
 export interface CheckProjectResult {
@@ -49,6 +49,40 @@ export interface CheckProjectOptions {
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
     /** Render this root-module binding instead of the last one. */
     entryBinding?: string;
+}
+
+/**
+ * Advance ONE binding through both the runtime evaluator and the type
+ * inferencer, in order, using the same shared lexical scope. The value side
+ * installs the binding in the runtime env; the inference side installs its
+ * scheme and exports it when requested.
+ */
+function checkTypedBinding(
+    binding: Binding,
+    valueEnv: Map<string, Value>,
+    inferencer: Inferencer,
+    moduleBindings: ReadonlySet<string>,
+    seen: ReadonlySet<string>,
+    scope: Map<string, string>,
+    exportedSchemes: Map<string, Scheme>,
+): { env: Map<string, Value>; seen: Set<string>; value: Value; diagnostics: Diagnostic[] } {
+    const diagnostics: Diagnostic[] = [];
+    if (scope.has(binding.name)) {
+        diagnostics.push({
+            node: binding,
+            message: `name '${binding.name}' (a local binding) conflicts with ${scope.get(binding.name)!}`,
+        });
+    }
+
+    // Type first against the ORIGINAL imported scope; the runtime diagnostic
+    // above is authoritative for scope collisions, so inference only
+    // installs the binding scheme here.
+    inferencer.inferBinding(binding, exportedSchemes, scope, false);
+    scope.set(binding.name, `local binding '${binding.name}'`);
+
+    const result = checkBinding(binding, valueEnv, moduleBindings, seen);
+    diagnostics.push(...result.diagnostics);
+    return { env: result.env, seen: result.seen, value: result.value, diagnostics };
 }
 
 /**
@@ -79,14 +113,23 @@ export function checkProject(
         const moduleImports: readonly ResolvedImportEdge[] =
             importsByModule.get(module) ?? module.imports ?? [];
 
-        // --- value/IR side (identical semantics to analyzeProject) ---------
+        // Prepare BOTH sides once for this module. The type inferencer owns
+        // the shared lexical scope; the value evaluator owns the runtime
+        // environment. Both are advanced together per binding below.
+        const typedScope = inferencer.beginModule(
+            module,
+            moduleImports,
+            schemeExportsByModule,
+            typeExportsByModule,
+        ).scope;
+        const scope = new Map(typedScope);
+
         let env = createPreludeEnv();
         const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
         const moduleDiagnostics: Diagnostic[] = [];
 
         const imported = resolveImportScope(module, moduleImports, valueExportsByModule, typeExportsByModule);
-        const importedTypes = resolveTypeImportScope(module, moduleImports, typeExportsByModule);
-        moduleDiagnostics.push(...imported.diagnostics, ...importedTypes.diagnostics);
+        moduleDiagnostics.push(...imported.diagnostics);
         for (const [name, v] of imported.flat) env.set(name, v);
         for (const [alias, selected] of imported.namespaces) {
             env.set(alias, {
@@ -96,46 +139,22 @@ export function checkProject(
                 ast: module.model.imports.find(imp => imp.alias === alias),
             });
         }
-        const scope = new Map(imported.scope);
-
-        const typeAliases = new Map(importedTypes.flat);
-        for (const alias of module.model.types) {
-            if (typeAliases.has(alias.name)) {
-                moduleDiagnostics.push({
-                    node: alias,
-                    message: `type alias '${alias.name}' conflicts with an imported type alias`,
-                });
-                continue;
-            }
-            typeAliases.set(alias.name, alias.type);
-        }
 
         const exports = new Map<string, Value>();
+        const exportedSchemes = new Map<string, Scheme>();
         let seen = new Set<string>();
         for (const binding of module.model.bindings) {
-            if (scope.has(binding.name)) {
-                moduleDiagnostics.push({
-                    node: binding,
-                    message: `name '${binding.name}' (a local binding) conflicts with ${scope.get(binding.name)!}`,
-                });
-            }
-            scope.set(binding.name, `local binding '${binding.name}'`);
-            const result = checkBinding(binding, env, moduleBindings, seen);
+            const result = checkTypedBinding(
+                binding, env, inferencer, moduleBindings, seen, scope, exportedSchemes,
+            );
             moduleDiagnostics.push(...result.diagnostics);
             env = result.env;
             seen = result.seen;
             value = result.value;
-            if (binding.export) exports.set(binding.name, value);
+            if (binding.export) {
+                exports.set(binding.name, value);
+            }
         }
-
-        // --- static-type side (identical semantics to inferProject) --------
-        // `inferModule` reads the SAME import edges and previous export maps.
-        const exportedSchemes = inferencer.inferModule(
-            module,
-            moduleImports,
-            schemeExportsByModule,
-            typeExportsByModule,
-        );
 
         valueExportsByModule.set(module, exports);
         schemeExportsByModule.set(module, exportedSchemes);

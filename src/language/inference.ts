@@ -228,6 +228,42 @@ export class Inferencer {
     }
 
     /**
+     * Prepare this inferencer for one module without walking its bindings:
+     * clone the prelude, resolve import scopes, install flat and namespaced
+     * schemes, and expand module-local type aliases. Returns the shared scope
+     * map used by the per-binding typed pass in `checker.ts`.
+     *
+     * `inferModule` remains a convenience wrapper around
+     * `beginModule` + `inferBinding` for standalone `types`/test callers.
+     */
+    beginModule(
+        module: ProjectModule,
+        imports: readonly ResolvedImportEdge[],
+        exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, Scheme>>,
+        typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, LangiumType>>,
+    ): { scope: ReadonlyMap<string, string> } {
+        this.env = new Map(this.preludeEnv);
+        this.modules = new Map<string, Map<string, Scheme>>();
+        const imported = resolveImportScope(module, imports, exportsByModule, typeExportsByModule);
+        const importedTypes = resolveTypeImportScope(module, imports, typeExportsByModule);
+        for (const d of importedTypes.diagnostics) this.diag(d.node, d.message);
+        for (const d of imported.diagnostics) this.diag(d.node, d.message);
+        for (const [name, scheme] of imported.flat) this.env.set(name, scheme);
+        for (const [alias, selected] of imported.namespaces) this.modules.set(alias, new Map(selected));
+        const scope = new Map(imported.scope);
+        this.typeAliases = new Map(importedTypes.flat);
+        this.typeNamespaces = new Map([...importedTypes.namespaces].map(([k, v]) => [k, new Map(v)]));
+        for (const alias of module.model.types) {
+            if (this.typeAliases.has(alias.name)) {
+                this.diag(alias, `type alias '${alias.name}' conflicts with an imported type alias`);
+                continue;
+            }
+            this.typeAliases.set(alias.name, alias.type);
+        }
+        return { scope };
+    }
+
+    /**
      * Infer one module in an already-prepared environment. Reads import
      * scopes from `exportsByModule` / `typeExportsByModule` (previous
      * modules) and returns the module's exported binding schemes. Callers
@@ -239,42 +275,26 @@ export class Inferencer {
         exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, Scheme>>,
         typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, LangiumType>>,
     ): Map<string, Scheme> {
-        this.env = new Map(this.preludeEnv);
-        this.modules = new Map<string, Map<string, Scheme>>();
-        const imported = resolveImportScope(module, imports, exportsByModule, typeExportsByModule);
-        const importedTypes = resolveTypeImportScope(module, imports, typeExportsByModule);
-        for (const d of importedTypes.diagnostics) this.diag(d.node, d.message);
-        for (const d of imported.diagnostics) this.diag(d.node, d.message);
-        for (const [name, scheme] of imported.flat) this.env.set(name, scheme);
-        for (const [alias, selected] of imported.namespaces) this.modules.set(alias, new Map(selected));
-        const scope = new Map(imported.scope);
+        const { scope } = this.beginModule(module, imports, exportsByModule, typeExportsByModule);
         const exported = new Map<string, Scheme>();
-        this.typeAliases = new Map(importedTypes.flat);
-        this.typeNamespaces = new Map([...importedTypes.namespaces].map(([k, v]) => [k, new Map(v)]));
-        for (const alias of module.model.types) {
-            if (this.typeAliases.has(alias.name)) {
-                this.diag(alias, `type alias '${alias.name}' conflicts with an imported type alias`);
-                continue;
-            }
-            this.typeAliases.set(alias.name, alias.type);
-        }
         for (const binding of module.model.bindings) {
-            if (scope.has(binding.name)) {
-                this.diag(binding, conflictMessage(binding.name, scope.get(binding.name)!, 'a local binding'));
-                // The local binding wins at runtime (the interpreter's env
-                // override replaces the module value) — stop treating the
-                // name as a namespace, or the two passes would diverge on
-                // every downstream error. A no-op for flat-import
-                // collisions (the name is not in `modules`).
-                this.modules.delete(binding.name);
-            }
-            scope.set(binding.name, `local binding '${binding.name}'`);
-            this.inferBinding(binding, exported);
+            this.inferBinding(binding, exported, scope);
         }
         return exported;
     }
 
-    inferBinding(b: Binding, exported: Map<string, Scheme>): void {
+    inferBinding(b: Binding, exported: Map<string, Scheme>, scope?: ReadonlyMap<string, string>, reportScopeConflict = true): void {
+        if (scope && scope.has(b.name)) {
+            if (reportScopeConflict) {
+                this.diag(b, conflictMessage(b.name, scope.get(b.name)!, 'a local binding'));
+            }
+            // The local binding wins at runtime (the interpreter's env
+            // override replaces the module value) — stop treating the
+            // name as a namespace, or the two passes would diverge on
+            // every downstream error. A no-op for flat-import
+            // collisions (the name is not in `modules`).
+            this.modules.delete(b.name);
+        }
         const inferred = this.inferExpr(b.value, this.env);
         let t = inferred;
         if (b.type) {

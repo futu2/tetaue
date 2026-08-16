@@ -28,7 +28,7 @@ import type { TetaueServices } from './language/tetaue-module.js';
 import { DIALECTS, isDialect } from './language/render.js';
 import type { RenderFormat } from './language/render.js';
 import { compileModuleText } from './language/compile.js';
-import { inferProject } from './language/inference.js';
+import { checkProject } from './language/checker.js';
 import type { CompileDiagnostic, CompileOutcome } from './language/compile.js';
 import { collectModuleTree, moduleOf } from './language/imports.js';
 import type { ProjectModule } from './language/imports.js';
@@ -244,7 +244,7 @@ async function cmdTypes(args: string[]): Promise<number> {
         console.error(`error: ${msg(err)}`);
         return 1;
     }
-    const result = inferProject(project.modules, project.importsByModule);
+    const result = checkProject(project.modules, { requireQuery: false, importsByModule: project.importsByModule });
     for (const d of result.diagnostics) {
         const m = moduleOf(d.node, project.modules) ?? project.main;
         const pos = d.node?.$cstNode?.range.start;
