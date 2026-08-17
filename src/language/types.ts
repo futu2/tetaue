@@ -21,6 +21,8 @@ export type PrimName = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' 
 export type Type =
     | { kind: 'var'; id: number }
     | { kind: 'prim'; name: PrimName }
+    /** A SQL predicate: either bool or maybe bool (three-valued logic). */
+    | { kind: 'truth' }
     | { kind: 'maybe'; of: Type }
     | { kind: 'fun'; from: Type; to: Type }
     | { kind: 'list'; of: Type }
@@ -92,6 +94,11 @@ const PRIM_NAMES: Record<PrimName, string> = {
 
 export function prim(name: PrimName): Type {
     return { kind: 'prim', name };
+}
+
+/** Internal type accepted by SQL three-valued logic predicates. */
+export function truthType(): Type {
+    return { kind: 'truth' };
 }
 
 export function maybeOf(t: Type): Type {
@@ -224,7 +231,7 @@ export class TypeUniverse {
                 case 'query': visit(r.row); break;
                 case 'builtin':
                 case 'agg': case 'group': case 'window': visit(r.of); break;
-                case 'prim': case 'order': case 'jkind': break;
+                case 'prim': case 'truth': case 'order': case 'jkind': break;
             }
         };
         visit(t);
@@ -322,6 +329,20 @@ export class TypeUniverse {
         if (b.kind === 'var') {
             this.bind(b.id, a);
             return a;
+        }
+
+        // A SQL predicate may be either non-null bool or nullable bool. The
+        // dedicated internal type keeps that choice open until a row schema
+        // is known, without making arbitrary scalar types acceptable.
+        if (a.kind === 'truth' || b.kind === 'truth') {
+            const other = a.kind === 'truth' ? b : a;
+            if (other.kind === 'truth') return a;
+            if (other.kind === 'prim' && other.name === 'bool') return a.kind === 'truth' ? a : b;
+            if (other.kind === 'maybe') {
+                const inner = this.resolve(other.of);
+                if (inner.kind === 'prim' && inner.name === 'bool') return a.kind === 'truth' ? a : b;
+            }
+            throw new UnifyError(a, b);
         }
 
         // `agg`/`group` mode absorption (transparent): unify the
@@ -611,7 +632,7 @@ export class TypeUniverse {
             case 'agg': return aggOf(this.substitute(subst, r.of));
             case 'group': return groupOf(this.substitute(subst, r.of));
             case 'window': return windowOf(this.substitute(subst, r.of));
-            case 'prim': case 'order': case 'jkind': return r;
+            case 'prim': case 'truth': case 'order': case 'jkind': return r;
         }
     }
 
@@ -642,6 +663,7 @@ export class TypeUniverse {
                     return info.kind === 'row' ? `r${r.id}` : `t${r.id}`;
                 }
                 case 'prim': return PRIM_NAMES[r.name];
+                case 'truth': return 'bool?';
                 case 'maybe':
                     return `(maybe ${p(r.of, false)})`;
                 case 'list': return `[${p(r.of, false)}]`;

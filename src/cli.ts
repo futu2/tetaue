@@ -36,6 +36,7 @@ import { findManifestDir, MANIFEST_NAME, parseManifest, resolveImport } from './
 import type { BuildConfig } from './language/resolve.js';
 import { formatTetaue } from './language/lsp/formatter.js';
 import type { Model } from './language/generated/ast.js';
+import { standardPrelude } from './language/prelude.js';
 
 const HELP = `tetaue — a pure functional SQL query language
 
@@ -244,7 +245,11 @@ async function cmdTypes(args: string[]): Promise<number> {
         console.error(`error: ${msg(err)}`);
         return 1;
     }
-    const result = checkProject(project.modules, { requireQuery: false, importsByModule: project.importsByModule });
+    const result = checkProject(project.modules, {
+        requireQuery: false,
+        importsByModule: project.importsByModule,
+        prelude: standardPrelude(services),
+    });
     for (const d of result.diagnostics) {
         const m = moduleOf(d.node, project.modules) ?? project.main;
         const pos = d.node?.$cstNode?.range.start;

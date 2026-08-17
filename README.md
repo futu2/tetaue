@@ -197,6 +197,19 @@ binding with a type annotation, and the next binding starts right after it.
 `table` is an ordinary function — `table : string -> query r` — and the query
 type annotation IS the table's schema.
 
+### Core and standard prelude
+
+The language is checked and evaluated by one shared pass (`checkProject`). Its
+TypeScript core is limited to SQL-aware primitives. Reusable functional
+helpers live in [`prelude.tetaue`](prelude.tetaue) and are processed by the
+same parser, inference engine, and interpreter as application code. The
+standard helpers include the `_op_` bindings, `id`, `const`, `compose`, `flip`,
+and `pipe`; local bindings and imports may shadow them normally. Infix parsing
+and precedence stay in the grammar, while an expression such as `1 + 2`
+resolves the scoped `_+_` function defined by the prelude. See
+[`docs/design/core.md`](docs/design/core.md) for the boundary and extension
+rules.
+
 ```
 users: query { id: int, name: string, active: bool } = table "users"
 adults = users & filter (u => u.active) & take 5
@@ -387,6 +400,14 @@ u & filter ...        # pipeline: apply the step to the query
   `filter (adult)`. Query steps compose too:
   `filter (adult) >>> take 10` is one reusable `query -> query` function,
   and the inferred composition type is `a -> c`, never the result type.
+- Every binary operator has an Agda-style curried function form: `_+_ 1 2`
+  is `1 + 2`, `_>>>_ f g` is `f >>> g`, and `_&_ query step` is
+  `query & step`. Sections are first-class and partially applicable:
+  `increment = _+_ 1`. These `_op_` functions are ordinary prelude bindings,
+  so a local or imported `_+_` changes infix `+` as well. A named section
+  resolves an exact `_name_` binding first and then an ordinary function, so
+  `_div_ 5 2` calls `div`, and `_combine_ x y` can call a user-defined curried
+  function named `_combine_` or `combine`.
 
 ### Types
 
@@ -402,6 +423,10 @@ non-null value into maybe, `nothing` is the maybe constant, and
 `u.age >= 18.0` (int column vs float literal) is a type error; write
 `18.0` against a `float` column. Haskell-base numerics: `/` is fractional
 division (`float -> float -> float`), `div`/`mod` are integral.
+
+SQL three-valued predicates are explicit: `is_true x` and `is_false x` test
+the TRUE/FALSE branches, while `is_unknown x` tests SQL `NULL`. They accept
+both `bool` and `(maybe bool)` and always return a non-null `bool`.
 
 Type aliases are declarations before bindings; prefix with `export` to
 share them with importing modules (flat imports and selective renaming):
@@ -558,6 +583,7 @@ regex_like u.name "^[A-Z]"  regex_replace u.name "[0-9]" "#"
 regex_extract [u.name, "([0-9]+)", 1]   # group arg is Trino-only
 like u.name "a%"                       # x LIKE pattern
 null_if u.name ""  is_null u.name  is_not_null u.name
+is_true u.flag  is_false u.flag  is_unknown u.flag
 case { u.active => u.name, _ => "inactive" }    # CASE WHEN active THEN name ELSE 'inactive' END
 case { u.age < 18 => "minor", u.age >= 65 => "senior", _ => "adult" }   # multi-branch; `_` is the fallback
 case u.code { "101" => "one", "102" => "two", _ => u.code }   # simple case: branches compare with the subject
@@ -717,6 +743,8 @@ src/language/
   catalog.ts            # compatibility re-export of builtin.ts
   checker.ts            # single typed-IR/checker pass (IR construction + type inference)
   interpreter.ts        # symbolic evaluator: curried builtins, query steps, diagnostics
+  optimize.ts           # pure, dialect-independent query normalization/rewrites
+  capabilities.ts       # pure dialect capability preflight for normalized queries
   types.ts              # type engine: HM unification, rows, `(maybe T)`, `?hole`s
   inference.ts          # type inference engine: prelude schemes, annotations, diagnostics
   imports.ts            # multi-file module resolution (cycles, missing files)
@@ -733,19 +761,19 @@ test/                   # bun test suite (incl. an end-to-end LSP test)
 examples/               # runnable example modules (incl. multi-file report.tetaue, joins.tetaue, case.tetaue)
 ```
 
-The interpreter powers rendering and structural checks; the inference engine
-adds the static type layer (row polymorphism, annotations, strict numerics).
-They are exposed as one `checkProject` pass that builds the typed SQL IR and
-returns exact-deduped diagnostics — so `check` and `render` never disagree.
+The interpreter builds the symbolic query IR, the pure optimizer normalizes it,
+and the capability preflight validates the selected dialect before SQL text is
+emitted. The inference engine adds the static type layer (row polymorphism,
+annotations, strict numerics). They are exposed as one `checkProject` pass that
+builds the typed SQL IR and returns exact-deduped diagnostics — so `check` and
+`render` never disagree.
 
 ## Roadmap
 
-- `values(...)` inline row literals, `union` / `unionAll` set operations
-- named parameter APIs on top of `param` placeholders, more of teta's catalog
-- more of teta's catalog: `case` inside `fold` with aggregates, more array
-  functions (indexing, element-wise — `list` aggregation and `[T]` column
-  annotations landed), lateral joins
-- LSP polish: completion for `$n` implicit lambdas, hover types for qualified
-  access across libs. (Go-to-definition across imports, `t.` completion, lib
-  doc hover, builtin-name completion, and importer revalidation on
-  lib/manifest changes are done.)
+- external schema/catalog declarations and a strict-schema project mode
+- query cardinality types for scalar and singleton subqueries
+- more pure optimizer rewrites: projection pruning, safe predicate pushdown,
+  and common-subexpression/CTE sharing
+- LSP polish: completion for `$n` implicit lambdas and richer cross-module
+  documentation (go-to-definition, qualified completion, builtin completion,
+  and importer revalidation are already implemented)

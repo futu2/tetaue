@@ -1,11 +1,13 @@
 /******************************************************************************
- * tetaue SQL renderer — lowers a Query value to a SQL string.
+ * tetaue SQL renderer — normalizes a Query value, then lowers it to SQL.
  *
  * Dialects are capability-driven (like teta's backend): identifier quoting,
  * boolean literals and function-name mappings are resolved at render time.
  ******************************************************************************/
 import { querySchema, type JoinKind, type Query, type SetOp, type SqlNode } from './interpreter.js';
 import type { BuiltinName } from './builtin.js';
+import { optimizeQuery } from './optimize.js';
+import { checkDialectCapabilities } from './capabilities.js';
 
 export interface DialectSpec {
     name: string;
@@ -486,7 +488,7 @@ const SPECIAL_CALLS = new Set<BuiltinName>([
     // scalar family
     'concat', 'greatest', 'least', 'substring', 'position', 'reverse', 'left_substring', 'right_substring',
     'lpad', 'rpad', 'regex_like', 'regex_replace', 'regex_extract', 'cast', 'try_cast',
-    'from_maybe', 'div',
+    'from_maybe', 'is_true', 'is_false', 'is_unknown', 'div',
 ]);
 
 function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): string | null {
@@ -565,6 +567,14 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
         }
         case 'from_maybe':
             return `COALESCE(${x()}, ${x(1)})`;
+        case 'is_true':
+            return `${x()} IS TRUE`;
+        case 'is_false':
+            return `${x()} IS FALSE`;
+        case 'is_unknown':
+            // IS UNKNOWN is not accepted by every supported backend;
+            // for a boolean expression SQL UNKNOWN is exactly NULL.
+            return `${x()} IS NULL`;
         case 'div':
             // Haskell `div` is integral division. PostgreSQL, SQLite and
             // Trino already integer-divide when both operands are ints;
@@ -1077,12 +1087,15 @@ export function renderQueryWithCtes(q: Query, dialect: DialectSpec, format: Rend
     const diagnostics: RenderDiagnostic[] = [];
     const parameters: ParameterState = new Map();
     try {
-        const ctes = collectCtes(q, dialect);
+        const normalized = optimizeQuery(q);
+        const capabilityDiagnostics = checkDialectCapabilities(normalized, dialect);
+        if (capabilityDiagnostics.length > 0) return { ok: false, diagnostics: capabilityDiagnostics };
+        const ctes = collectCtes(normalized, dialect);
         const bodies = [...ctes].map(([query, name]) => {
             const sql = renderQueryWithDiagnostics(query, dialect, 'compact', diagnostics, ctes, parameters);
             return { name, sql };
         });
-        const body = renderQueryWithDiagnostics(q, dialect, format, diagnostics, ctes, parameters);
+        const body = renderQueryWithDiagnostics(normalized, dialect, format, diagnostics, ctes, parameters);
         if (diagnostics.length > 0) return { ok: false, diagnostics };
         const withClause = bodies.length > 0
             ? `WITH ${bodies.map((b, i) => `${dialect.quoteIdentifier(b.name)} AS (\n${indentLines(b.sql, INDENT)}\n)${i < bodies.length - 1 ? ',' : ''}`).join('\n')}\n`
@@ -1098,14 +1111,17 @@ export function renderQueryWithCtes(q: Query, dialect: DialectSpec, format: Rend
 
 /**
  * Pure renderer entry point: lowering errors are data, not exceptions.
- * Capability errors are accumulated on the render context; the only catch
- * is for unexpected programmer errors, which are still reported as data.
+ * Dialect capability failures are preflighted before this lowering pass;
+ * defensive checks remain in the renderer for malformed hand-built IR.
  */
 export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
     const diagnostics: RenderDiagnostic[] = [];
     const parameters: ParameterState = new Map();
     try {
-        const sql = renderQueryWithDiagnostics(q, dialect, format, diagnostics, new Map(), parameters);
+        const normalized = optimizeQuery(q);
+        const capabilityDiagnostics = checkDialectCapabilities(normalized, dialect);
+        if (capabilityDiagnostics.length > 0) return { ok: false, diagnostics: capabilityDiagnostics };
+        const sql = renderQueryWithDiagnostics(normalized, dialect, format, diagnostics, new Map(), parameters);
         return diagnostics.length > 0 ? { ok: false, diagnostics } : { ok: true, sql, parameters: [...parameters.keys()] };
     } catch (err) {
         return {

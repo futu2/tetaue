@@ -27,6 +27,7 @@ import { projectTreeFor } from '../compile.js';
 import { isAccessExpression, isApplication, isIdentifier } from '../generated/ast.js';
 import type { Model } from '../generated/ast.js';
 import type { ProjectModule } from '../imports.js';
+import { standardPrelude } from '../prelude.js';
 
 /** Synthetic property inserted after the dot so the access parses. */
 const DUMMY = '_tetaue_field';
@@ -156,7 +157,11 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
             return CompletionList.create(items, false);
         }
 
-        const inferred = checkProject(modules, { requireQuery: false, importsByModule });
+        const inferred = checkProject(modules, {
+            requireQuery: false,
+            importsByModule,
+            prelude: standardPrelude(this.services),
+        });
         let typed: AstNode | undefined = receiver;
         while (typed && !inferred.nodeTypes.has(typed)) typed = typed.$container;
         if (!typed) return undefined;

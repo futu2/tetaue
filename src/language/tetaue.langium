@@ -49,13 +49,13 @@ Import:
 // One selective import item. `a as b` imports export `a` under the local
 // name `b` (for flat imports) or as `t.b` (for namespaced imports).
 ImportName:
-    name=(ID | ARG_ID) ('as' renamed=(ID | ARG_ID))?;
+    name=(ID | ARG_ID | OP_SECTION) ('as' renamed=(ID | ARG_ID | OP_SECTION))?;
 
 // `export` marks a binding as part of the module's public surface: only
 // exported bindings are visible to importers (flat or qualified). Within a
 // module, exported and private bindings see each other equally.
 Binding:
-    (export?='export')? name=(ID | ARG_ID) (':' type=Type)? '=' value=Expression;
+    (export?='export')? name=(ID | ARG_ID | OP_SECTION) (':' type=Type)? '=' value=Expression;
 
 Expression:
     Ascription | LetExpression | BinaryExpression;
@@ -65,7 +65,7 @@ Expression:
 // LambdaLetExpression keeps `&`/`$` out of the lambda body unless
 // parenthesized.
 LetExpression:
-    {infer LetExpression} 'let' name=(ID | ARG_ID) (':' type=Type)? '=' value=Expression 'in' body=Expression;
+    {infer LetExpression} 'let' name=(ID | ARG_ID | OP_SECTION) (':' type=Type)? '=' value=Expression 'in' body=Expression;
 
 // `e : T` — a type annotation on any expression, lowest precedence
 // (`a & f : T` is `(a & f) : T`). Annotations are erased at evaluation time.
@@ -142,7 +142,7 @@ LambdaBody:
     Ascription | LambdaLetExpression | LambdaBinaryExpression;
 
 LambdaLetExpression:
-    {infer LambdaLetExpression} 'let' name=(ID | ARG_ID) (':' type=Type)? '=' value=LambdaBody 'in' body=LambdaBody;
+    {infer LambdaLetExpression} 'let' name=(ID | ARG_ID | OP_SECTION) (':' type=Type)? '=' value=LambdaBody 'in' body=LambdaBody;
 
 infix LambdaBinaryExpression on UnaryExpression:
     right assoc '>>>' | '<<<'
@@ -157,7 +157,7 @@ UnaryExpression:
     | AccessExpression;
 
 AccessExpression infers Expr:
-    Application ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | STRING))*;
+    Application ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | OP_SECTION | STRING))*;
 
 // Juxtaposition application: `filter (u => u.age >= 18)` is filter applied
 // to a lambda; `table "users"` is table applied to the table name.
@@ -176,8 +176,9 @@ Application infers Expr:
 // form (use `$1`/`$2` for implicit parameters instead).
 Argument infers Expr:
     {infer Lambda} '(' param=LambdaParam ')' '=>' body=LambdaBody
-    | Atom ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | STRING))+
+    | Atom ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | OP_SECTION | STRING))+
     | {infer Identifier} name=ARG_ID
+    | {infer OperatorSection} value=OP_SECTION
     | {infer NumberLiteral} value=NUMBER
     | {infer StringLiteral} value=STRING
     | {infer BooleanLiteral} value=('true' | 'false')
@@ -200,6 +201,7 @@ Atom infers Expr:
     | {infer CaseExpression} 'case' (subject=Expression)? '{' (branches+=CaseBranch (',' branches+=CaseBranch)* ','?)? '}'
     | Identifier
     | {infer DollarParam} value=LAMBDA_PARAM
+    | {infer OperatorSection} value=OP_SECTION
     | '(' Expression ')';
 
 Identifier infers Expr:
@@ -230,6 +232,12 @@ MapEntry:
 
 hidden terminal WS: /\s+/;
 hidden terminal COMMENT: /#[^\r\n]*/;
+
+// Agda-style binary operator names. `_+_`, `_>>>_`, and `_op_` are ordinary
+// lexical bindings and first-class curried functions, so `_+_ 1 2` is exactly
+// `1 + 2`. This must precede ID: named sections such as `_div_` are otherwise
+// valid identifiers.
+terminal OP_SECTION: /_(>>>|<<<|==|!=|<=|>=|&&|\|\||\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/;
 
 // A bare identifier usable as an application argument: any identifier NOT
 // followed by `=`. The lookahead keeps bindings comma-free — `filter adult`

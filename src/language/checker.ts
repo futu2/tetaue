@@ -50,6 +50,13 @@ export interface CheckProjectOptions {
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
     /** Render this root-module binding instead of the last one. */
     entryBinding?: string;
+    /**
+     * Optional standard-library module. Its exported bindings are evaluated
+     * once from the core and injected into every user module. Keeping this
+     * explicit makes the core/prelude boundary testable and avoids a hidden
+     * second evaluator.
+     */
+    prelude?: ProjectModule;
 }
 
 /**
@@ -60,7 +67,7 @@ export function checkProject(
     modules: readonly ProjectModule[],
     options: CheckProjectOptions = {},
 ): CheckProjectResult {
-    const { requireQuery = true, importsByModule = new Map(), entryBinding } = options;
+    const { requireQuery = true, importsByModule = new Map(), entryBinding, prelude } = options;
 
     const inferencer = new Inferencer();
     inferencer.prelude();
@@ -74,10 +81,15 @@ export function checkProject(
 
     const interpreterDiagnostics: Diagnostic[] = [];
     const root = modules[modules.length - 1];
+    // The prelude is a real module, but it is not part of the user's import
+    // graph. Process it first and inject only its exports into user scopes.
+    const allModules = prelude ? [prelude, ...modules] : [...modules];
+    let standardValues = new Map<string, Value>();
+    let standardSchemes = new Map<string, Scheme>();
     let rootEnv: Map<string, Value> | undefined;
     let value: Value = ERROR;
 
-    for (const module of modules) {
+    for (const module of allModules) {
         const moduleImports: readonly ResolvedImportEdge[] =
             importsByModule.get(module) ?? module.imports ?? [];
 
@@ -110,6 +122,17 @@ export function checkProject(
             });
         }
 
+        // Standard-library names have lower precedence than imports and local
+        // bindings, matching ordinary lexical shadowing.
+        if (module !== prelude) {
+            for (const [name, scheme] of standardSchemes) {
+                if (!inferencer.env.has(name)) inferencer.env.set(name, scheme);
+            }
+            for (const [name, v] of standardValues) {
+                if (!env.has(name)) env.set(name, v);
+            }
+        }
+
         const exports = new Map<string, Value>();
         const exportedSchemes = new Map<string, Scheme>();
         let seen = new Set<string>();
@@ -133,6 +156,10 @@ export function checkProject(
         ));
 
         if (module === root) rootEnv = env;
+        if (module === prelude) {
+            standardValues = exports;
+            standardSchemes = exportedSchemes;
+        }
         interpreterDiagnostics.push(...moduleDiagnostics);
     }
 
@@ -166,7 +193,7 @@ export function checkProject(
         }
     }
 
-    const diagnostics = mergeDiagnostics(modules, interpreterDiagnostics);
+    const diagnostics = mergeDiagnostics(allModules, interpreterDiagnostics);
     return {
         value,
         diagnostics,

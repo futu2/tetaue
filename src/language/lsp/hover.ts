@@ -19,6 +19,7 @@ import { isAccessExpression, isBinding, isIdentifier } from '../generated/ast.js
 import type { Binding, Model } from '../generated/ast.js';
 import { moduleQualifiedBinding } from './module-access.js';
 import { labelName } from '../strings.js';
+import { standardPrelude } from '../prelude.js';
 
 export class TetaueHoverProvider implements HoverProvider {
     constructor(private readonly services: TetaueServices) {}
@@ -32,7 +33,11 @@ export class TetaueHoverProvider implements HoverProvider {
         if (!node) return undefined;
 
         const { modules, importsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
-        const result = checkProject(modules, { requireQuery: false, importsByModule });
+        const result = checkProject(modules, {
+            requireQuery: false,
+            importsByModule,
+            prelude: standardPrelude(this.services),
+        });
 
         // Walk up to the nearest node with a recorded type (leaf terminals
         // belong to their owning AST node, which is already recorded).

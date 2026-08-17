@@ -17,6 +17,7 @@ import { createImportResolver } from './resolve.js';
 import type { TetaueServices } from './tetaue-module.js';
 import { collectModuleTree, moduleOf } from './imports.js';
 import type { ProjectModule } from './imports.js';
+import { standardPrelude } from './prelude.js';
 
 export function registerValidationChecks(services: TetaueServices): void {
     const registry = services.validation.ValidationRegistry;
@@ -55,7 +56,11 @@ export function checkModel(model: Model, accept: ValidationAcceptor, services: T
     // helper modules legitimately end in non-query bindings); the CLI enforces
     // it for the root. The checker runs IR construction and type inference as
     // one pass and returns the exact-deduped diagnostics.
-    const { diagnostics: checked } = checkProject(modules, { requireQuery: false, importsByModule });
+    const { diagnostics: checked } = checkProject(modules, {
+        requireQuery: false,
+        importsByModule,
+        prelude: standardPrelude(services),
+    });
     // Tree diagnostics (unresolved imports, cycles, parse errors) are not
     // produced by the checker, so fold them into the same exact-deduped list.
     const merged = mergeDiagnostics(modules, diagnostics, checked);

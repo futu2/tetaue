@@ -9,6 +9,7 @@ import * as langium from 'langium';
 export const TetaueTerminals = {
     WS: /\s+/,
     COMMENT: /#[^\r\n]*/,
+    OP_SECTION: /_(>>>|<<<|==|!=|<=|>=|&&|\|\||\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/,
     ARG_ID: /(?=([_a-zA-Z][\w_]*))\1(?![ \t\r\n]*[:=])/,
     ID: /[_a-zA-Z][\w_]*/,
     NUMBER: /[0-9]+(\.[0-9]*)?/,
@@ -223,7 +224,7 @@ export function isDollarParam(item: unknown): item is DollarParam {
     return reflection.isInstance(item, DollarParam.$type);
 }
 
-export type Expr = AccessExpression | Application | BooleanLiteral | CaseExpression | DollarParam | Expression | Identifier | Lambda | ListLiteral | MapLiteral | NullLiteral | NumberLiteral | StringLiteral;
+export type Expr = AccessExpression | Application | BooleanLiteral | CaseExpression | DollarParam | Expression | Identifier | Lambda | ListLiteral | MapLiteral | NullLiteral | NumberLiteral | OperatorSection | StringLiteral;
 
 export const Expr = {
     $type: 'Expr'
@@ -526,6 +527,21 @@ export function isNumberLiteral(item: unknown): item is NumberLiteral {
     return reflection.isInstance(item, NumberLiteral.$type);
 }
 
+export interface OperatorSection extends langium.AstNode {
+    readonly $container: AccessExpression | Application | BinaryExpression | LambdaBinaryExpression | UnaryMinus;
+    readonly $type: 'OperatorSection';
+    value: string;
+}
+
+export const OperatorSection = {
+    $type: 'OperatorSection',
+    value: 'value'
+} as const;
+
+export function isOperatorSection(item: unknown): item is OperatorSection {
+    return reflection.isInstance(item, OperatorSection.$type);
+}
+
 export interface QualifiedTypeName extends langium.AstNode {
     readonly $container: Ascription | Binding | FunType | LambdaLetExpression | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
     readonly $type: 'QualifiedTypeName';
@@ -754,6 +770,7 @@ export type TetaueAstType = {
     Model: Model
     NullLiteral: NullLiteral
     NumberLiteral: NumberLiteral
+    OperatorSection: OperatorSection
     QualifiedTypeName: QualifiedTypeName
     QueryType: QueryType
     RecordField: RecordField
@@ -1133,6 +1150,15 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
             properties: {
                 value: {
                     name: NumberLiteral.value
+                }
+            },
+            superTypes: [Expr.$type]
+        },
+        OperatorSection: {
+            name: OperatorSection.$type,
+            properties: {
+                value: {
+                    name: OperatorSection.value
                 }
             },
             superTypes: [Expr.$type]

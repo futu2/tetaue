@@ -23,7 +23,7 @@ describe('builtin completion', () => {
         for (const name of ['filter', 'map', 'sort', 'take', 'fold', 'distinct',
             'upper', 'lower', 'count', 'sum', 'coalesce', 'abs',
             'current_date', 'date_add', 'ceil', 'floor', 'concat', 'greatest',
-            'substring', 'cast', 'like', 'is_null']) {
+            'substring', 'cast', 'like', 'is_null', 'is_true', 'is_false', 'is_unknown']) {
             expect(labels).toContain(name);
         }
     });

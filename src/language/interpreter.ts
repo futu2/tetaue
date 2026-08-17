@@ -14,7 +14,7 @@ import {
     isCaseExpression, isIdentifier, isLambda, isLambdaBinaryExpression, isLambdaLetExpression,
     isDollarParam, isLetExpression, isListLiteral,
     isListType, isMapLiteral,
-    isNullLiteral, isNumberLiteral, isQualifiedTypeName, isQueryType, isStringLiteral,
+    isNullLiteral, isNumberLiteral, isOperatorSection, isQualifiedTypeName, isQueryType, isStringLiteral,
     isTypeAtom, isTypeHole, isTypeParen, isTypeVar, isUnaryMinus,
     type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
 } from './generated/ast.js';
@@ -23,6 +23,10 @@ import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
 import { labelName, parseStringLiteral } from './strings.js';
 export { parseStringLiteral };
 import { CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
+import {
+    BINARY_OPERATORS, isBinaryOperator, isOperatorIntrinsicName, operatorIntrinsicName,
+    sectionName, sectionSpelling, type BinaryOperator,
+} from './operators.js';
 
 // ---------------------------------------------------------------------------
 // SQL model
@@ -272,6 +276,19 @@ function numberValue(v: Value): number | null {
     const node = exprNode(v);
     if (node?.kind === 'lit' && typeof node.value === 'number') return node.value;
     return null;
+}
+
+/** SQL three-valued logic predicates; all return a non-null boolean. */
+function truthPredicateBuiltin(name: 'is_true' | 'is_false' | 'is_unknown'): () => Value {
+    return () => fn(name, (arg, at, ctx) => {
+        const node = exprNode(arg);
+        if (!node || (node.type !== 'bool' && node.type !== 'null' && node.type !== 'unknown')) {
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects a boolean or nullable boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
+            return ERROR;
+        }
+        if (forbid(node, ['agg', 'group', 'order'], name, at ?? arg.ast, ctx)) return ERROR;
+        return mkExpr({ kind: 'call', name, args: [node], type: 'bool' }, at);
+    });
 }
 
 
@@ -695,6 +712,49 @@ function composeValues(l: Value, r: Value, op: '>>>' | '<<<', at: AstNode, ctx: 
     return ERROR;
 }
 
+/** Turn an Agda-style `_op_` reference into an ordinary curried function. */
+function operatorSectionValue(raw: string, at: AstNode, ctx: Ctx): Value {
+    const scoped = ctx.env.get(raw);
+    if (scoped) return scoped;
+
+    const op = sectionName(raw);
+    if (!isBinaryOperator(op)) {
+        const named = ctx.env.get(op);
+        if (named) return named;
+        ctx.diagnostics.push({ node: at, message: `unknown operator section '${raw}' — '${op}' is not defined` });
+        return ERROR;
+    }
+    // `analyze` does not load the source prelude. Keep the primitive fallback
+    // for that compatibility API; production checking resolves the exported
+    // `_op_` binding above.
+    return operatorIntrinsicValue(op);
+}
+
+/** The hidden SQL-aware primitive exported under an ordinary prelude binding. */
+function operatorIntrinsicValue(op: BinaryOperator): Value {
+    return fn(operatorIntrinsicName(op), (left, at1, ctx1) =>
+        fn(operatorIntrinsicName(op), (right, at2, ctx2) =>
+            applyBinaryOperator(op, left, right, at2 ?? at1 ?? fallbackNode(ctx1), ctx2)));
+}
+
+/** Apply the scoped `_op_` binding used by infix syntax. */
+function applyScopedBinaryOperator(op: BinaryOperator, left: Value, right: Value, at: AstNode, ctx: Ctx): Value {
+    // The fallback preserves the low-level `analyze` API, whose contract does
+    // not include parsing the standard prelude. `checkProject` always finds the
+    // source-defined binding unless application code has shadowed it.
+    const operator = ctx.env.get(sectionSpelling(op)) ?? operatorIntrinsicValue(op);
+    const partial = applyWith(operator, left, at, ctx);
+    return isError(partial) ? ERROR : applyWith(partial, right, at, ctx);
+}
+
+/** SQL-aware semantics supplied only by hidden operator intrinsics. */
+function applyBinaryOperator(op: BinaryOperator, left: Value, right: Value, at: AstNode, ctx: Ctx): Value {
+    if (op === '&') return applyWith(right, left, at, ctx);
+    if (op === '$') return applyWith(left, right, at, ctx);
+    if (op === '>>>' || op === '<<<') return composeValues(left, right, op, at, ctx);
+    return evalBinary(op, left, right, at, ctx);
+}
+
 /** Turn a row transformer (lambda or function) into a `map` query step. */
 function mapStepFromTransformer(q: Query, f: Value, at: AstNode | undefined, ctx: Ctx): Query | null {
     // After a fold the pipeline is aggregated; projecting the result again
@@ -914,30 +974,17 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
     if (isBinaryExpression(e) || isLambdaBinaryExpression(e)) {
         // (LambdaBinaryExpression is the `&`/`$`-free chain used for lambda
         // bodies — structurally identical to BinaryExpression.)
-        if (e.operator === '&') {
-            // pipeline: `left & right` ⇔ apply right to left
-            const left = evalUnary(e.left, ctx);
-            const right = evalUnary(e.right, ctx);
-            return applyWith(right, left, e, ctx);
+        const left = evalUnary(e.left, ctx);
+        // `$` keeps implicit-lambda argument behavior; all other operators use
+        // the ordinary unary operand evaluation already encoded by the AST.
+        const right = e.operator === '$'
+            ? evalArg(e.right as Expr, ctx)
+            : evalUnary(e.right, ctx);
+        if (!isBinaryOperator(e.operator)) {
+            ctx.diagnostics.push({ node: e, message: `unknown operator '${e.operator}'` });
+            return ERROR;
         }
-        if (e.operator === '$') {
-            // application: `left $ right` ⇔ apply left to right (right-assoc)
-            const left = evalUnary(e.left, ctx);
-            const right = evalArg(e.right as Expr, ctx);
-            return applyWith(left, right, e, ctx);
-        }
-        if (e.operator === '>>>' || e.operator === '<<<') {
-            // PureScript function composition: `f <<< g` = `x => f (g x)`,
-            // `f >>> g` = `x => g (f x)`.
-            const l = evalUnary(e.left, ctx);
-            if (isError(l)) return ERROR;
-            const r = evalUnary(e.right, ctx);
-            if (isError(r)) return ERROR;
-            return composeValues(l, r, e.operator, e, ctx);
-        }
-        const l = evalUnary(e.left, ctx);
-        const r = evalUnary(e.right, ctx);
-        return evalBinary(e.operator, l, r, e, ctx);
+        return applyScopedBinaryOperator(e.operator, left, right, e, ctx);
     }
     if (isAccessExpression(e)) {
         const recv = evalExprWith(e.receiver, ctx);
@@ -1031,6 +1078,9 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
         // Snapshot the current scope: lambdas see only bindings defined so far.
         return { kind: 'lambda', params: [lambdaParam(e)], body: e.body as unknown as Expr, closure: new Map(ctx.env), ast: e };
     }
+    if (isOperatorSection(e)) {
+        return operatorSectionValue(e.value, e, ctx);
+    }
     if (isIdentifier(e)) {
         const v = ctx.env.get(e.name);
         if (v) return v;
@@ -1038,7 +1088,7 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
             ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}' — bindings must be defined before use` });
             return ERROR;
         }
-        const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k));
+        const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
         ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
         return ERROR;
     }
@@ -2216,6 +2266,9 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         if (forbid(node, ['agg', 'group', 'order'], 'is_not_null', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'is-null', expr: node, negated: true, type: 'bool' }, at);
     }),
+    is_true: truthPredicateBuiltin('is_true'),
+    is_false: truthPredicateBuiltin('is_false'),
+    is_unknown: truthPredicateBuiltin('is_unknown'),
 
     // --- type conversion --------------------------------------------------
     cast: castBuiltin('cast'),
@@ -3152,11 +3205,14 @@ export interface ProjectAnalysisOptions {
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
 }
 
-/** The prelude environment shared by `analyzeProject` and `checkProject`. */
+/** The primitive environment shared by `analyzeProject` and `checkProject`. */
 export function createPreludeEnv(): Map<string, Value> {
     const env = new Map<string, Value>();
     for (const [name, factory] of Object.entries(BUILTINS)) {
         env.set(name, factory());
+    }
+    for (const operator of BINARY_OPERATORS) {
+        env.set(operatorIntrinsicName(operator), operatorIntrinsicValue(operator));
     }
     return env;
 }

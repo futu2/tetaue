@@ -1,0 +1,26 @@
+# The standard library is intentionally ordinary tetaue code. Keep SQL
+# implementation primitives in the TypeScript core and put reusable
+# functional definitions here.
+export _>>>_ = __op_compose_forward
+export _<<<_ = __op_compose_backward
+export _*_ = __op_multiply
+export _/_ = __op_divide
+export _+_ = __op_add
+export _-_ = __op_subtract
+export _<>_ = __op_merge
+export _==_ = __op_equal
+export _!=_ = __op_not_equal
+export _<_ = __op_less_than
+export _<=_ = __op_less_than_or_equal
+export _>_ = __op_greater_than
+export _>=_ = __op_greater_than_or_equal
+export _&&_ = __op_and
+export _||_ = __op_or
+export _&_ = __op_pipeline
+export _$_ = __op_apply
+
+export id = x => x
+export const = x => y => x
+export compose = f => g => x => f (g x)
+export flip = f => x => y => f y x
+export pipe = f => g => x => g (f x)

@@ -27,6 +27,7 @@ import type { ResolvedImportEdge } from './imports.js';
 import type { ProjectModule } from './imports.js';
 import { createImportResolver } from './resolve.js';
 import type { Model } from './generated/ast.js';
+import { standardPrelude } from './prelude.js';
 
 export interface CompileDiagnostic {
     /** URI of the module the diagnostic belongs to. */
@@ -208,7 +209,12 @@ export function compileModuleText(
     }
 
     const { modules, importsByModule, diagnostics: treeDiagnostics, warnings: treeWarnings } = projectTreeFor(main, services);
-    const { value, diagnostics: merged } = checkProject(modules, { requireQuery, importsByModule, entryBinding: binding });
+    const { value, diagnostics: merged } = checkProject(modules, {
+        requireQuery,
+        importsByModule,
+        entryBinding: binding,
+        prelude: standardPrelude(services),
+    });
 
     const all: CompileDiagnostic[] = [];
     for (const d of [...treeDiagnostics, ...merged]) {

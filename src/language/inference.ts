@@ -19,7 +19,7 @@ import {
     isAccessExpression, isAscription, isApplication, isBinaryExpression,
     isBooleanLiteral, isCaseExpression, isDollarParam, isFunType, isIdentifier, isLambda,
     isLambdaBinaryExpression, isLambdaLetExpression, isLetExpression, isListLiteral, isListType,
-    isMapLiteral, isNullLiteral,
+    isMapLiteral, isNullLiteral, isOperatorSection,
     isNumberLiteral, isQualifiedTypeName, isQueryType, isRecordType, isStringLiteral, isTypeAtom, isTypeHole, isTypeParen,
     isTypeVar, isUnaryMinus,
     type Binding, type CaseExpression, type Expr, type Lambda, type MapEntry, type Model,
@@ -27,7 +27,7 @@ import {
 import type { Type as LangiumType } from './generated/ast.js';
 import {
     TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
-    builtinOf, fun, listOf, maybeOf, prim, queryOf, rowOf,
+    builtinOf, fun, listOf, maybeOf, prim, queryOf, rowOf, truthType,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
@@ -38,6 +38,10 @@ import type { Diagnostic, Value } from './interpreter.js';
 import { labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
 import { CAST_TYPES, LIST_ARITY } from './builtin.js';
+import {
+    BINARY_OPERATORS, isBinaryOperator, operatorIntrinsicName, sectionName, sectionSpelling,
+    type BinaryOperator,
+} from './operators.js';
 
 export interface InferDiagnostic {
     node: AstNode | undefined;
@@ -188,9 +192,9 @@ export class Inferencer {
     // -----------------------------------------------------------------------
 
     /**
-     * Build the prelude environment from the builtin catalog — the single
-     * source of truth for every scheme (see catalog.ts). The join kinds are
-     * a dedicated `jkind` type, aggregates return `agg t`, `group` returns
+     * Build the primitive environment from the builtin catalog plus the hidden
+     * operator intrinsics consumed by `prelude.tetaue`. The join kinds are a
+     * dedicated `jkind` type, aggregates return `agg t`, `group` returns
      * `group t`, and the list-argument builtins take one list argument, so
      * `join "inner"`, plain fold entries and non-order sort lambdas are all
      * STATIC type errors, not runtime checks.
@@ -206,8 +210,47 @@ export class Inferencer {
                 this.env.set(name, { ...scheme, type: builtinOf(name, this.u.peel(scheme.type)) });
             }
         }
-        // The prelude is cloned into every module's env (see inferProject).
+        for (const operator of BINARY_OPERATORS) {
+            const type = this.operatorIntrinsicType(operator);
+            const scheme = this.u.generalize([], type);
+            this.env.set(operatorIntrinsicName(operator), {
+                ...scheme,
+                type: builtinOf(`operator:${operator}`, type),
+            });
+        }
+        // The primitive environment is cloned into every module (see beginModule).
         this.preludeEnv = new Map(this.env);
+    }
+
+    /** Static shape of a hidden SQL-aware operator primitive. */
+    private operatorIntrinsicType(op: BinaryOperator): Type {
+        const a = this.u.fresh();
+        const b = this.u.fresh();
+        const c = this.u.fresh();
+        switch (op) {
+            case '>>>': return fun(fun(a, b), fun(fun(b, c), fun(a, c)));
+            case '<<<': return fun(fun(b, c), fun(fun(a, b), fun(a, c)));
+            case '&': return fun(a, fun(fun(a, b), b));
+            case '$': return fun(fun(a, b), fun(a, b));
+            case '&&': case '||':
+                return fun(prim('bool'), fun(prim('bool'), prim('bool')));
+            case '==': case '!=': case '<': case '<=': case '>': case '>=':
+                return fun(a, fun(a, prim('bool')));
+            case '/': return fun(prim('float'), fun(prim('float'), prim('float')));
+            case '<>': return fun(a, fun(b, c));
+            case '+': case '-': case '*': return fun(a, fun(a, a));
+        }
+    }
+
+    /** Compatibility value for low-level inference, which does not load prelude.tetaue. */
+    private fallbackOperatorType(op: BinaryOperator): Type {
+        return builtinOf(`operator:${op}`, this.operatorIntrinsicType(op));
+    }
+
+    private taggedOperator(type: Type): BinaryOperator | null {
+        if (type.kind !== 'builtin' || !type.name.startsWith('operator:')) return null;
+        const operator = type.name.slice('operator:'.length);
+        return isBinaryOperator(operator) ? operator : null;
     }
 
     // -----------------------------------------------------------------------
@@ -519,6 +562,7 @@ export class Inferencer {
             return this.inferMerge(base, updated, e);
         }
         if (isLambda(e)) return this.inferLambda(e, env);
+        if (isOperatorSection(e)) return this.inferOperatorSection(e, env);
         if (isIdentifier(e)) {
             const scheme = env.get(e.name);
             return scheme ? this.u.instantiate(scheme) : this.u.fresh(); // unknown ids are the interpreter's call
@@ -619,13 +663,35 @@ export class Inferencer {
     }
 
     private inferBinary(e: import('./generated/ast.js').BinaryExpression, env: Map<string, Scheme>): Type {
-        const op = e.operator;
+        const op = e.operator as BinaryOperator;
+        const lt = this.inferExpr(e.left, env);
+        const rt = this.inferExpr(e.right, env);
+        const scheme = env.get(sectionSpelling(op));
+        const operator = scheme ? this.u.instantiate(scheme) : this.fallbackOperatorType(op);
+        const intrinsic = this.taggedOperator(operator);
+        if (intrinsic) {
+            return this.inferBinaryTypes(intrinsic, lt, rt, e, e.left, e.right, env);
+        }
+        const partial = this.applyInferredFunction(operator, lt, e.left, null);
+        return this.applyInferredFunction(partial, rt, e.right, null);
+    }
+
+    /** Static semantics shared by infix expressions and `_op_ a b`. */
+    private inferBinaryTypes(
+        op: BinaryOperator,
+        lt: Type,
+        rt: Type,
+        node: AstNode,
+        leftNode: AstNode,
+        rightNode: AstNode,
+        env: Map<string, Scheme>,
+    ): Type {
         if (op === '&') {
             // a & f ⇔ f a — ordinary function application with the operands
             // reversed. Type mismatches are reported here as well as by the
             // interpreter; the two passes are deduped when the messages match.
-            const a = this.inferExpr(e.left, env);
-            const f = this.inferExpr(e.right, env);
+            const a = lt;
+            const f = rt;
             const a1 = this.u.fresh();
             const b1 = this.u.fresh();
             try {
@@ -634,8 +700,8 @@ export class Inferencer {
                 return b1;
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    if (!this.reportNumericMix(e, err)) {
-                        this.reportApplyMismatch(e, f, a, e.right, env);
+                    if (!this.reportNumericMix(node, err)) {
+                        this.reportApplyMismatch(node, f, a, rightNode, env);
                     }
                 } else {
                     throw err;
@@ -644,8 +710,8 @@ export class Inferencer {
             }
         }
         if (op === '$') {
-            const f = this.inferExpr(e.left, env);
-            const a = this.inferExpr(e.right, env);
+            const f = lt;
+            const a = rt;
             const a1 = this.u.fresh();
             const b1 = this.u.fresh();
             try {
@@ -654,8 +720,8 @@ export class Inferencer {
                 return b1;
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    if (!this.reportNumericMix(e, err)) {
-                        this.reportApplyMismatch(e, f, a, e.right, env);
+                    if (!this.reportNumericMix(node, err)) {
+                        this.reportApplyMismatch(node, f, a, rightNode, env);
                     }
                 } else {
                     throw err;
@@ -664,8 +730,8 @@ export class Inferencer {
             }
         }
         if (op === '>>>' || op === '<<<') {
-            const l = this.inferExpr(e.left, env);
-            const r = this.inferExpr(e.right, env);
+            const l = lt;
+            const r = rt;
             const a = this.u.fresh();
             const b = this.u.fresh();
             const c = this.u.fresh();
@@ -680,8 +746,8 @@ export class Inferencer {
                 return fun(a, c);
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    if (!this.reportNumericMix(e, err)) {
-                        this.diag(e, `cannot compose ${this.u.pretty(l)} with ${this.u.pretty(r)} — both must be functions`);
+                    if (!this.reportNumericMix(node, err)) {
+                        this.diag(node, `cannot compose ${this.u.pretty(l)} with ${this.u.pretty(r)} — both must be functions`);
                     }
                 } else {
                     throw err;
@@ -689,11 +755,9 @@ export class Inferencer {
                 return this.u.fresh();
             }
         }
-        const lt = this.inferExpr(e.left, env);
-        const rt = this.inferExpr(e.right, env);
         if (op === '==' || op === '!=' || op === '<' || op === '<=' || op === '>' || op === '>=') {
-            const leftNull = this.isNullLiteralNode(e.left);
-            const rightNull = this.isNullLiteralNode(e.right);
+            const leftNull = this.isNullLiteralNode(leftNode);
+            const rightNull = this.isNullLiteralNode(rightNode);
             try {
                 if (leftNull || rightNull) {
                     // null : forall a. maybe a — comparing a nullable value with
@@ -704,13 +768,13 @@ export class Inferencer {
                     const rl = this.u.peel(lt);
                     const rr = this.u.peel(rt);
                     if (rl.kind === 'maybe' || rr.kind === 'maybe') {
-                        this.diag(e, `comparison expects non-null values — use is_null/is_not_null or from_maybe, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                        this.diag(node, `comparison expects non-null values — use is_null/is_not_null or from_maybe, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                         return prim('bool');
                     }
                 }
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    this.diag(e, `cannot compare ${this.u.pretty(lt)} with ${this.u.pretty(rt)}`);
+                    this.diag(node, `cannot compare ${this.u.pretty(lt)} with ${this.u.pretty(rt)}`);
                 } else {
                     throw err;
                 }
@@ -723,7 +787,7 @@ export class Inferencer {
                 this.u.unify(rt, prim('bool'));
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    this.diag(e, `'${op}' requires boolean operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                    this.diag(node, `'${op}' requires boolean operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                 } else {
                     throw err;
                 }
@@ -733,7 +797,7 @@ export class Inferencer {
         // `<>` — the record-merge monoid (right record wins on overlap);
         // same typing as the `merge` builtin.
         if (op === '<>') {
-            return this.inferMerge(lt, rt, e);
+            return this.inferMerge(lt, rt, node);
         }
         // Haskell-base numerics: + - * require the same numeric type; / is
         // fractional division and requires float; use div/mod for integrals.
@@ -743,7 +807,7 @@ export class Inferencer {
                 this.u.unify(rt, prim('float'));
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    this.diag(e, `'/' requires float operands — use div for integral division, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                    this.diag(node, `'/' requires float operands — use div for integral division, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                 } else {
                     throw err;
                 }
@@ -757,9 +821,9 @@ export class Inferencer {
             const rl = this.u.peel(lt);
             const rr = this.u.peel(rt);
             if (rl.kind === 'prim' && rr.kind === 'prim' && isNumericPrim(rl) && isNumericPrim(rr) && rl.name !== rr.name) {
-                this.diag(e, `'${op}' requires numeric operands of the same type, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                this.diag(node, `'${op}' requires numeric operands of the same type, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
             } else if (rl.kind === 'prim' && rr.kind === 'prim' && !isNumericPrim(rl) && !isNumericPrim(rr)) {
-                this.diag(e, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                this.diag(node, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
             }
             return unified;
         } catch (err) {
@@ -767,9 +831,9 @@ export class Inferencer {
                 const rl = this.u.peel(lt);
                 const rr = this.u.peel(rt);
                 if (rl.kind === 'prim' && rr.kind === 'prim' && isNumericPrim(rl) && isNumericPrim(rr)) {
-                    this.diag(e, `'${op}' requires numeric operands of the same type, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                    this.diag(node, `'${op}' requires numeric operands of the same type, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                 } else {
-                    this.diag(e, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                    this.diag(node, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                 }
             } else {
                 throw err;
@@ -782,6 +846,74 @@ export class Inferencer {
     // Application
     // -----------------------------------------------------------------------
 
+    /** Type of an Agda-style `_op_` first-class operator reference. */
+    private inferOperatorSection(
+        e: import('./generated/ast.js').OperatorSection,
+        env: Map<string, Scheme>,
+    ): Type {
+        const scoped = env.get(e.value);
+        if (scoped) return this.u.instantiate(scoped);
+
+        const op = sectionName(e.value);
+        if (!isBinaryOperator(op)) {
+            const scheme = env.get(op);
+            if (scheme) return this.u.instantiate(scheme);
+            this.diag(e, `unknown operator section '${e.value}' — '${op}' is not defined`);
+            return this.u.fresh();
+        }
+        return this.fallbackOperatorType(op);
+    }
+
+    private inferOperatorApplication(
+        op: BinaryOperator,
+        e: import('./generated/ast.js').Application,
+        env: Map<string, Scheme>,
+        rawFunction: Type,
+    ): Type {
+        if (e.arguments.length < 2) {
+            // Partial application remains ordinary currying. Exact binary
+            // checks run once the section receives both arguments directly.
+            return this.inferGenericApplication(rawFunction, e, env);
+        }
+        const leftNode = e.arguments[0]!;
+        const rightNode = e.arguments[1]!;
+        const left = this.inferArg(leftNode, env);
+        const right = this.inferArg(rightNode, env);
+        let result = this.inferBinaryTypes(op, left, right, e, leftNode, rightNode, env);
+        for (const argument of e.arguments.slice(2)) {
+            result = this.applyInferredFunction(result, this.inferArg(argument, env), argument, null);
+        }
+        return result;
+    }
+
+    private inferGenericApplication(
+        rawFunction: Type,
+        e: import('./generated/ast.js').Application,
+        env: Map<string, Scheme>,
+    ): Type {
+        let current = this.u.peel(rawFunction);
+        for (const argument of e.arguments) {
+            current = this.applyInferredFunction(current, this.inferArg(argument, env), argument, null);
+        }
+        return current;
+    }
+
+    private applyInferredFunction(f: Type, arg: Type, node: AstNode, name: string | null): Type {
+        const param = this.u.fresh();
+        const result = this.u.fresh();
+        try {
+            this.u.unify(f, fun(param, result));
+            this.u.unify(param, arg);
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.argError(name, 0, node, arg, param, f);
+                return this.u.fresh();
+            }
+            throw err;
+        }
+        return result;
+    }
+
     private inferApplication(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
         // A builtin keeps its identity in its TYPE, so `f = fold`, `by = sort`
         // and `pick = greatest` behave exactly like a direct prelude use.
@@ -793,6 +925,12 @@ export class Inferencer {
         // application of zero arguments: keep the builtin tag so its special
         // typing rules survive first-class bindings.
         if (e.arguments.length === 0) return rawF;
+        const operatorName = boundName?.startsWith('operator:')
+            ? boundName.slice('operator:'.length)
+            : null;
+        if (operatorName && isBinaryOperator(operatorName)) {
+            return this.inferOperatorApplication(operatorName, e, env, rawF);
+        }
         // `param "name"` — all occurrences of the same parameter name share
         // one named type hole, so conflicting uses cannot both type-check and
         // then collapse onto one SQL bind placeholder at render time.
@@ -832,6 +970,9 @@ export class Inferencer {
         if (funcName === 'join' && e.arguments.length === 4) return this.inferJoin(e, env);
         if (funcName === 'scalar' && e.arguments.length === 1) return this.inferScalar(e, env);
         if ((funcName === 'in_query' || funcName === 'not_in_query') && e.arguments.length === 2) return this.inferInQuery(e, env);
+        if ((funcName === 'is_true' || funcName === 'is_false' || funcName === 'is_unknown') && e.arguments.length === 1) {
+            return this.inferTruthPredicate(e, env, funcName);
+        }
         if (funcName === 'fold' && e.arguments.length === 1) return this.inferFold(e, env);
         if (funcName === 'group_by' && e.arguments.length === 1) return this.inferGroupBy(e, env);
         if (funcName === 'map' && e.arguments.length === 1) return this.inferMap(e, env);
@@ -1093,6 +1234,19 @@ export class Inferencer {
             return this.u.fresh();
         }
         return maybeOf(fields[0]![1]);
+    }
+
+    /** SQL three-valued logic predicates accept bool, maybe bool, or NULL. */
+    private inferTruthPredicate(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, name: string): Type {
+        const arg = e.arguments[0]!;
+        const argType = this.inferArg(arg, env);
+        try {
+            this.u.unify(argType, truthType());
+        } catch (err) {
+            if (!(err instanceof UnifyError)) throw err;
+            this.diag(e, `${name} expects a boolean or nullable boolean expression, got type ${this.u.pretty(argType)}`);
+        }
+        return prim('bool');
     }
 
     /** `in_query x q` / `not_in_query x q` — IN (SELECT ...). */

@@ -29,6 +29,37 @@ heterogeneous list is tolerated at the list itself and checked per element.
 
 A bare reference (`f = greatest`) is the function value, not a call.
 
+## Agda-style operator sections
+
+Every infix symbol has an ordinary curried binding whose name surrounds the
+symbol with underscores:
+
+```
+_+_ 1 2       # 1 + 2
+_>>>_ f g     # f >>> g
+_&_ query step
+increment = _+_ 1
+```
+
+The standard meanings are defined in `prelude.tetaue`, using hidden SQL-aware
+intrinsics from the small core:
+
+```
+export _+_ = __op_add
+export _>>>_ = __op_compose_forward
+```
+
+Infix syntax resolves that lexical binding and applies it twice, so `_+_ 1 2`
+and `1 + 2` are the same operation. A local or imported `_+_` binding changes
+both forms. The grammar still owns the finite symbol set, precedence, and
+associativity; adding an entirely new infix symbol requires a grammar change.
+
+A word between the underscores first resolves an exact `_word_` binding, then
+falls back to the ordinary `word` function. Thus `_div_ 5 2` calls the `div`
+builtin, while `_combine_ x y` calls a user binding named either `_combine_`
+or `combine`. The referenced function remains normally curried and
+type-checked; the underscores do not introduce separate SQL lowering.
+
 ## Records
 
 `merge l r` (also written infix `l <> r`) combines two records into one;
