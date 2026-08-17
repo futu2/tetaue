@@ -28,7 +28,7 @@ import {
 import type { Type as LangiumType } from './generated/ast.js';
 import {
     ConstraintError, TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
-    builtinOf, fun, isTypeClassInstance, listOf, maybeOf, prim, queryOf, rowOf, truthType,
+    builtinOf, fun, isTypeClassInstance, listOf, maybeOf, nullExtendedMaybeOf, prim, queryOf, rowOf, truthType,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
@@ -656,6 +656,63 @@ export class Inferencer {
         return fun(paramType, body);
     }
 
+    /** Add SQL outer-join nullability without nesting an existing Maybe. */
+    private nullExtend(t: Type): Type {
+        return this.u.peel(t).kind === 'maybe' ? t : nullExtendedMaybeOf(t);
+    }
+
+    /**
+     * Infer the common inline two-argument join merger against its actual
+     * input types. This lets field access through a null-extended `(maybe r)`
+     * row retain Maybe in the projected result instead of first inferring an
+     * ordinary row lambda and trying to retrofit nullability afterwards.
+     */
+    private inferJoinMergerArg(e: Expr, env: Map<string, Scheme>, left: Type, right: Type): Type {
+        const outer = this.unwrapApplicationExpr(e);
+        if (outer && isLambda(outer)) {
+            const inner = this.unwrapApplicationExpr(outer.body as unknown as AstNode);
+            if (inner && isLambda(inner)) {
+                const outerEnv = new Map(env);
+                const outerRigid: number[] = [];
+                const outerParam = outer.param!.type
+                    ? this.translateType(outer.param!.type, true, new Map(), outerRigid)
+                    : left;
+                outerEnv.set(outer.param!.name ?? '', { vars: [], type: outerParam });
+
+                const innerEnv = new Map(outerEnv);
+                const innerRigid: number[] = [];
+                const innerParam = inner.param!.type
+                    ? this.translateType(inner.param!.type, true, new Map(), innerRigid)
+                    : right;
+                innerEnv.set(inner.param!.name ?? '', { vars: [], type: innerParam });
+
+                const body = this.inferExpr(inner.body as unknown as UnaryExpression, innerEnv);
+                for (const id of [...outerRigid, ...innerRigid]) this.u.setVarRigid(id, false);
+
+                const innerType = fun(innerParam, body);
+                const outerType = fun(outerParam, innerType);
+                this.nodeTypes.set(inner, innerType);
+                this.nodeTypes.set(outer, outerType);
+                return outerType;
+            }
+        }
+
+        const arity = this.dollarArity(e, env);
+        if (arity > 0) {
+            const contextualEnv = new Map(env);
+            const params: Type[] = [];
+            for (let i = 1; i <= arity; i++) {
+                const param = i === 1 ? left : i === 2 ? right : this.u.fresh('flex');
+                contextualEnv.set(`$${i}`, { vars: [], type: param });
+                params.push(param);
+            }
+            const body = this.inferExpr(e, contextualEnv);
+            return params.reduceRight((acc, param) => fun(param, acc), body);
+        }
+
+        return this.inferArg(e, env);
+    }
+
     /**
      * Is `e` a qualified module access `t.binding` where `t` is a namespace
      * alias of the current module? The receiver parses as an Application of a
@@ -691,22 +748,29 @@ export class Inferencer {
             this.diag(e, `tables have no fields — access columns through a row parameter inside a lambda, e.g. map (u => u.${property})`);
             return this.u.fresh();
         }
+        const nullExtended = r.kind === 'maybe';
+        const fieldReceiver = nullExtended ? r.of : recv;
+        const receiverRow = this.u.peel(fieldReceiver);
+        if (receiverRow.kind === 'query') {
+            this.diag(e, `tables have no fields — access columns through a row parameter inside a lambda, e.g. map (u => u.${property})`);
+            return this.u.fresh();
+        }
         // Completion inserts `u._tetaue_field` into a mid-typing document; it
         // is a probe, not a real column, and must not pin `u`'s row.
         if (property.startsWith(SYNTHETIC_FIELD_PREFIX)) return this.u.fresh();
         let field;
         try {
-            field = this.u.fieldOf(recv, property);
+            field = this.u.fieldOf(fieldReceiver, property);
         } catch (err) {
             if (!(err instanceof UnifyError)) throw err;
             field = null; // e.g. extending a rigid (annotated) row tail
         }
         if (!field) {
-            const labels = r.kind === 'row' ? this.u.rowLabels(r) : [];
+            const labels = receiverRow.kind === 'row' ? this.u.rowLabels(receiverRow) : [];
             this.diag(e, `unknown column '${property}'${labels.length > 0 ? ` — available: ${labels.join(', ')}` : ''}`);
             return this.u.fresh();
         }
-        return field.type;
+        return nullExtended ? this.nullExtend(field.type) : field.type;
     }
 
     private inferBinary(e: import('./generated/ast.js').BinaryExpression, env: Map<string, Scheme>): Type {
@@ -1473,10 +1537,9 @@ export class Inferencer {
     }
 
     /**
-     * `joinKind right on merger` — for LEFT/RIGHT/FULL joins the
-     * null-extended side can produce SQL NULLs, so the merger's output row is
-     * explicitly `maybe` on every projected field. INNER joins keep the
-     * merger's exact row type.
+     * `joinKind right on merger` — the ON predicate sees the original rows;
+     * the merger sees `(maybe row)` only on the side an outer join can omit.
+     * Its projection therefore determines result nullability field by field.
      */
     private inferJoin(
         e: import('./generated/ast.js').Application,
@@ -1489,7 +1552,6 @@ export class Inferencer {
         const t = this.u.fresh('flex');
         const rightT = this.inferArg(e.arguments[0]!, env);
         const onT = this.inferArg(e.arguments[1]!, env);
-        const mergerT = this.inferArg(e.arguments[2]!, env);
         try {
             this.u.unify(rightT, queryOf(s));
         } catch (err) {
@@ -1510,31 +1572,24 @@ export class Inferencer {
             }
             return this.u.fresh();
         }
+        const mergerLeft = kindName === 'right' || kindName === 'full' ? maybeOf(r) : r;
+        const mergerRight = kindName === 'left' || kindName === 'full' ? maybeOf(s) : s;
+        const mergerT = this.inferJoinMergerArg(e.arguments[2]!, env, mergerLeft, mergerRight);
+        const expectedMerger = fun(mergerLeft, fun(mergerRight, t));
         // A plain `merge` is the advertised full-row-union shorthand. The
         // generic merge scheme returns an unconstrained fresh row, which would
-        // lose every projected field and the outer-join nullability of the
-        // result. Compute the merge row directly from the left and right rows
-        // (right wins on overlap) instead of unifying the generic scheme.
+        // lose every projected field. Compute the merge row directly from the
+        // merger's possibly null-extended inputs (right wins on overlap).
         const mergerIsMerge = mergerT.kind === 'builtin' && mergerT.name === 'merge';
         let row: Type;
         if (mergerIsMerge) {
-            // Materialize each side's open-tail fields before merging so the
-            // outer-join maybe-wrapping below sees every projected column
-            // (otherwise a column carried only in a materialized tail is not
-            // wrapped and escapes as non-null).
-            const mergeInput = (input: Type): Type => {
-                const rt = this.u.peel(input);
-                if (rt.kind !== 'row') return input;
-                const resolved = this.u.resolveRow(rt);
-                return rowOf([...resolved.fields], resolved.tail);
-            };
-            row = this.inferMerge(mergeInput(r), mergeInput(s), e.arguments[2]!);
+            row = this.inferMerge(mergerLeft, mergerRight, e.arguments[2]!);
         } else {
             try {
-                this.u.unify(mergerT, fun(r, fun(s, t)));
+                this.u.unify(mergerT, expectedMerger);
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    this.argError(name, 2, e.arguments[2]!, mergerT, fun(r, fun(s, t)), undefined);
+                    this.argError(name, 2, e.arguments[2]!, mergerT, expectedMerger, undefined);
                 } else {
                     throw err;
                 }
@@ -1551,21 +1606,7 @@ export class Inferencer {
             this.argError(name, 2, e.arguments[2]!, mergerT, undefined, undefined);
             return this.u.fresh();
         }
-        if (kindName === 'inner') return fun(queryOf(r), queryOf(row));
-
-        // Null-extended columns are nullable in the result. We conservatively
-        // wrap every projected field; a future provenance analysis can narrow
-        // this to only the fields read from the null-extended side.
-        const resolved = this.u.resolveRow(row);
-        const fields: [string, Type][] = [...resolved.fields].map(([key, ft]) => {
-            const rt = this.u.peel(ft);
-            return [key, rt.kind === 'maybe' ? ft : maybeOf(ft)];
-        });
-        if (resolved.tail) {
-            const tailRoot = this.u.resolve(resolved.tail);
-            if (tailRoot.kind === 'var') this.u.setVarAbsorbAsMaybe(tailRoot.id, true);
-        }
-        return fun(queryOf(r), queryOf({ kind: 'row', fields: new Map(fields), tail: resolved.tail }));
+        return fun(queryOf(r), queryOf(row));
     }
 
     /**
@@ -2028,11 +2069,17 @@ export class Inferencer {
      * yet). Closed non-row types return null — `merge` requires records on
      * both sides.
      */
-    private mergeRowShape(t: Type, at: AstNode, which: 'first' | 'second'): { fields: Map<string, Type>; tail: Type | null; varId: number | null } | null {
-        const r = this.u.peel(t);
+    private mergeRowShape(t: Type, at: AstNode, which: 'first' | 'second'): { fields: Map<string, Type>; tail: Type | null; varId: number | null; nullExtended: boolean } | null {
+        const outer = this.u.peel(t);
+        const nullExtended = outer.kind === 'maybe';
+        const r = this.u.peel(nullExtended ? outer.of : outer);
         if (r.kind === 'row') {
             const resolved = this.u.resolveRow(r);
-            return { fields: new Map(resolved.fields), tail: resolved.tail, varId: null };
+            const fields = new Map<string, Type>();
+            for (const [label, type] of resolved.fields) {
+                fields.set(label, nullExtended ? this.nullExtend(type) : type);
+            }
+            return { fields, tail: resolved.tail, varId: null, nullExtended };
         }
         if (r.kind === 'var') {
             const info = this.u.varInfo(r.id);
@@ -2040,7 +2087,7 @@ export class Inferencer {
                 this.diag(at, `merge expects a record as its ${which} argument, got type ${this.u.pretty(t)}`);
                 return null;
             }
-            return { fields: new Map(), tail: null, varId: r.id };
+            return { fields: new Map(), tail: null, varId: r.id, nullExtended };
         }
         this.diag(at, `merge expects a record as its ${which} argument, got type ${this.u.pretty(t)}`);
         return null;
@@ -2073,18 +2120,22 @@ export class Inferencer {
         }
 
         let resTail: Type;
+        let nullExtendedTail = false;
         if (bShape.varId !== null) {
             // Unconstrained right row: it IS the result's open part.
             resTail = this.u.fresh('row');
             try { this.u.bind(bShape.varId, { kind: 'row', fields: new Map(), tail: resTail }); } catch { /* leave open */ }
+            nullExtendedTail = bShape.nullExtended;
         } else if (bShape.tail) {
             // Right side's open tail flows into the result unchanged.
             resTail = bShape.tail;
+            nullExtendedTail = bShape.nullExtended;
         } else if (aShape.varId !== null) {
             // Closed right record: an unconstrained left row becomes the
             // result's open part (fields materialized later still appear).
             resTail = this.u.fresh('row');
             try { this.u.bind(aShape.varId, { kind: 'row', fields: new Map(), tail: resTail }); } catch { /* leave open */ }
+            nullExtendedTail = aShape.nullExtended;
         } else if (aShape.tail) {
             // Closed right record: the left's open tail flows into the result.
             resTail = this.u.fresh('row');
@@ -2092,9 +2143,14 @@ export class Inferencer {
             if (t.kind === 'var' && !this.u.varInfo(t.id).rigid) {
                 try { this.u.bind(t.id, resTail); } catch { /* kind conflict: leave open */ }
             }
+            nullExtendedTail = aShape.nullExtended;
         } else {
             // Both closed: keep a tail open so the result stays mergeable.
             resTail = this.u.fresh('row');
+        }
+        if (nullExtendedTail) {
+            const tail = this.u.resolve(resTail);
+            if (tail.kind === 'var') this.u.setVarAbsorbAsMaybe(tail.id, true);
         }
         return { kind: 'row', fields: resFields, tail: resTail };
     }

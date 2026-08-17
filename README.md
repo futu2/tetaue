@@ -547,6 +547,10 @@ q = users & joinInner paid_orders ($1.id == $2.user_id) merge
 The right side is a first-class query VALUE (any binding or pipeline — stepped right
 sides render as subqueries). Because the merger picks the output columns explicitly,
 overlapping column names are not an error — rename them in the merger instead.
+For outer joins, only the side that can be absent is nullable inside the merger:
+the right side of `joinLeft`, the left side of `joinRight`, and both sides of
+`joinFull`. Columns projected from the guaranteed side and literal values keep
+their original non-null types.
 
 ```
 by_age = sort (u => [desc u.age])

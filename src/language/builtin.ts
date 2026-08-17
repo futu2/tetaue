@@ -89,11 +89,13 @@ function projectionScheme(u: TypeUniverse): Scheme {
         fun(fun(r, rowOf([], s)), fun(queryOf(r), queryOf(rowOf([], s)))));
 }
 
-/** The scheme shared by fixed-kind joins. */
-function joinScheme(u: TypeUniverse): Scheme {
-    return poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
+/** Fixed-kind join scheme, including the side null-extended by an outer join. */
+function joinScheme(kind: 'inner' | 'left' | 'right' | 'full'): (u: TypeUniverse) => Scheme {
+    return u => poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
         const on = fun(r, fun(s, p('bool')));       // l => r => bool
-        const merger = fun(r, fun(s, t));           // l => r => row t
+        const mergerLeft = kind === 'right' || kind === 'full' ? maybeOf(r) : r;
+        const mergerRight = kind === 'left' || kind === 'full' ? maybeOf(s) : s;
+        const merger = fun(mergerLeft, fun(mergerRight, t));
         return fun(queryOf(s), fun(on, fun(merger, fun(queryOf(r), queryOf(t)))));
     });
 }
@@ -120,10 +122,10 @@ export const BUILTIN_SPECS = [
         const merger = fun(r, fun(s, t));       // l => r => row t
         return fun(rightFn, fun(on, fun(merger, fun(queryOf(r), queryOf(t)))));
     }) },
-    { name: 'joinInner', category: 'query-step', doc: 'joinInner right on merger — INNER JOIN', scheme: joinScheme },
-    { name: 'joinLeft', category: 'query-step', doc: 'joinLeft right on merger — LEFT JOIN', scheme: joinScheme },
-    { name: 'joinRight', category: 'query-step', doc: 'joinRight right on merger — RIGHT JOIN', scheme: joinScheme },
-    { name: 'joinFull', category: 'query-step', doc: 'joinFull right on merger — FULL JOIN', scheme: joinScheme },
+    { name: 'joinInner', category: 'query-step', doc: 'joinInner right on merger — INNER JOIN', scheme: joinScheme('inner') },
+    { name: 'joinLeft', category: 'query-step', doc: 'joinLeft right on merger — LEFT JOIN', scheme: joinScheme('left') },
+    { name: 'joinRight', category: 'query-step', doc: 'joinRight right on merger — RIGHT JOIN', scheme: joinScheme('right') },
+    { name: 'joinFull', category: 'query-step', doc: 'joinFull right on merger — FULL JOIN', scheme: joinScheme('full') },
 
     // --- set operations (pure query -> query functions) -----------------
     { name: 'union', category: 'set', doc: 'UNION (distinct set union)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },

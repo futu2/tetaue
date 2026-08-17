@@ -52,7 +52,7 @@ export type Type =
     | { kind: 'prim'; name: PrimName }
     /** A SQL predicate: either bool or maybe bool (three-valued logic). */
     | { kind: 'truth' }
-    | { kind: 'maybe'; of: Type }
+    | { kind: 'maybe'; of: Type; flattenNullExtension?: boolean }
     | { kind: 'fun'; from: Type; to: Type }
     | { kind: 'list'; of: Type }
     /** A record row: unordered label → type map, plus an optional tail variable. */
@@ -144,6 +144,11 @@ export function maybeOf(t: Type): Type {
     // Unlike the old `maybe T` design, Maybe is NOT transparent: `maybe T`
     // never unifies with `T`. Nesting is meaningful (Haskell-style).
     return { kind: 'maybe', of: t };
+}
+
+/** SQL null extension is idempotent even though explicit Maybe nesting is not. */
+export function nullExtendedMaybeOf(t: Type): Type {
+    return t.kind === 'maybe' ? t : { kind: 'maybe', of: t, flattenNullExtension: true };
 }
 
 export function fun(from: Type, to: Type): Type {
@@ -308,6 +313,11 @@ export class TypeUniverse {
     peel(t: Type): Type {
         let r = this.resolve(t);
         while (r.kind === 'builtin') r = this.resolve(r.of);
+        while (r.kind === 'maybe' && r.flattenNullExtension) {
+            const inner = this.resolve(r.of);
+            if (inner.kind !== 'maybe') break;
+            r = inner;
+        }
         return r;
     }
 
@@ -437,8 +447,8 @@ export class TypeUniverse {
 
     /** Unify two types structurally (no implicit Maybe conversion). Throws UnifyError. */
     private unifyInternal(a: Type, b: Type): Type {
-        a = this.resolve(a);
-        b = this.resolve(b);
+        a = this.peelNullExtension(a);
+        b = this.peelNullExtension(b);
         if (a === b) return a;
         if (a.kind === 'var' && b.kind === 'var' && a.id === b.id) return a;
 
@@ -533,6 +543,17 @@ export class TypeUniverse {
         throw new UnifyError(a, b);
     }
 
+    /** Resolve an idempotent SQL null-extension wrapper once its input is Maybe. */
+    private peelNullExtension(t: Type): Type {
+        let r = this.resolve(t);
+        while (r.kind === 'maybe' && r.flattenNullExtension) {
+            const inner = this.resolve(r.of);
+            if (inner.kind !== 'maybe') break;
+            r = inner;
+        }
+        return r;
+    }
+
     /** Resolve a row's tail chain, merging fields from materialized tails. */
     resolveRow(r: Extract<Type, { kind: 'row' }>): { fields: Map<string, Type>; tail: Type | null } {
         const fields = new Map<string, Type>();
@@ -575,7 +596,7 @@ export class TypeUniverse {
             throw new UnifyError(rowOf([...row.fields]), rowOf([[label, type]]));
         }
         const absorbAsMaybe = this.varInfo(t.id).absorbAsMaybe === true;
-        const storedType = absorbAsMaybe && type.kind !== 'maybe' ? maybeOf(type) : type;
+        const storedType = absorbAsMaybe ? nullExtendedMaybeOf(type) : type;
         const fresh = this.fresh('row');
         if (absorbAsMaybe && fresh.kind === 'var') this.setVarAbsorbAsMaybe(fresh.id, true);
         this.bind(t.id, { kind: 'row', fields: new Map([[label, storedType]]), tail: fresh });
@@ -745,7 +766,10 @@ export class TypeUniverse {
             return subst.get(r.id) ?? r;
         }
         switch (r.kind) {
-            case 'maybe': return maybeOf(this.substitute(subst, r.of));
+            case 'maybe': {
+                const of = this.substitute(subst, r.of);
+                return r.flattenNullExtension ? nullExtendedMaybeOf(of) : maybeOf(of);
+            }
             case 'fun': return fun(this.substitute(subst, r.from), this.substitute(subst, r.to));
             case 'list': return listOf(this.substitute(subst, r.of));
             case 'row': {
@@ -780,7 +804,7 @@ export class TypeUniverse {
      */
     pretty(t: Type, showNullable: boolean = false, friendlyVars: boolean = false): string {
         const p = (x: Type, paren: boolean): string => {
-            const r = this.resolve(x);
+            const r = this.peelNullExtension(x);
             switch (r.kind) {
                 case 'var': {
                     const info = this.infos.get(r.id)!;

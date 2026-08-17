@@ -89,10 +89,11 @@ tail       ::= lowercase-row-variable | '?hole_name'
 - Scalar SQL functions (`upper`, `length`, `trim`, date functions, ...) take
   and return non-maybe values; SQL NULL propagation is achieved explicitly
   with `from_maybe`/`coalesce`, not by implicit lifting.
-- **Outer joins** (`left`/`right`/`full`) mark every field of the merger's
-  result row as maybe. This is deliberately conservative: the current
-  provenance analysis does not yet narrow the nullability to only the
-  null-extended side.
+- **Outer joins** expose the null-extended input as a maybe row to the merger:
+  `joinLeft` makes the right row maybe, `joinRight` makes the left row maybe,
+  and `joinFull` makes both maybe. Field access through a maybe row produces a
+  maybe field (without adding a second layer to an already-maybe field), so
+  fields from a guaranteed side and constant projections remain non-null.
 - **Aggregates** that SQL can make NULL on empty/all-null input
   (`sum`, `avg`, `min`, `max`) produce maybe results:
   `sum : numeric -> agg (maybe numeric)`. `count : a -> agg int` and
@@ -167,11 +168,11 @@ drop        : int -> query r -> query r
 joinInner   : forall r s t. query s -> (r -> s -> bool)
                 -> (r -> s -> {t}) -> query r -> query {t}
 joinLeft    : forall r s t. query s -> (r -> s -> bool)
-                -> (r -> s -> {t}) -> query r -> query {t}
+                -> (r -> (maybe s) -> {t}) -> query r -> query {t}
 joinRight   : forall r s t. query s -> (r -> s -> bool)
-                -> (r -> s -> {t}) -> query r -> query {t}
+                -> ((maybe r) -> s -> {t}) -> query r -> query {t}
 joinFull    : forall r s t. query s -> (r -> s -> bool)
-                -> (r -> s -> {t}) -> query r -> query {t}
+                -> ((maybe r) -> (maybe s) -> {t}) -> query r -> query {t}
 union       : forall r. query r -> query r -> query r
 
 fmap        : closed dispatch for `(a -> b) -> (maybe a) -> (maybe b)`,
@@ -208,8 +209,9 @@ not        : bool -> bool
 div, mod   : int -> int -> int
 ```
 
-Inference specializes the three outer join functions and wraps every projected
-result field in `maybe`; `joinInner` preserves the merger's exact row type.
+Inference specializes the three outer join functions by making only the
+null-extended merger argument(s) maybe. The merger's exact projected row is the
+result type for every join kind.
 
 ## 9. Generalization
 

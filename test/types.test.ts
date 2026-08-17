@@ -3,7 +3,7 @@ import { parseModel, typeErrors, allErrors, render, services } from './helpers.t
 import { checkProject } from '../src/language/checker.ts';
 import {
     ConstraintError, TypeUniverse, UnifyError, type Type,
-    fun, listOf, maybeOf, prim, queryOf, rowOf,
+    fun, listOf, maybeOf, nullExtendedMaybeOf, prim, queryOf, rowOf,
 } from '../src/language/types.ts';
 import { inferProject } from '../src/language/inference.ts';
 import { standardPrelude } from '../src/language/prelude.ts';
@@ -36,6 +36,15 @@ describe('type engine', () => {
         expect(() => u.unify(maybeOf(prim('int')), maybeOf(prim('string')))).toThrow(UnifyError);
         const a = u.fresh();
         expect(() => u.unify(a, maybeOf(a))).toThrow(UnifyError); // occurs check, no α ~ maybe α
+    });
+
+    test('SQL null extension is idempotent without flattening explicit Maybe', () => {
+        const u = new TypeUniverse();
+        const delayed = u.fresh();
+        const extended = nullExtendedMaybeOf(delayed);
+        u.unify(delayed, maybeOf(prim('int')));
+        expect(u.pretty(extended)).toBe('(maybe int)');
+        expect(u.pretty(maybeOf(maybeOf(prim('int'))))).toBe('(maybe (maybe int))');
     });
 
     test('open rows absorb extra fields from closed rows', () => {
@@ -751,17 +760,62 @@ q = users & map (u => { n = param "x" + 1, s = upper (param "x") })`;
         expect(allErrors(ok)).toEqual([]);
     });
 
-    test('fixed join functions preserve inner types and make outer results nullable', () => {
+    test('fixed join functions make only the null-extended side nullable', () => {
         const source = (name: string) => `a: query { id: int, x: string } = table "a"
 b: query { id: int, y: string } = table "b"
 q = a & ${name} b (l => r => l.id == r.id) merge`;
-        const inner = source('joinInner');
-        expect(typeErrors(inner)).toEqual([]);
-        expect(typeOf(inner, 'q')).toBe('query { id: int, x: string, y: string }');
-        for (const name of ['joinLeft', 'joinRight', 'joinFull']) {
-            const outer = source(name);
-            expect(typeErrors(outer)).toEqual([]);
-            expect(typeOf(outer, 'q')).toBe('query { id: (maybe int), x: (maybe string), y: (maybe string) }');
+        const expected = new Map([
+            ['joinInner', 'query { id: int, x: string, y: string }'],
+            // merge is right-biased, so the overlapping id comes from b.
+            ['joinLeft', 'query { id: (maybe int), x: string, y: (maybe string) }'],
+            ['joinRight', 'query { id: int, x: (maybe string), y: string }'],
+            ['joinFull', 'query { id: (maybe int), x: (maybe string), y: (maybe string) }'],
+        ]);
+        for (const [name, result] of expected) {
+            const joined = source(name);
+            expect(typeErrors(joined)).toEqual([]);
+            expect(typeOf(joined, 'q')).toBe(result);
+        }
+    });
+
+    test('outer join merger projections preserve guaranteed fields and constants', () => {
+        const source = (name: string) => `a: query { id: int, x: string } = table "a"
+b: query { id: int, y: string } = table "b"
+q = a & ${name} b (l => r => l.id == r.id) (l => r => {
+    lid = l.id, rid = r.id, x = l.x, y = r.y, marker = 1
+})`;
+        const expected = new Map([
+            ['joinLeft', 'query { lid: int, marker: int, rid: (maybe int), x: string, y: (maybe string) }'],
+            ['joinRight', 'query { lid: (maybe int), marker: int, rid: int, x: (maybe string), y: string }'],
+            ['joinFull', 'query { lid: (maybe int), marker: int, rid: (maybe int), x: (maybe string), y: (maybe string) }'],
+        ]);
+        for (const [name, result] of expected) {
+            const joined = source(name);
+            expect(typeErrors(joined)).toEqual([]);
+            expect(typeOf(joined, 'q')).toBe(result);
+        }
+    });
+
+    test('outer join merger must unwrap fields from the null-extended side', () => {
+        const src = `a: query { id: int } = table "a"
+b: query { id: int } = table "b"
+q = a & joinLeft b (l => r => l.id == r.id) (l => r => { id = r.id + 1 })`;
+        expect(typeErrors(src).join('\n')).toContain("'+' requires numeric operands, got (maybe int) and int");
+    });
+
+    test('null extension does not nest an existing nullable column', () => {
+        const source = (name: string) => `a: query { id: int, x: (maybe string) } = table "a"
+b: query { id: int, y: (maybe string) } = table "b"
+q = a & ${name} b (l => r => l.id == r.id) (l => r => { x = l.x, y = r.y })`;
+        const expected = new Map([
+            ['joinLeft', 'query { x: (maybe string), y: (maybe string) }'],
+            ['joinRight', 'query { x: (maybe string), y: (maybe string) }'],
+            ['joinFull', 'query { x: (maybe string), y: (maybe string) }'],
+        ]);
+        for (const [name, result] of expected) {
+            const joined = source(name);
+            expect(typeErrors(joined)).toEqual([]);
+            expect(typeOf(joined, 'q')).toBe(result);
         }
     });
 
