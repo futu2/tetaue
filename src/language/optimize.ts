@@ -67,6 +67,9 @@ function optimizeExpr(node: SqlNode, state: OptimizeState): SqlNode {
                 return boolLiteral(!expr.value, node.ast);
             }
             if (expr.kind === 'not') return expr.expr;
+            if (expr.kind === 'is-null') {
+                return { ...expr, negated: !expr.negated, ast: node.ast };
+            }
             return expr === node.expr ? node : { ...node, expr };
         }
         case 'call': {

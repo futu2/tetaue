@@ -2,7 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import { NodeFileSystem } from 'langium/node';
 import { readFileSync } from 'node:fs';
 import { createTetaueServices } from '../src/language/tetaue-module.js';
-import { standardPrelude, STANDARD_PRELUDE_SOURCE } from '../src/language/prelude.js';
+import { standardPrelude, standardPreludeNames, STANDARD_PRELUDE_SOURCE } from '../src/language/prelude.js';
+import { BUILTINS } from '../src/language/interpreter.js';
 import { checkProject } from '../src/language/checker.js';
 import type { Model } from '../src/language/generated/ast.js';
 
@@ -35,6 +36,22 @@ describe('standard prelude', () => {
         const plus = prelude.model.bindings.find(binding => binding.name === '_+_');
         expect(plus?.export).toBe(true);
         expect(plus?.$cstNode?.text).toBe('export _+_ = __op_add');
+    });
+
+    test('defines derived helpers outside the primitive builtin table', () => {
+        const names = standardPreludeNames(services);
+        for (const name of ['is_nothing', 'is_just', 'is_not_null']) {
+            expect(names).toContain(name);
+            expect(Object.keys(BUILTINS)).not.toContain(name);
+        }
+        expect(names).not.toContain('filtered');
+
+        const result = checked(`
+            users: query { name: (maybe string) } = table "users"
+            q = users & filter (u => is_just u.name && is_not_null u.name && is_nothing nothing)
+        `);
+        expect(result.diagnostics).toEqual([]);
+        expect(result.value.kind).toBe('query');
     });
 
     test('prelude definitions can be shadowed like ordinary bindings', () => {

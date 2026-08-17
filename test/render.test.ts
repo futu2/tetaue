@@ -476,14 +476,6 @@ describe('function composition and aliases', () => {
         expect(sql).toContain('WHERE age >= 18');
     });
 
-    test('filtered is an alias for filter', () => {
-        const sql = render(`
-            ${USERS}
-            q = users & filtered (u => u.age >= 21)
-        `);
-        expect(sql).toContain('WHERE age >= 21');
-    });
-
     test('composing a non-function is an error', () => {
         const messages = errors(`
             ${USERS}

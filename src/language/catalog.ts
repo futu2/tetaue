@@ -1,10 +1,9 @@
 /******************************************************************************
- * tetaue builtin catalog — compatibility facade.
+ * tetaue primitive builtin catalog — compatibility facade.
  *
- * The real catalog lives in builtin.ts: names, aliases, docs, categories and
- * static type schemes are declared there once. Interpreter and renderer type
- * their builtin tables against the same `BuiltinName` union, so a builtin
- * cannot drift between semantic, type and render layers.
+ * The core catalog lives in builtin.ts: primitive names, aliases, docs,
+ * categories and static type schemes are declared there once. Source-prelude
+ * definitions intentionally sit outside this facade.
  ******************************************************************************/
 export {
     type BuiltinAliasName,

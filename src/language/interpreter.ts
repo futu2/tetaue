@@ -1309,8 +1309,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     }),
 
     // --- query steps ----------------------------------------------------
-    // `filtered` keeps the rows that satisfy a predicate; `filter` is a synonym.
-    filtered: filterBuiltin('filtered'),
     filter: filterBuiltin('filter'),
 
     select: () => fn('select', (labelsArg, at, ctx) => {
@@ -2238,33 +2236,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         }
         if (forbid(node, ['agg', 'group', 'order'], 'is_null', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'is-null', expr: node, negated: false, type: 'bool' }, at);
-    }),
-    is_nothing: () => fn('is_nothing', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `is_nothing expects a maybe expression, e.g. is_nothing u.nickname` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'is_nothing', at ?? arg.ast, ctx)) return ERROR;
-        return mkExpr({ kind: 'is-null', expr: node, negated: false, type: 'bool' }, at);
-    }),
-    is_just: () => fn('is_just', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `is_just expects a maybe expression, e.g. is_just u.nickname` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'is_just', at ?? arg.ast, ctx)) return ERROR;
-        return mkExpr({ kind: 'is-null', expr: node, negated: true, type: 'bool' }, at);
-    }),
-    is_not_null: () => fn('is_not_null', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `is_not_null expects an expression, e.g. is_not_null u.nickname` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'is_not_null', at ?? arg.ast, ctx)) return ERROR;
-        return mkExpr({ kind: 'is-null', expr: node, negated: true, type: 'bool' }, at);
     }),
     is_true: truthPredicateBuiltin('is_true'),
     is_false: truthPredicateBuiltin('is_false'),
@@ -3203,6 +3174,8 @@ export interface ProjectAnalysisOptions {
     requireQuery?: boolean;
     /** Resolved import edges from `collectModuleTree` (pure tree). */
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    /** Optional source standard library, evaluated before the user modules. */
+    prelude?: ProjectModule;
 }
 
 /** The primitive environment shared by `analyzeProject` and `checkProject`. */
@@ -3226,7 +3199,7 @@ export function createPreludeEnv(): Map<string, Value> {
  * The ROOT module's last binding is the project's query.
  */
 export function analyzeProject(modules: readonly ProjectModule[], options: ProjectAnalysisOptions = {}): AnalysisResult {
-    const { requireQuery = true, importsByModule = new Map() } = options;
+    const { requireQuery = true, importsByModule = new Map(), prelude } = options;
     const diagnostics: Diagnostic[] = [];
 
     // Exported bindings per module, keyed by module identity (diamond dedup
@@ -3235,8 +3208,10 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
     const exportsByModule = new Map<ProjectModule, Map<string, Value>>();
     const typeExportsByModule = new Map<ProjectModule, Map<string, import('./generated/ast.js').Type>>();
 
+    const allModules = prelude ? [prelude, ...modules] : [...modules];
+    let standardValues = new Map<string, Value>();
     let value: Value = ERROR;
-    for (const module of modules) {
+    for (const module of allModules) {
         // Each module gets its OWN immutable scope: prelude, imports, then
         // local bindings. The environment is threaded through the binding
         // fold; nothing is reassigned on a shared context object.
@@ -3255,6 +3230,11 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         for (const [name, v] of imported.flat) env.set(name, v);
         for (const [alias, selected] of imported.namespaces) {
             env.set(alias, { kind: 'module', name: alias, exports: new Map(selected), ast: module.model.imports.find(imp => imp.alias === alias) });
+        }
+        if (module !== prelude) {
+            for (const [name, standardValue] of standardValues) {
+                if (!env.has(name)) env.set(name, standardValue);
+            }
         }
         const scope = new Map(imported.scope);
 
@@ -3290,6 +3270,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         typeExportsByModule.set(module, new Map(
             module.model.types.filter(a => a.export).map(a => [a.name, a.type]),
         ));
+        if (module === prelude) standardValues = exports;
         diagnostics.push(...moduleDiagnostics);
     }
 

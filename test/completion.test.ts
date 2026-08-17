@@ -31,7 +31,7 @@ describe('builtin completion', () => {
     test('filters by the typed prefix', async () => {
         const labels = await completionsAt(`${USERS}\nq = users & fil`, 1, 14);
         expect(labels).toContain('filter');
-        expect(labels).toContain('filtered');
+        expect(labels).not.toContain('filtered');
         expect(labels).not.toContain('take');
         expect(labels).not.toContain('concat');
     });

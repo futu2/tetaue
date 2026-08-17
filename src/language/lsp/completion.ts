@@ -27,12 +27,12 @@ import { projectTreeFor } from '../compile.js';
 import { isAccessExpression, isApplication, isIdentifier } from '../generated/ast.js';
 import type { Model } from '../generated/ast.js';
 import type { ProjectModule } from '../imports.js';
-import { standardPrelude } from '../prelude.js';
+import { standardPrelude, standardPreludeNames } from '../prelude.js';
 
 /** Synthetic property inserted after the dot so the access parses. */
 const DUMMY = '_tetaue_field';
 
-const STEP_NAMES = new Set(['filter', 'filtered', 'map', 'sort', 'take', 'distinct', 'fold', 'group_by', 'join', 'join_lateral', 'select']);
+const STEP_NAMES = new Set(['filter', 'map', 'sort', 'take', 'distinct', 'fold', 'group_by', 'join', 'join_lateral', 'select']);
 const AGG_NAMES = new Set(['count', 'sum', 'avg', 'min', 'max', 'list', 'group']);
 const JOIN_KIND_NAMES = new Set(['inner', 'left', 'right', 'full']);
 
@@ -47,10 +47,12 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
     override readonly completionOptions: CompletionProviderOptions = { triggerCharacters: ['.'] };
 
     private readonly services: TetaueServices;
+    private readonly standardNames: readonly string[];
 
     constructor(services: TetaueServices) {
         super(services);
         this.services = services;
+        this.standardNames = [...new Set([...Object.keys(BUILTINS), ...standardPreludeNames(services)])];
     }
 
     override async getCompletion(
@@ -68,10 +70,9 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
     }
 
     /**
-     * Builtin name completion in expression positions: the prelude's
-     * functions (filter, map, upper, count, current_date, ceil, concat, ...)
-     * are interpreter-env values, invisible to Langium's grammar-driven
-     * default provider, so they are suggested from `BUILTINS` directly.
+     * Standard-library completion in expression positions: primitive and
+     * source-prelude functions are invisible to Langium's grammar-driven
+     * default provider, so combine both sets explicitly.
      * Text-only heuristics: skip inside strings/comments and after a `.`
      * (field access owns those positions).
      */
@@ -92,7 +93,7 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
         if (before.endsWith('.')) return undefined;
 
         const replaceStart = document.textDocument.positionAt(start);
-        const items = Object.keys(BUILTINS)
+        const items = this.standardNames
             .filter(name => name.startsWith(prefix))
             .sort()
             .map(name => ({

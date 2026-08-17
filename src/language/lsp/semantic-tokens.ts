@@ -23,6 +23,7 @@ import type { AstNode } from 'langium';
 import { GrammarUtils } from 'langium';
 import { AbstractSemanticTokenProvider, type SemanticTokenAcceptor } from 'langium/lsp';
 import { BUILTINS } from '../interpreter.js';
+import { standardPreludeNames } from '../prelude.js';
 import type { TetaueServices } from '../tetaue-module.js';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBinding, isBooleanLiteral,
@@ -32,11 +33,12 @@ import {
 } from '../generated/ast.js';
 import type { Model } from '../generated/ast.js';
 
-const BUILTIN_NAMES = new Set(Object.keys(BUILTINS));
-
 export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
+    private readonly standardNames: ReadonlySet<string>;
+
     constructor(services: TetaueServices) {
         super(services);
+        this.standardNames = new Set([...Object.keys(BUILTINS), ...standardPreludeNames(services)]);
     }
 
     protected highlightElement(node: AstNode, acceptor: SemanticTokenAcceptor): void {
@@ -197,7 +199,7 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
                 return { type: 'namespace' };
             }
         }
-        if (BUILTIN_NAMES.has(name)) {
+        if (this.standardNames.has(name)) {
             return { type: 'function', modifier: 'defaultLibrary' };
         }
         return { type: 'variable' };

@@ -5,9 +5,10 @@ import { NodeFileSystem } from 'langium/node';
 import { URI } from 'langium';
 import { createTetaueServices } from '../src/language/tetaue-module.js';
 import type { TetaueServices } from '../src/language/tetaue-module.js';
-import { analyze } from '../src/language/interpreter.js';
+import { analyze, analyzeProject } from '../src/language/interpreter.js';
 import { infer } from '../src/language/inference.js';
 import { checkProject } from '../src/language/checker.js';
+import { standardPrelude } from '../src/language/prelude.js';
 import { renderQuery, DIALECTS } from '../src/language/render.js';
 import type { RenderFormat } from '../src/language/render.js';
 import type { Model } from '../src/language/generated/ast.js';
@@ -58,7 +59,10 @@ export function allErrors(text: string): string[] {
 /** Interpret a module and render its query to SQL. Throws on diagnostics. */
 export function render(text: string, dialect: string = 'sqlite', format: RenderFormat = 'pretty'): string {
     const model = parseModel(text);
-    const { value, diagnostics } = analyze(model);
+    const { value, diagnostics } = analyzeProject(
+        [{ model, uri: undefined, imports: [] }],
+        { prelude: standardPrelude(services) },
+    );
     if (diagnostics.length > 0) {
         throw new Error(`invalid module: ${diagnostics.map(d => d.message).join(' | ')}`);
     }

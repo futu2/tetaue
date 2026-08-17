@@ -35,7 +35,7 @@
     "keywords": {
       "patterns": [
         {
-          "match": "\\b(import|table|filter|filtered|map|sort|take|distinct|fold|join|asc|desc|group|count|sum|avg|min|max|coalesce|from_maybe|is_nothing|is_just|is_null|is_not_null|just|nothing|div|mod|upper|lower|length|abs|is_in|is_not_in|not|true|false|null|query|maybe|forall|case|_)\\b",
+          "match": "\\b(import|table|filter|map|sort|take|distinct|fold|join|asc|desc|group|count|sum|avg|min|max|coalesce|from_maybe|is_nothing|is_just|is_null|is_not_null|just|nothing|div|mod|upper|lower|length|abs|is_in|is_not_in|not|true|false|null|query|maybe|forall|case|_)\\b",
           "name": "keyword.other.tetaue"
         },
         {

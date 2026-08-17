@@ -48,6 +48,20 @@ describe('pure query optimization', () => {
         });
     });
 
+    test('normalizes negated null predicates', () => {
+        const query = queryOf(`
+            users: query { name: (maybe string) } = table "users"
+            q = users & filter (u => not (is_null u.name))
+        `);
+
+        const rendered = renderQuery(query, DIALECTS.postgresql!, 'compact');
+        expect(rendered).toEqual({
+            ok: true,
+            sql: 'SELECT * FROM users WHERE name IS NOT NULL',
+            parameters: [],
+        });
+    });
+
     test('combines adjacent offsets while retaining the source query', () => {
         const query = queryOf(`
             users: query { id: int } = table "users"
@@ -61,4 +75,3 @@ describe('pure query optimization', () => {
         expect(drops[0]!.n).toBe(5);
     });
 });
-

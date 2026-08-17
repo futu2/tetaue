@@ -6,8 +6,8 @@ Tetaue has two layers:
    table roots, query steps, SQL expressions, dialect capabilities, and the
    primitive type schemes in `src/language/builtin.ts`.
 2. The standard prelude is ordinary tetaue code in [`prelude.tetaue`](../../prelude.tetaue).
-   It defines the public `_op_` bindings plus `id`, `const`, `compose`, `flip`,
-   and `pipe`.
+   It defines the public `_op_` bindings plus reusable functions such as
+   `id`, `compose`, `is_nothing`, and `is_just`.
 
 The prelude is not a second implementation of the language. The checker parses
 it, runs the same interpreter and Hindley-Milner inferencer used for user code,
@@ -30,3 +30,7 @@ standard prelude (`standardPrelude(services)`).
 This boundary is intentionally small. Adding a SQL primitive requires a core
 builtin specification and runtime implementation. Adding a reusable functional
 abstraction should be a `.tetaue` prelude definition instead.
+
+Aliases and compositions follow the same rule. For example, `is_nothing =
+is_null` and `is_just x = not (is_null x)` are source prelude definitions;
+only `is_null` and `not` need core implementations.

@@ -1817,7 +1817,7 @@ export class Inferencer {
             return r.kind === 'fun' ? r.to : null;
         };
         switch (name) {
-            case 'filter': case 'filtered': {
+            case 'filter': {
                 const r = ret(argType);
                 if (r) this.diag(node, `${name} predicate must be a boolean expression, got type ${p(r)}`);
                 else this.diag(node, `${name} expects a one-parameter predicate lambda or function, e.g. ${name} (u => u.age >= 18)`);

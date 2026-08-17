@@ -204,7 +204,8 @@ TypeScript core is limited to SQL-aware primitives. Reusable functional
 helpers live in [`prelude.tetaue`](prelude.tetaue) and are processed by the
 same parser, inference engine, and interpreter as application code. The
 standard helpers include the `_op_` bindings, `id`, `const`, `compose`, `flip`,
-and `pipe`; local bindings and imports may shadow them normally. Infix parsing
+`pipe`, and the derived Maybe predicates; local bindings and imports may shadow
+them normally. Infix parsing
 and precedence stay in the grammar, while an expression such as `1 + 2`
 resolves the scoped `_+_` function defined by the prelude. See
 [`docs/design/core.md`](docs/design/core.md) for the boundary and extension
@@ -365,8 +366,8 @@ u & filter ...        # pipeline: apply the step to the query
   query as a derived table so `q & take 2 & sort ...` really limits first
   and sorts second. Repeated `take` steps fold to the smaller limit, and a
   new `sort` replaces the previous one.
-- `filter` keeps the rows whose predicate is true (`filter p` ≡ `filtered p`
-  — both names work). After a `fold` it becomes `HAVING`.
+- `filter` keeps the rows whose predicate is true. After a `fold` it becomes
+  `HAVING`.
 - A `fold` ends the flat `FROM` scope: `map`, `join`, and further `fold`s
   after a `fold` run on the aggregated result, which is wrapped as a derived
   table (teta-style) — so you can project the aggregate
@@ -500,7 +501,7 @@ are static errors, not runtime surprises:
 | Builtin | Meaning | Renders to |
 |---|---|---|
 | `table "name"` | query root; schema from the binding annotation (`t: query { col: type } = table "name"`) or inferred | `FROM name` |
-| `filter (u => boolExpr)` | keep rows matching a predicate (alias: `filtered`) | `WHERE ...` / `HAVING ...` |
+| `filter (u => boolExpr)` | keep rows matching a predicate | `WHERE ...` / `HAVING ...` |
 | `map (u => { a = expr, ... })` | project one record per row | `SELECT ...` |
 | `select ["id", "name"]` | project only the listed columns | `SELECT id, name` |
 | `sort (u => [asc u.a, desc u.b])` | ORDER BY | `ORDER BY ... ASC, ... DESC` |

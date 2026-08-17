@@ -14,7 +14,7 @@ export { collectModuleTree, moduleOf } from './imports.js';
 export type { ProjectModule, ModuleTree, ModuleTreeOptions, ResolvedImportEdge } from './imports.js';
 export { checkProject } from './checker.js';
 export type { CheckProjectOptions, CheckProjectResult } from './checker.js';
-export { standardPrelude, STANDARD_PRELUDE_SOURCE } from './prelude.js';
+export { standardPrelude, standardPreludeNames, STANDARD_PRELUDE_SOURCE } from './prelude.js';
 export { BINARY_OPERATORS, isBinaryOperator, sectionName, sectionSpelling } from './operators.js';
 export type { BinaryOperator } from './operators.js';
 export { renderQuery, renderQueryWithCtes, DIALECTS, isDialect } from './render.js';

@@ -1,12 +1,12 @@
 /******************************************************************************
- * tetaue builtin catalog — the single source of truth for the prelude.
+ * tetaue primitive builtin catalog — the single source of truth for the core.
  *
- * Every builtin's STATIC TYPE SCHEME lives here, declared once, and the type
- * inference pass builds its environment from this table (see inference.ts
- * `prelude()`). The interpreter's runtime implementations stay in
+ * Every core primitive's STATIC TYPE SCHEME lives here, declared once, and the
+ * type inference pass builds its primitive environment from this table (see
+ * inference.ts `prelude()`). The runtime implementations stay in
  * interpreter.ts (`BUILTINS`) — this catalog and that table are checked for
- * name parity by test/catalog.test.ts, so a builtin can never exist on one
- * side without the other.
+ * name parity by test/catalog.test.ts. Derived public functions live in
+ * prelude.tetaue and therefore do not appear in either table.
  *
  * The schemes encode the DSL's MODES as types:
  *   - join kinds are a dedicated `jkind` type, so `join "inner"` is a type
@@ -230,18 +230,14 @@ export const BUILTIN_SPECS = [
 ] as const satisfies readonly BuiltinSpec[];
 
 /**
- * Names whose scheme is an alias of another builtin's (same typing, e.g.
- * `filtered` = `filter`, `is_not_in` = `is_in`). The inference pass copies
- * the target's scheme under the alias name.
+ * Core names whose scheme matches another primitive even though their runtime
+ * behavior differs (for example `is_not_in` and `is_in`). The inference pass
+ * copies the target's scheme under the second name.
  */
 export const BUILTIN_ALIASES = {
-    filtered: 'filter',
     is_not_in: 'is_in',
     right_substring: 'left_substring',
     like: 'regex_like',
-    is_not_null: 'is_null',
-    is_nothing: 'is_null',
-    is_just: 'is_null',
     try_cast: 'cast',
     least: 'greatest',
     rpad: 'lpad',

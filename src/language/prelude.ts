@@ -37,6 +37,11 @@ export const = x => y => x
 export compose = f => g => x => f (g x)
 export flip = f => x => y => f y x
 export pipe = f => g => x => g (f x)
+
+# Derived Maybe helpers belong here rather than in the SQL core.
+export is_nothing = is_null
+export is_just = x => not (is_null x)
+export is_not_null = is_just
 `;
 
 /** Parse the embedded standard library using the caller's language services. */
@@ -54,4 +59,11 @@ export function standardPrelude(services: TetaueServices): ProjectModule {
         uri: 'tetaue:prelude',
         imports: [],
     };
+}
+
+/** Public names supplied by the source prelude rather than the primitive core. */
+export function standardPreludeNames(services: TetaueServices): readonly string[] {
+    return standardPrelude(services).model.bindings
+        .filter(binding => binding.export)
+        .map(binding => binding.name);
 }
