@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { parseModel, typeErrors, allErrors, render } from './helpers.ts';
+import { parseModel, typeErrors, allErrors, render, services } from './helpers.ts';
 import { checkProject } from '../src/language/checker.ts';
 import {
-    TypeUniverse, UnifyError, type Type,
+    ConstraintError, TypeUniverse, UnifyError, type Type,
     fun, listOf, maybeOf, prim, queryOf, rowOf,
 } from '../src/language/types.ts';
 import { inferProject } from '../src/language/inference.ts';
+import { standardPrelude } from '../src/language/prelude.ts';
 import type { ProjectModule } from '../src/language/imports.ts';
 
 const USERS = `users: query {
@@ -99,6 +100,24 @@ describe('type engine', () => {
             restore();
         }
     });
+
+    test('class constraints survive schemes and failed constrained unification rolls back', () => {
+        const u = new TypeUniverse();
+        const a = u.fresh();
+        u.constrain(a, 'Num');
+        const numericIdentity = u.generalize([], fun(a, a));
+        expect(u.pretty(numericIdentity.type)).toMatch(/^Num (t\d*) => \1 -> \1$/);
+
+        const invalid = u.instantiate(numericIdentity);
+        expect(() => u.unify(invalid, fun(prim('string'), prim('string')))).toThrow(ConstraintError);
+
+        const valid = u.instantiate(numericIdentity);
+        expect(() => u.unify(valid, fun(prim('decimal'), prim('decimal')))).not.toThrow();
+
+        const transactional = u.fresh();
+        expect(() => u.unifyConstrained(transactional, prim('string'), 'Num')).toThrow(ConstraintError);
+        expect(() => u.unify(transactional, prim('int'))).not.toThrow();
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -136,7 +155,7 @@ describe('row polymorphism', () => {
         `)).toEqual([]);
         expect(typeErrors(`${USERS}
             orders: query { user_id: int } = table "orders"
-            q = users & join inner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, oid = r.user_id })
+            q = users & joinInner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, oid = r.user_id })
         `)).toEqual([]);
         expect(typeErrors(`${USERS}
             adult = u => u.age >= 18
@@ -145,7 +164,7 @@ describe('row polymorphism', () => {
         expect(typeErrors(`${USERS}
             adult = u => u.age >= 18
             q = users & filter (adult <<< (x => x + 1))
-        `).join('\n')).toContain('cannot compose');
+        `).join('\n')).toContain('cannot apply');
     });
 
     test('row polymorphism survives map projections (the row narrows)', () => {
@@ -158,10 +177,38 @@ describe('row polymorphism', () => {
 // ---------------------------------------------------------------------------
 
 describe('strict numerics', () => {
+    test('arithmetic lambdas retain a Num constraint after generalization', () => {
+        const model = parseModel('add = x => y => x + y\nnegate = x => -x\nq = add');
+        const result = inferProject(
+            [{ model, uri: undefined, imports: [] }],
+            new Map(),
+            standardPrelude(services),
+        );
+        expect(result.typeOf(model.bindings[0]!)).toBe('Num t => t -> t -> t');
+        expect(result.typeOf(model.bindings[1]!)).toBe('Num t => t -> t');
+        expect(result.diagnostics).toEqual([]);
+
+        expect(typeErrors('add = x => y => x + y\nq = add "a" "b"')).toEqual([
+            'Num requires a numeric type, got string',
+        ]);
+        expect(typeErrors('negate = x => -x\nq = negate "a"')).toEqual([
+            'Num requires a numeric type, got string',
+        ]);
+    });
+
     test('int/float do not mix', () => {
         expect(typeErrors(`${USERS}\nq = users & map (u => { x = 1 + 2.5 })`).join('\n')).toContain('of the same type');
         expect(typeErrors(`${USERS}\nq = users & map (u => { x = u.age + 1.5 })`).join('\n')).toContain('cannot mix int and float');
         expect(typeErrors(`${USERS}\nq = users & filter (u => u.age >= 100.0)`).join('\n')).toContain('cannot mix int and float');
+    });
+
+    test('decimal is a Num instance and still does not mix with other numeric types', () => {
+        const direct = `d: decimal = cast 1 "decimal"\ni: int = 1\nq = d + i`;
+        expect(typeErrors(direct).join('\n')).toContain('numeric operands of the same type');
+
+        const throughRow = `orders: query { total: decimal } = table "orders"
+q = orders & map (o => { x = o.total + 1 })`;
+        expect(typeErrors(throughRow).join('\n')).toContain('cannot mix numeric types (decimal vs int)');
     });
 
     test('matching numerics are fine', () => {
@@ -173,6 +220,36 @@ describe('strict numerics', () => {
     test('a decimal literal is float even when its value is integral (100.0)', () => {
         // 100.0 is float by syntax, so comparing a float column with it is fine.
         expect(typeErrors(`orders: query { total: float } = table "orders"\nq = orders & filter (o => o.total >= 100.0)`)).toEqual([]);
+    });
+});
+
+describe('closed typeclass instances', () => {
+    test('container classes have explicit closed instances', () => {
+        const u = new TypeUniverse();
+        expect(() => u.constrain(maybeOf(prim('int')), 'Applicative')).not.toThrow();
+        expect(() => u.constrain(listOf(prim('int')), 'Alternative')).not.toThrow();
+        expect(() => u.constrain(listOf(prim('int')), 'Monad')).not.toThrow();
+        expect(() => u.constrain(queryOf(rowOf([['id', prim('int')]])), 'Functor')).not.toThrow();
+        expect(() => u.constrain(queryOf(rowOf([['id', prim('int')]])), 'Monad')).toThrow(ConstraintError);
+    });
+
+    test('Eq and Ord cover the supported scalar primitives', () => {
+        const source = `users: query { id: int, name: string, active: bool } = table "users"
+q = users & filter (u => u.id >= 1 && u.name < "z" && u.active == true)`;
+        expect(typeErrors(source)).toEqual([]);
+    });
+
+    test('record equality and unsupported semigroup operands are rejected', () => {
+        const equality = `q = table "users" & filter (u => { id = u.id } == { id = 1 })`;
+        expect(typeErrors(equality).join('\n')).toContain('cannot compare');
+        const semigroup = `q = table "users" & map (u => { value = u.id <> 1 })`;
+        expect(typeErrors(semigroup).join('\n')).toContain('Semigroup');
+    });
+
+    test('string and list semigroup operations type-check', () => {
+        expect(typeErrors(`q = table "users" & map (u => { value = u.name <> "!" })`)).toEqual([]);
+        expect(typeErrors(`values = [1, 2] <> [3]
+q = table "users"`)).toEqual([]);
     });
 });
 
@@ -216,7 +293,11 @@ users: UserRow = table "users"
 q = users & filter (adult) & map (u => { id, name })`;
         expect(typeErrors(src)).toEqual([]);
         const model = parseModel(src);
-        const result = inferProject([{ model, uri: undefined, imports: [] }]);
+        const result = inferProject(
+            [{ model, uri: undefined, imports: [] }],
+            new Map(),
+            standardPrelude(services),
+        );
         const usersBinding = model.bindings.find(b => b.name === 'users')!;
         expect(result.typeOf(usersBinding)).toBe('query { age: int, id: int, name: string }');
     });
@@ -235,7 +316,7 @@ describe('annotations and ascription', () => {
         // The annotation becomes the binding type, so applying the closed-row
         // predicate to a wider users row is a static row mismatch.
         const messages = typeErrors(`${USERS}\nadult: { age: int } -> bool = u => u.age >= 18\nq = users & filter (adult)`);
-        expect(messages.join('\n')).toContain('cannot apply a function of type query { age: int } -> query { age: int }');
+        expect(messages.join('\n')).toContain('to an argument of type query { age: int } -> query { age: int }');
     });
 
     test('binding annotation missing the used field is an error', () => {
@@ -323,12 +404,12 @@ describe('type errors', () => {
     test('join overlap is not an error — the merger picks the output row', () => {
         const messages = allErrors(`${USERS}
             orders: query { id: int, user_id: int } = table "orders"
-            q = users & join inner orders (l => r => l.id == r.id) (l => r => { left_id = l.id, right_id = r.id })
+            q = users & joinInner orders (l => r => l.id == r.id) (l => r => { left_id = l.id, right_id = r.id })
         `);
         expect(messages).toEqual([]);
         const sql = render(`${USERS}
             orders: query { id: int, user_id: int } = table "orders"
-            q = users & join inner orders (l => r => l.id == r.id) (l => r => { left_id = l.id, right_id = r.id })
+            q = users & joinInner orders (l => r => l.id == r.id) (l => r => { left_id = l.id, right_id = r.id })
         `);
         expect(sql).toContain('ON users.id = orders.id');
         expect(sql).toContain('users.id AS left_id');
@@ -360,7 +441,11 @@ users: query { id: int } = table "users"
 q = users & map (u => { id = f u.id })`;
         expect(typeErrors(holes)).toEqual([]);
         const model = parseModel('t = table "users"');
-        const result = inferProject([{ model, uri: undefined, imports: [] }]);
+        const result = inferProject(
+            [{ model, uri: undefined, imports: [] }],
+            new Map(),
+            standardPrelude(services),
+        );
         expect(result.typeOf(model.bindings[0]!)).toBe('query ?table_users');
     });
 
@@ -388,7 +473,7 @@ q = users & map (u => { id = f u.id })`;
     });
 
     test('dynamic joins qualify both sides', () => {
-        const sql = render(`users = table "users"\norders = table "orders"\nq = users & join inner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }`);
+        const sql = render(`users = table "users"\norders = table "orders"\nq = users & joinInner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }`);
         expect(sql).toContain('ON users.id = orders.user_id');
     });
 
@@ -463,7 +548,7 @@ describe('paren-free application', () => {
     });
 
     test('join with a bare-identifier right side still works', () => {
-        const src = `users: query { id: int } = table "users"\norders: query { user_id: int } = table "orders"\nq = users & join inner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }`;
+        const src = `users: query { id: int } = table "users"\norders: query { user_id: int } = table "orders"\nq = users & joinInner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }`;
         expect(typeErrors(src)).toEqual([]);
     });
 
@@ -502,7 +587,7 @@ describe('imports', () => {
             uri: 'main.tetaue',
             imports: [{ alias: undefined, target: tables, importNode: rootModel.imports[0]! }],
         };
-        const { diagnostics } = inferProject([tables, root]);
+        const { diagnostics } = inferProject([tables, root], new Map(), standardPrelude(services));
         expect(diagnostics).toEqual([]);
     });
 
@@ -524,7 +609,7 @@ describe('imports', () => {
             uri: 'main.tetaue',
             imports: [{ alias: 'h', target: helpers, importNode: rootModel.imports[0]! }],
         };
-        const { diagnostics } = inferProject([helpers, root]);
+        const { diagnostics } = inferProject([helpers, root], new Map(), standardPrelude(services));
         expect(diagnostics).toEqual([]);
     });
 
@@ -544,25 +629,26 @@ describe('imports', () => {
             uri: 'main.tetaue',
             imports: [{ alias: 'h', target: helpers, importNode: rootModel.imports[0]! }],
         };
-        const { diagnostics } = inferProject([helpers, root]);
+        const { diagnostics } = inferProject([helpers, root], new Map(), standardPrelude(services));
         expect(diagnostics.map(d => d.message).join('\n')).toContain("module 'h' has no exported binding 'adult'");
     });
 });
 
 // ---------------------------------------------------------------------------
-// DSL modes are types: jkind, order, aggregate/group (B)
+// DSL modes are types: order and aggregate/group (B)
 // ---------------------------------------------------------------------------
 
 describe('DSL modes are static types', () => {
-    test('join kinds are a dedicated type — a string kind is a type error', () => {
-        const src = `${USERS}\norders: query { user_id: int } = table "orders"\nq = users & join "inner" orders (l => r => l.id == r.user_id) (l => r => { uid = l.id })`;
+    test('the removed general join is not in the public prelude', () => {
+        const src = `${USERS}\norders: query { user_id: int } = table "orders"\nq = users & join orders (l => r => l.id == r.user_id) (l => r => { uid = l.id })`;
         const messages = allErrors(src);
-        expect(messages.join('\n')).toContain('join expects a join kind as its first argument: inner, left, right or full');
-        expect(messages.length).toBe(1); // interpreter + inference dedupe on (node, message)
+        expect(messages.join('\n')).toContain("unknown identifier 'join'");
     });
 
-    test('join with a bare kind still type-checks', () => {
-        expect(typeErrors(`${USERS}\norders: query { user_id: int } = table "orders"\nq = users & join inner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id })`)).toEqual([]);
+    test('all fixed-kind joins type-check', () => {
+        for (const name of ['joinInner', 'joinLeft', 'joinRight', 'joinFull']) {
+            expect(typeErrors(`${USERS}\norders: query { user_id: int } = table "orders"\nq = users & ${name} orders (l => r => l.id == r.user_id) (l => r => { uid = l.id })`)).toEqual([]);
+        }
     });
 
     test('sort requires order items, not a plain column', () => {
@@ -591,7 +677,7 @@ describe('DSL modes are static types', () => {
     });
 
     test('a fold result row is plain: HAVING filters and ORDER BY on aggregate columns work', () => {
-        const src = `${USERS}\norders: query { user_id: int, total: float } = table "orders"\nq = users\n    & join inner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, total = r.total })\n    & fold (r => { uid = group r.uid, total = sum r.total })\n    & filter (r => from_maybe 0.0 r.total > 100.0)\n    & sort (r => [desc r.total])`;
+        const src = `${USERS}\norders: query { user_id: int, total: float } = table "orders"\nq = users\n    & joinInner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, total = r.total })\n    & fold (r => { uid = group r.uid, total = sum r.total })\n    & filter (r => from_maybe 0.0 r.total > 100.0)\n    & sort (r => [desc r.total])`;
         expect(typeErrors(src)).toEqual([]);
     });
 
@@ -609,7 +695,11 @@ describe('DSL modes are static types', () => {
 describe('review fixes: composition types, merge partials, shadowing, case nullability', () => {
     function typeOf(text: string, binding: string): string | undefined {
         const model = parseModel(text);
-        const result = inferProject([{ model, uri: undefined, imports: [] }]);
+        const result = inferProject(
+            [{ model, uri: undefined, imports: [] }],
+            new Map(),
+            standardPrelude(services),
+        );
         const b = model.bindings.find(x => x.name === binding);
         return b ? result.typeOf(b) : undefined;
     }
@@ -637,14 +727,18 @@ q = users & map (u => extend u)`;
 
     test('closed-row binding annotations now narrow downstream applications', () => {
         const messages = typeErrors(`${USERS}\nadult: { age: int } -> bool = u => u.age >= 18\nq = users & filter (adult)`);
-        expect(messages.join('\n')).toContain('cannot apply a function of type query { age: int } -> query { age: int }');
+        expect(messages.join('\n')).toContain('to an argument of type query { age: int } -> query { age: int }');
     });
 });
 
 describe('post-review design fixes', () => {
     function typeOf(text: string, binding: string): string | undefined {
         const model = parseModel(text);
-        const result = inferProject([{ model, uri: undefined, imports: [] }]);
+        const result = inferProject(
+            [{ model, uri: undefined, imports: [] }],
+            new Map(),
+            standardPrelude(services),
+        );
         const b = model.bindings.find(x => x.name === binding);
         return b ? result.typeOf(b) : undefined;
     }
@@ -657,12 +751,18 @@ q = users & map (u => { n = param "x" + 1, s = upper (param "x") })`;
         expect(allErrors(ok)).toEqual([]);
     });
 
-    test('join ... merge keeps the full outer-join row and maybe types', () => {
-        const src = `a: query { id: int, x: string } = table "a"
+    test('fixed join functions preserve inner types and make outer results nullable', () => {
+        const source = (name: string) => `a: query { id: int, x: string } = table "a"
 b: query { id: int, y: string } = table "b"
-q = a & join left b (l => r => l.id == r.id) merge`;
-        expect(typeErrors(src)).toEqual([]);
-        expect(typeOf(src, 'q')).toBe('query { id: (maybe int), x: (maybe string), y: (maybe string) }');
+q = a & ${name} b (l => r => l.id == r.id) merge`;
+        const inner = source('joinInner');
+        expect(typeErrors(inner)).toEqual([]);
+        expect(typeOf(inner, 'q')).toBe('query { id: int, x: string, y: string }');
+        for (const name of ['joinLeft', 'joinRight', 'joinFull']) {
+            const outer = source(name);
+            expect(typeErrors(outer)).toEqual([]);
+            expect(typeOf(outer, 'q')).toBe('query { id: (maybe int), x: (maybe string), y: (maybe string) }');
+        }
     });
 
     test('group_by allows grouping without aggregates', () => {

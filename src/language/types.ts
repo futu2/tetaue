@@ -8,6 +8,7 @@
  *     distinct type constructor: `T` and `maybe T` never unify, so
  *     nullability is always explicit;
  *   - the parameterized `query { row }` type for tables/pipelines.
+ *   - constrained variables such as `Num t`, preserved by type schemes.
  *
  * Variables are kind-flexible (a fresh variable becomes a row variable the
  * first time it is unified with a row) and live in a mutable binding store
@@ -17,6 +18,34 @@
  ******************************************************************************/
 
 export type PrimName = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' | 'timestamp';
+export type ScalarTypeClass = 'Num' | 'Eq' | 'Ord' | 'Semigroup' | 'Monoid';
+export type ContainerTypeClass = 'Functor' | 'Applicative' | 'Alternative' | 'Monad';
+export type TypeClass = ScalarTypeClass | ContainerTypeClass;
+
+const TYPE_CLASS_INSTANCES: Readonly<Record<ScalarTypeClass, ReadonlySet<PrimName>>> = {
+    Num: new Set(['int', 'float', 'decimal']),
+    Eq: new Set(['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']),
+    Ord: new Set(['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']),
+    Semigroup: new Set(['string']),
+    Monoid: new Set(['string']),
+};
+
+/** Whether a primitive type implements one of the compiler-owned classes. */
+export function isTypeClassInstance(constraint: ScalarTypeClass, type: PrimName): boolean {
+    return TYPE_CLASS_INSTANCES[constraint].has(type);
+}
+
+/** Closed higher-kinded instances supported by the current runtime. */
+export type FunctorName = 'maybe' | 'list' | 'query';
+
+export function isFunctorInstance(name: FunctorName): boolean {
+    return name === 'maybe' || name === 'list' || name === 'query';
+}
+
+export function isContainerTypeClassInstance(constraint: ContainerTypeClass, name: FunctorName): boolean {
+    if (constraint === 'Functor') return isFunctorInstance(name);
+    return name === 'maybe' || name === 'list';
+}
 
 export type Type =
     | { kind: 'var'; id: number }
@@ -31,8 +60,6 @@ export type Type =
     | { kind: 'query'; row: Type }
     /** An ORDER BY item (`asc`/`desc`). */
     | { kind: 'order' }
-    /** A join kind constant (`inner`, `left`, `right`, `full`). */
-    | { kind: 'jkind' }
     /**
      * A prelude builtin reference. Transparent in unification and pretty
      * printing, but the tag survives generalization/instantiation so a
@@ -67,12 +94,14 @@ export interface VarInfo {
      * binding shares one unsolved metavariable until unification fills it.
      */
     hole: boolean;
+    /** Type-class constraints which must hold when this variable is bound. */
+    classes: ReadonlySet<TypeClass>;
     absorbAsMaybe?: boolean;
 }
 
 export interface Scheme {
     /** Quantified variables, in order. */
-    vars: { id: number; kind: VarKind; name: string | null }[];
+    vars: { id: number; kind: VarKind; name: string | null; classes: readonly TypeClass[] }[];
     type: Type;
 }
 
@@ -84,6 +113,16 @@ export class UnifyError extends Error {
         super('cannot unify');
         this.a = a;
         this.b = b;
+    }
+}
+
+/** Raised when a type does not implement a required type class. */
+export class ConstraintError extends UnifyError {
+    constraint: TypeClass;
+    constructor(constraint: TypeClass, type: Type) {
+        super(type, type);
+        this.constraint = constraint;
+        this.message = `type does not implement ${constraint}`;
     }
 }
 
@@ -124,10 +163,6 @@ export function builtinOf(name: string, of: Type): Type {
     return { kind: 'builtin', name, of };
 }
 
-export function jkindType(): Type {
-    return { kind: 'jkind' };
-}
-
 /** Wrap `t` in the aggregate mode: `agg t` ("an aggregate of `t`"). */
 export function aggOf(t: Type): Type {
     return t.kind === 'agg' ? t : { kind: 'agg', of: t };
@@ -158,16 +193,35 @@ export class TypeUniverse {
     private infos = new Map<number, VarInfo>();
     private nextId = 1;
 
-    fresh(kind: 'flex' | 'type' | 'row' = 'flex', name: string | null = null): Type {
+    fresh(
+        kind: 'flex' | 'type' | 'row' = 'flex',
+        name: string | null = null,
+        classes: readonly TypeClass[] = [],
+    ): Type {
         const id = this.nextId++;
-        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name, hole: false, absorbAsMaybe: false });
+        const constrainedKind = kind === 'flex' && classes.length > 0 ? 'type' : kind;
+        this.infos = new Map(this.infos).set(id, {
+            kind: constrainedKind,
+            rigid: false,
+            name,
+            hole: false,
+            classes: new Set(classes),
+            absorbAsMaybe: false,
+        });
         return { kind: 'var', id };
     }
 
     /** Create a hole (`?name`): flexible, named, and never generalized. */
     freshHole(kind: 'flex' | 'type' | 'row' = 'flex', name: string): Type {
         const id = this.nextId++;
-        this.infos = new Map(this.infos).set(id, { kind, rigid: false, name, hole: true, absorbAsMaybe: false });
+        this.infos = new Map(this.infos).set(id, {
+            kind,
+            rigid: false,
+            name,
+            hole: true,
+            classes: new Set(),
+            absorbAsMaybe: false,
+        });
         return { kind: 'var', id };
     }
 
@@ -189,6 +243,54 @@ export class TypeUniverse {
         const info = this.infos.get(id);
         if (!info) throw new Error(`unknown type variable ${id}`);
         this.infos = new Map(this.infos).set(id, { ...info, absorbAsMaybe });
+    }
+
+    /** Require `t` to implement a type class, preserving the constraint on variables. */
+    constrain(t: Type, constraint: TypeClass): void {
+        const snapshot = this.snapshot();
+        try {
+            this.constrainInternal(t, constraint);
+        } catch (err) {
+            this.restore(snapshot);
+            throw err;
+        }
+    }
+
+    private constrainInternal(t: Type, constraint: TypeClass): void {
+        const r = this.resolve(t);
+        if (r.kind === 'var') {
+            const info = this.varInfo(r.id);
+            if (info.kind === 'row') throw new ConstraintError(constraint, r);
+            if (!info.classes.has(constraint)) {
+                this.infos = new Map(this.infos).set(r.id, {
+                    ...info,
+                    kind: info.kind === 'flex' ? 'type' : info.kind,
+                    classes: new Set([...info.classes, constraint]),
+                });
+            }
+            return;
+        }
+        const functorName: FunctorName | null = r.kind === 'maybe' || r.kind === 'list' || r.kind === 'query'
+            ? r.kind
+            : null;
+        if ((constraint === 'Functor' || constraint === 'Applicative' || constraint === 'Alternative' || constraint === 'Monad')
+            && functorName !== null && isContainerTypeClassInstance(constraint, functorName)) {
+            return;
+        }
+        if (r.kind === 'builtin' || r.kind === 'maybe' || r.kind === 'agg'
+            || r.kind === 'group' || r.kind === 'window') {
+            this.constrainInternal(r.of, constraint);
+            return;
+        }
+        if (r.kind === 'list' && (constraint === 'Semigroup' || constraint === 'Monoid')) {
+            return;
+        }
+        if (r.kind === 'prim'
+            && constraint !== 'Functor' && constraint !== 'Applicative' && constraint !== 'Alternative' && constraint !== 'Monad'
+            && isTypeClassInstance(constraint, r.name)) {
+            return;
+        }
+        throw new ConstraintError(constraint, r);
     }
 
     /** Follow variable bindings to the root type. */
@@ -231,7 +333,7 @@ export class TypeUniverse {
                 case 'query': visit(r.row); break;
                 case 'builtin':
                 case 'agg': case 'group': case 'window': visit(r.of); break;
-                case 'prim': case 'truth': case 'order': case 'jkind': break;
+                case 'prim': case 'truth': case 'order': break;
             }
         };
         visit(t);
@@ -262,11 +364,20 @@ export class TypeUniverse {
             if (thisKind === 'type' && other.kind === 'row') {
                 throw new UnifyError({ kind: 'var', id: varId }, t);
             }
+            let otherKind = other.kind;
             if (thisKind === 'row') {
-                this.infos = new Map(this.infos).set(r.id, { ...other, kind: 'row', absorbAsMaybe: info.absorbAsMaybe || other.absorbAsMaybe });
+                otherKind = 'row';
+            } else if (thisKind === 'type' && other.kind === 'flex') {
+                otherKind = 'type';
             } else if (other.kind === 'row') {
                 thisKind = 'row';
             }
+            this.infos = new Map(this.infos).set(r.id, {
+                ...other,
+                kind: otherKind,
+                classes: new Set([...other.classes, ...info.classes]),
+                absorbAsMaybe: info.absorbAsMaybe || other.absorbAsMaybe,
+            });
         } else {
             // Kind discipline against concrete types: a row-pinned variable
             // can only bind to rows, and a type-pinned variable only to
@@ -278,6 +389,7 @@ export class TypeUniverse {
             } else if (thisKind === 'type' && r.kind === 'row') {
                 throw new UnifyError({ kind: 'var', id: varId }, t);
             }
+            for (const constraint of info.classes) this.constrainInternal(r, constraint);
         }
         if (thisKind !== info.kind) {
             this.infos = new Map(this.infos).set(varId, { ...info, kind: thisKind });
@@ -293,6 +405,19 @@ export class TypeUniverse {
         const snapshot = this.snapshot();
         try {
             return this.unifyInternal(a, b);
+        } catch (err) {
+            this.restore(snapshot);
+            throw err;
+        }
+    }
+
+    /** Unify two types and require the result to implement a class atomically. */
+    unifyConstrained(a: Type, b: Type, constraint: TypeClass): Type {
+        const snapshot = this.snapshot();
+        try {
+            const unified = this.unifyInternal(a, b);
+            this.constrainInternal(unified, constraint);
+            return unified;
         } catch (err) {
             this.restore(snapshot);
             throw err;
@@ -397,9 +522,6 @@ export class TypeUniverse {
                 break;
             case 'order':
                 if (b.kind === 'order') return a;
-                break;
-            case 'jkind':
-                if (b.kind === 'jkind') return a;
                 break;
             case 'window':
                 if (b.kind === 'window') {
@@ -579,7 +701,12 @@ export class TypeUniverse {
         return {
             vars: free.map(id => {
                 const info = this.infos.get(id)!;
-                return { id, kind: info.kind === 'row' ? 'row' : 'type', name: info.name };
+                return {
+                    id,
+                    kind: info.kind === 'row' ? 'row' : 'type',
+                    name: info.name,
+                    classes: [...info.classes],
+                };
             }),
             type: t,
         };
@@ -590,7 +717,7 @@ export class TypeUniverse {
         if (s.vars.length === 0) return s.type;
         const subst = new Map<number, Type>();
         for (const v of s.vars) {
-            const fresh = this.fresh(v.kind === 'row' ? 'row' : 'flex', v.name);
+            const fresh = this.fresh(v.kind === 'row' ? 'row' : 'flex', v.name, v.classes);
             subst.set(v.id, fresh);
         }
         return this.substitute(subst, s.type);
@@ -632,7 +759,7 @@ export class TypeUniverse {
             case 'agg': return aggOf(this.substitute(subst, r.of));
             case 'group': return groupOf(this.substitute(subst, r.of));
             case 'window': return windowOf(this.substitute(subst, r.of));
-            case 'prim': case 'truth': case 'order': case 'jkind': return r;
+            case 'prim': case 'truth': case 'order': return r;
         }
     }
 
@@ -684,10 +811,17 @@ export class TypeUniverse {
                     return paren ? `(${s})` : s;
                 }
                 case 'order': return 'order';
-                case 'jkind': return 'join kind';
             }
         };
-        return p(t, false);
+        const body = p(t, false);
+        const constraints: string[] = [];
+        for (const id of this.freeVars(t)) {
+            const info = this.varInfo(id);
+            for (const typeClass of info.classes) {
+                constraints.push(`${typeClass} ${p({ kind: 'var', id }, false)}`);
+            }
+        }
+        return constraints.length > 0 ? `${constraints.join(', ')} => ${body}` : body;
     }
 
     /** Pretty-print a row for "available: ..." lists: `id, name, age`. */

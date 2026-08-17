@@ -110,6 +110,25 @@ describe('dialect capability fixes execute on SQLite', () => {
         expect(sql).toContain(`LPAD(a, 3, ' ') AS l`);
         expect(sql).toContain(`RPAD(a, 3, ' ') AS r`);
     });
+
+    test('lpad/rpad fallbacks pad and truncate correctly on SQLite', () => {
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE t (a text)');
+        db.run("INSERT INTO t VALUES ('ab'), ('abcdef')");
+        const sql = render(`t: query { a: string } = table "t"\nq = t & map (u => { l = lpad [u.a, 4, "0"], r = rpad [u.a, 4, "0"] })`);
+        expect(db.query(sql).all()).toEqual([
+            { l: '00ab', r: 'ab00' },
+            { l: 'abcd', r: 'abcd' },
+        ]);
+    });
+
+    test('reverse fallback executes without a SQLite extension', () => {
+        const db = new Database(':memory:');
+        db.run('CREATE TABLE t (a text)');
+        db.run("INSERT INTO t VALUES ('abcd'), ('')");
+        const sql = render(`t: query { a: string } = table "t"\nq = t & map (u => { r = reverse u.a })`);
+        expect(db.query(sql).all()).toEqual([{ r: 'dcba' }, { r: '' }]);
+    });
 });
 
 describe('count_distinct aggregate', () => {

@@ -14,79 +14,6 @@ export interface CapabilityDiagnostic {
     node?: unknown;
 }
 
-function stringLiteral(node: SqlNode | undefined): string | null {
-    return node?.kind === 'lit' && typeof node.value === 'string' ? node.value : null;
-}
-
-function numberLiteral(node: SqlNode | undefined): number | null {
-    return node?.kind === 'lit' && typeof node.value === 'number' ? node.value : null;
-}
-
-function checkCall(node: Extract<SqlNode, { kind: 'call' }>, dialect: DialectSpec, diagnostics: CapabilityDiagnostic[]): void {
-    const d = dialect.name;
-    switch (node.name) {
-        case 'reverse':
-            if (d === 'sqlite') diagnostics.push({ message: `reverse is not supported for the sqlite dialect`, node });
-            break;
-        case 'lpad': case 'rpad':
-            if (d === 'sqlite') diagnostics.push({ message: `${node.name} is not supported for the sqlite dialect`, node });
-            break;
-        case 'regex_like':
-            if (d === 'sqlite') diagnostics.push({ message: `regex_like is not supported for the sqlite dialect`, node });
-            break;
-        case 'regex_replace':
-            if (d === 'sqlite') diagnostics.push({ message: `regex_replace is not supported for the sqlite dialect`, node });
-            break;
-        case 'regex_extract': {
-            if (d === 'mysql' || d === 'sqlite') {
-                diagnostics.push({ message: `regex_extract is not supported for the ${d} dialect`, node });
-            } else if ((d === 'postgresql' || d === 'hive') && node.args[2]) {
-                diagnostics.push({ message: `regex_extract group argument is not supported for the ${d} dialect`, node });
-            }
-            break;
-        }
-        case 'try_cast':
-            if (d !== 'trino') diagnostics.push({ message: `try_cast is not supported for the ${d} dialect`, node });
-            break;
-        case 'cast':
-            if (d === 'sqlite' && stringLiteral(node.args[1]) === 'bool') {
-                diagnostics.push({ message: `casting to bool is not supported for the sqlite dialect`, node });
-            }
-            break;
-        case 'date_add': {
-            if (d === 'sqlite' && numberLiteral(node.args[2]) === null) {
-                diagnostics.push({ message: `date_add with a non-literal amount is not supported for the sqlite dialect`, node });
-            }
-            break;
-        }
-        case 'date_diff': {
-            const unit = stringLiteral(node.args[1]) ?? 'day';
-            if (d === 'sqlite' && !new Set(['day', 'hour', 'minute', 'second']).has(unit)) {
-                diagnostics.push({ message: `date_diff unit '${unit}' is not supported for the sqlite dialect — supported: day, hour, minute, second`, node });
-            } else if (d === 'hive' && unit !== 'day') {
-                diagnostics.push({ message: `date_diff unit '${unit}' is not supported for the hive dialect — supported: day`, node });
-            }
-            break;
-        }
-        case 'date_trunc': {
-            const unit = stringLiteral(node.args[1]) ?? 'day';
-            if (d === 'mysql') {
-                diagnostics.push({ message: `date_trunc is not supported for the mysql dialect`, node });
-            } else if (d === 'sqlite' && !new Set(['year', 'month', 'day']).has(unit)) {
-                diagnostics.push({ message: `date_trunc unit '${unit}' is not supported for the sqlite dialect — supported: year, month, day`, node });
-            } else if (d === 'hive' && !new Set(['year', 'month', 'week', 'day']).has(unit)) {
-                diagnostics.push({ message: `date_trunc unit '${unit}' is not supported for the hive dialect — supported: year, month, week, day`, node });
-            }
-            break;
-        }
-        case 'date_parse':
-            if (d === 'hive') {
-                diagnostics.push({ message: `date_parse is not supported for the hive dialect — use date_format with to_unixtime/from_unixtime instead`, node });
-            }
-            break;
-    }
-}
-
 function walkRow(row: RowNode, dialect: DialectSpec, diagnostics: CapabilityDiagnostic[], seen: Set<Query>): void {
     for (const field of row.fields) walkExpr(field.node, dialect, diagnostics, seen);
 }
@@ -105,7 +32,8 @@ function walkExpr(node: SqlNode, dialect: DialectSpec, diagnostics: CapabilityDi
             walkExpr(node.expr, dialect, diagnostics, seen);
             return;
         case 'call':
-            checkCall(node, dialect, diagnostics);
+            // Every public scalar/date call has a lowering in every built-in
+            // dialect. Capability checks are only needed for query shape.
             node.args.forEach(arg => walkExpr(arg, dialect, diagnostics, seen));
             return;
         case 'agg':
@@ -200,4 +128,3 @@ export function checkDialectCapabilities(query: Query, dialect: DialectSpec): Ca
     walkQuery(query, dialect, diagnostics, new Set());
     return diagnostics;
 }
-

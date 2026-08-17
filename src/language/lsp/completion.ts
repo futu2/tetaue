@@ -21,7 +21,6 @@ import {
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, Range, TextEdit,
 } from 'vscode-languageserver';
 import type { TetaueServices } from '../tetaue-module.js';
-import { BUILTINS } from '../interpreter.js';
 import { checkProject } from '../checker.js';
 import { projectTreeFor } from '../compile.js';
 import { isAccessExpression, isApplication, isIdentifier } from '../generated/ast.js';
@@ -32,14 +31,12 @@ import { standardPrelude, standardPreludeNames } from '../prelude.js';
 /** Synthetic property inserted after the dot so the access parses. */
 const DUMMY = '_tetaue_field';
 
-const STEP_NAMES = new Set(['filter', 'map', 'sort', 'take', 'distinct', 'fold', 'group_by', 'join', 'join_lateral', 'select']);
+const STEP_NAMES = new Set(['filter', 'map', 'sort', 'take', 'distinct', 'fold', 'group_by', 'joinInner', 'joinLeft', 'joinRight', 'joinFull', 'join_lateral', 'select']);
 const AGG_NAMES = new Set(['count', 'sum', 'avg', 'min', 'max', 'list', 'group']);
-const JOIN_KIND_NAMES = new Set(['inner', 'left', 'right', 'full']);
 
 function builtinDetail(name: string): string | undefined {
     if (STEP_NAMES.has(name)) return 'query step';
     if (AGG_NAMES.has(name)) return 'aggregate';
-    if (JOIN_KIND_NAMES.has(name)) return 'join kind';
     return 'function';
 }
 
@@ -52,7 +49,7 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
     constructor(services: TetaueServices) {
         super(services);
         this.services = services;
-        this.standardNames = [...new Set([...Object.keys(BUILTINS), ...standardPreludeNames(services)])];
+        this.standardNames = [...new Set(standardPreludeNames(services))];
     }
 
     override async getCompletion(

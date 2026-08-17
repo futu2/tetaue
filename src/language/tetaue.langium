@@ -11,7 +11,8 @@
  *   - `let x = e in body` — pure local bindings (`let`/`in` reserved)
  *   - implicit lambdas: a parenthesized expression using $n parameters,
  *     `($1 + 3)` ≡ `u => u + 3`, `($1 + $2)` ≡ `$1 => $2 => $1 + $2`
- *   - builtins live in a prelude of plain identifiers (table, filter, ...)
+ *   - SQL primitives use reserved `@` names (for example `@table`); public
+ *     names such as `table` and `filter` are ordinary prelude bindings
  * Operators: `&` is the pipeline (`a & f` ⇔ `f a`), `$` is right-associative
  * application (`f $ a` ⇔ `f a`), and `<<<`/`>>>` compose functions point-free.
  * Semantics follow teta (https://github.com/futu2/teta): immutable queries,
@@ -98,8 +99,8 @@ BaseType infers Type:
     | QueryType
     | {infer ListType} '[' type=Type ']'
     | {infer TypeHole} name=HOLE
-    | {infer TypeVar} name=(ID | ARG_ID)
-    | {infer QualifiedTypeName} receiver=(ID | ARG_ID) '.' name=(ID | ARG_ID)
+    | {infer TypeVar} name=(ID | ARG_ID | CORE_ID)
+    | {infer QualifiedTypeName} receiver=(ID | ARG_ID) '.' name=(ID | ARG_ID | CORE_ID)
     | {infer TypeParen} '(' type=Type ')';
 
 RecordType:
@@ -113,12 +114,15 @@ RecordField:
 
 // Operator precedence, tightest first:
 //   >>> <<<  (function composition, PureScript-style, right-assoc)
+//   <$> <$ <*> <* *>  (closed Functor/Applicative operations)
+//   <|>     (closed Alternative choice)
 //   * /     (multiplicative)
 //   + - <>  (additive; `<>` is the record merge monoid, Haskell-style)
 //   == != < <= > >=  (comparison, non-chained)
 //   &&      (and)
 //   ||      (or)
 //   &       (pipeline: `a & f` ⇔ `f a`, left-assoc — Haskell-style)
+//   >>= >>  (closed Monad operations)
 //   $       (application: `f $ a` ⇔ `f a`, right-assoc — Haskell-style)
 //
 // Composition follows PureScript (`Control.Semigroupoid`): `<<<` is compose
@@ -126,12 +130,15 @@ RecordField:
 // is its flip. `.` is reserved for record field access (`u.age`).
 infix BinaryExpression on UnaryExpression:
     right assoc '>>>' | '<<<'
+    > '<$>' | '<$' | '<*' | '*>' | '<*>'
+    > '<|>'
     > '*' | '/'
     > '+' | '-' | '<>'
     > '==' | '!=' | '<' | '<=' | '>' | '>='
     > '&&'
     > '||'
     > '&'
+    > '>>=' | '>>'
     > right assoc '$';
 
 // A lambda body is the same operator chain WITHOUT the `&` (pipeline) and `$`
@@ -146,11 +153,14 @@ LambdaLetExpression:
 
 infix LambdaBinaryExpression on UnaryExpression:
     right assoc '>>>' | '<<<'
+    > '<$>' | '<$' | '<*' | '*>' | '<*>'
+    > '<|>'
     > '*' | '/'
     > '+' | '-' | '<>'
     > '==' | '!=' | '<' | '<=' | '>' | '>='
     > '&&'
-    > '||';
+    > '||'
+    > '>>=' | '>>';
 
 UnaryExpression:
     {infer UnaryMinus} '-' operand=UnaryExpression
@@ -177,7 +187,7 @@ Application infers Expr:
 Argument infers Expr:
     {infer Lambda} '(' param=LambdaParam ')' '=>' body=LambdaBody
     | Atom ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | OP_SECTION | STRING))+
-    | {infer Identifier} name=ARG_ID
+    | {infer Identifier} name=(ARG_ID | CORE_ID)
     | {infer OperatorSection} value=OP_SECTION
     | {infer NumberLiteral} value=NUMBER
     | {infer StringLiteral} value=STRING
@@ -205,7 +215,7 @@ Atom infers Expr:
     | '(' Expression ')';
 
 Identifier infers Expr:
-    {infer Identifier} name=(ID | ARG_ID);
+    {infer Identifier} name=(ID | ARG_ID | CORE_ID);
 
 // `case { cond => value, ..., _ => value }` — SQL CASE WHEN as a first-class
 // expression. Each branch maps a boolean condition to a value; the final
@@ -237,7 +247,11 @@ hidden terminal COMMENT: /#[^\r\n]*/;
 // lexical bindings and first-class curried functions, so `_+_ 1 2` is exactly
 // `1 + 2`. This must precede ID: named sections such as `_div_` are otherwise
 // valid identifiers.
-terminal OP_SECTION: /_(>>>|<<<|==|!=|<=|>=|&&|\|\||\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/;
+terminal OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/;
+
+// Core SQL primitives are inaccessible through ordinary names. The standard
+// prelude aliases `filter = @filter`, etc. before user modules are checked.
+terminal CORE_ID: /@[a-zA-Z][\w_]*/;
 
 // A bare identifier usable as an application argument: any identifier NOT
 // followed by `=`. The lookahead keeps bindings comma-free — `filter adult`

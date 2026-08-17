@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { collectModuleTree } from '../src/language/imports.ts';
 import { analyzeProject } from '../src/language/interpreter.ts';
 import { inferProject } from '../src/language/inference.ts';
+import { standardPrelude } from '../src/language/prelude.ts';
 import { renderQuery, DIALECTS } from '../src/language/render.ts';
 import { parseModel, services } from './helpers.ts';
 
@@ -18,7 +19,10 @@ function analyzeFiles(files: Record<string, string>, main: string) {
         read: uri => files[uri],
         parse: (text, uri) => parseModel(text),
     });
-    const result = analyzeProject(tree.modules, { requireQuery: true });
+    const result = analyzeProject(tree.modules, {
+        requireQuery: true,
+        prelude: standardPrelude(services),
+    });
     return { tree, result };
 }
 
@@ -73,7 +77,7 @@ describe('multi-file modules', () => {
                 import "tables.tetaue"
                 q = users
                     & map (u => { uid = u.id })
-                    & join inner orders (u => o => u.uid == o.user_id) (u => o => { uid = u.uid, oid = o.user_id })
+                    & joinInner orders (u => o => u.uid == o.user_id) (u => o => { uid = u.uid, oid = o.user_id })
             `,
         }, 'main.tetaue');
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id');
@@ -327,7 +331,11 @@ describe('selective imports', () => {
             'schema.tetaue': `export type UserRow = query { id: int }`,
             'main.tetaue': `import "schema.tetaue" as s\nusers: s.Nope = table "users"\nq = users & take 1`,
         }, 'main.tetaue');
-        const typeDiags = inferProject(missing.tree.modules, missing.tree.importsByModule).diagnostics.map(d => d.message).join('\n');
+        const typeDiags = inferProject(
+            missing.tree.modules,
+            missing.tree.importsByModule,
+            standardPrelude(services),
+        ).diagnostics.map(d => d.message).join('\n');
         expect(typeDiags).toContain("unknown type 's.Nope'");
     });
 
@@ -389,7 +397,10 @@ describe('selective imports', () => {
             'tables.tetaue': `export users: query { id: int } = table "users"\nexport orders: query { id: int } = table "orders"`,
             'main.tetaue': `import "tables.tetaue" as t (users)\nq = t.users & take 1\nq2 = t.orders & take 1`,
         }, 'main.tetaue');
-        const r2 = analyzeProject(tree.modules, { requireQuery: false });
+        const r2 = analyzeProject(tree.modules, {
+            requireQuery: false,
+            prelude: standardPrelude(services),
+        });
         expect(r2.diagnostics.map(d => d.message).join('\n')).toContain("module 't' has no exported binding 'orders'");
     });
 

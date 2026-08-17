@@ -22,6 +22,15 @@ design has been removed.
    `nothing : forall a. (maybe a)`, `from_maybe : a -> (maybe a) -> a`,
    `is_null` / `is_not_null : (maybe a) -> bool`. `coalesce` remains as the
    SQL-native choice between two maybe values.
+5. **Numeric polymorphism is constrained.** `Num t` is retained on inferred
+   variables through generalization and instantiation. Its closed instances
+   are currently `int`, `float`, and `decimal`.
+6. **Other classes are closed compiler-owned constraints.** `Eq` and `Ord`
+   cover the scalar primitives listed below; `Semigroup`/`Monoid` cover
+   strings and lists for `<>`; `Functor` has executable instances for
+   `maybe`, lists, and queries; and `Applicative`, `Alternative`, and `Monad`
+   have executable instances for `maybe` and lists. These constraints are not
+   user-declarable.
 
 ## 2. Type aliases
 
@@ -111,14 +120,41 @@ tail       ::= lowercase-row-variable | '?hole_name'
 
 ## 6. Numeric rules (Haskell base)
 
-- `+`, `-`, `*`: same numeric type in and out (`int` with `int`,
-  `float` with `float`); `int` and `float` never mix.
+- `+`, `-`, `*`: `Num t => t -> t -> t`. Both operands and the result have
+  the same type; `int` and `float` never mix.
+- Unary `-`: `Num t => t -> t`.
 - `/`: fractional division — `float -> float -> float`.
 - `div`, `mod`: integral — `int -> int -> int` (the old `%` operator is gone).
 - `ceil`, `floor`, `sqrt`, `abs`, `round` preserve their input numeric type.
 - `pow : float -> float -> float`.
 
-## 7. Builtin type schemes (selected)
+## 7. Closed typeclasses
+
+The current runtime uses a deliberately closed instance table:
+
+- `Num`: `int`, `float`, `decimal`.
+- `Eq`: `int`, `float`, `decimal`, `string`, `bool`, `date`, `timestamp`.
+- `Ord`: the same scalar set as `Eq`.
+- `Semigroup` and `Monoid`: `string` and lists (list concatenation does not
+  require a constraint on the element type).
+- `Functor`: `(maybe a)`, `[a]`, and `query r` through `fmap`.
+- `Applicative`: `(maybe a)` and `[a]` through `<*>`, `<*`, and `*>`.
+- `Alternative`: `(maybe a)` and `[a]` through `<|>` / `orElse`.
+- `Monad`: `(maybe a)` and `[a]` through `>>=` / `bind` and `>>` / `then`.
+
+`<>` therefore has three layers of behavior: structural right-biased record
+merge, string concatenation lowered through `concat`, and list concatenation.
+`Monoid` does not expose a polymorphic `mempty` yet because evaluation has no
+type-directed dictionary; no unsound generic empty value is provided.
+
+These are concrete closed instances, not a Haskell-style open class system.
+User-declared classes, instance declarations, and higher-kinded variables
+(`Functor f`, user-defined `Applicative`/`Monad` instances, and similar)
+require a future dictionary and higher-kinded-type design. Query remains only
+a Functor: joins and correlated composition keep their explicit relational
+operators.
+
+## 8. Builtin type schemes (selected)
 
 ```
 table       : string -> query ?table       -- special-cased; hole per application
@@ -128,11 +164,25 @@ fold        : forall r s. (r -> {s}) -> query r -> query {s}
 sort        : forall r t. (r -> t) -> query r -> query r   -- t = order | [order]
 take        : int -> query r -> query r
 drop        : int -> query r -> query r
-join        : forall r s t. jkind -> query s -> (r -> s -> bool)
+joinInner   : forall r s t. query s -> (r -> s -> bool)
+                -> (r -> s -> {t}) -> query r -> query {t}
+joinLeft    : forall r s t. query s -> (r -> s -> bool)
+                -> (r -> s -> {t}) -> query r -> query {t}
+joinRight   : forall r s t. query s -> (r -> s -> bool)
+                -> (r -> s -> {t}) -> query r -> query {t}
+joinFull    : forall r s t. query s -> (r -> s -> bool)
                 -> (r -> s -> {t}) -> query r -> query {t}
 union       : forall r. query r -> query r -> query r
 
-fmap        : forall a b. (a -> b) -> (maybe a) -> (maybe b)
+fmap        : closed dispatch for `(a -> b) -> (maybe a) -> (maybe b)`,
+              `(a -> b) -> [a] -> [b]`, and `(r -> s) -> query r -> query s`
+replaceWith : closed `<$` dispatch over maybe, list, and query
+ap          : closed `<*>` dispatch over maybe and list
+applyLeft   : closed `<*` dispatch over maybe and list
+applyRight  : closed `*>` dispatch over maybe and list
+orElse      : closed `<|>` dispatch over maybe and list
+bind        : closed `>>=` dispatch over maybe and list
+then        : closed `>>` dispatch over maybe and list
 just        : forall a. a -> (maybe a)
 nothing     : forall a. (maybe a)
 from_maybe  : forall a. a -> (maybe a) -> a
@@ -149,16 +199,23 @@ min, max    : forall a. a -> agg (maybe a)       -- comparable a
 list        : forall a. a -> agg [a]
 group       : forall a. a -> group a
 
-== != < <= > >= : forall a. a -> a -> bool       -- non-maybe; null via == null
+== !=            : Eq a => a -> a -> bool       -- non-maybe; null via == null
+< <= > >=        : Ord a => a -> a -> bool       -- non-maybe
 && ||      : bool -> bool -> bool
 not        : bool -> bool
-+ - *      : numeric t => t -> t -> t
++ - *      : Num t => t -> t -> t
 /          : float -> float -> float
 div, mod   : int -> int -> int
 ```
 
-## 8. Generalization
+Inference specializes the three outer join functions and wraps every projected
+result field in `maybe`; `joinInner` preserves the merger's exact row type.
+
+## 9. Generalization
 
 Generalization happens at module bindings and `let` bindings. Variables free
 in the environment and all holes are excluded from the quantifier list, so
-holes remain shared and rigid annotation checking is unchanged.
+holes remain shared and rigid annotation checking is unchanged. Type-class
+constraints are stored with quantified variables and recreated when a scheme
+is instantiated, so `add = x => y => x + y` infers
+`Num t => t -> t -> t` rather than the unsound `t -> t -> t`.

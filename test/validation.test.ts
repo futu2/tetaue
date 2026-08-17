@@ -96,44 +96,43 @@ describe('semantic errors', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q = users & join inner orders (u => u.id == 1) (u => o => { uid = u.id })
+            q = users & joinInner orders (u => u.id == 1) (u => o => { uid = u.id })
         `);
-        expect(messages.join('\n')).toContain("join 'on' must be a two-argument function (curried)");
+        expect(messages.join('\n')).toContain("joinInner 'on' must be a two-argument function (curried)");
     });
 
-    test('join kind must be inner/left/right/full', () => {
+    test('the removed general join is unknown', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q = users & join orders 42 (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q = users & join orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
-        expect(messages.join('\n')).toContain('inner, left, right or full');
+        expect(messages.join('\n')).toContain("unknown identifier 'join'");
     });
 
-    test('join kind must be a bare identifier, not a string', () => {
+    test('removed join kind constants are unknown', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
-            orders: query { user_id: int } = table "orders"
-            q = users & join orders "inner" (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q = users & filter (u => u.id == inner)
         `);
-        expect(messages.join('\n')).toContain('inner, left, right or full');
+        expect(messages.join('\n')).toContain("unknown identifier 'inner'");
     });
 
     test('join merger must be a two-argument function', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q = users & join inner orders u => o => u.id == o.user_id (u => { uid = u.id })
+            q = users & joinInner orders u => o => u.id == o.user_id (u => { uid = u.id })
         `);
-        expect(messages.join('\n')).toContain("join 'merger' must be a two-argument function (curried)");
+        expect(messages.join('\n')).toContain("joinInner 'merger' must be a two-argument function (curried)");
     });
 
-    test('join right must be a query', () => {
+    test('join right side must be a query', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
-            q = users & join inner 42 (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q = users & joinInner 42 (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
-        expect(messages.join('\n')).toContain('join expects a query as its second argument');
+        expect(messages.join('\n')).toContain('joinInner expects a query as its first argument');
     });
 
     test('stepped right side of a join renders as a subquery', () => {
@@ -141,7 +140,7 @@ describe('semantic errors', () => {
             users: query { id: int } = table "users"
             orders: query { user_id: int, status: string } = table "orders"
             paid = orders & filter (o => o.status == "paid")
-            q = users & join inner paid (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.user_id })
+            q = users & joinInner paid (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.user_id })
         `);
         expect(sql).toContain([
             'INNER JOIN (',
@@ -157,9 +156,9 @@ describe('semantic errors', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q = users & join inner orders ($1.id == 3) { uid = $1.id }
+            q = users & joinInner orders ($1.id == 3) { uid = $1.id }
         `);
-        expect(messages.join('\n')).toContain("join 'on' must be a two-argument function (curried)");
+        expect(messages.join('\n')).toContain("joinInner 'on' must be a two-argument function (curried)");
     });
 
     test('$n inside an explicit lambda body is an error', () => {

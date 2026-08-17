@@ -12,7 +12,8 @@
  * instantiated at each use. Nullability is explicit Haskell-style
  * `(maybe T)` — there is NO implicit T -> maybe T conversion. Holes
  * (`?name`) are unsolved metavariables shared through the module, never
- * generalized. Numerics are strict. See docs/design/type-system.md.
+ * generalized. Numeric polymorphism carries a `Num` constraint through
+ * generalization and instantiation. See docs/design/type-system.md.
  ******************************************************************************/
 import type { AstNode } from 'langium';
 import {
@@ -26,8 +27,8 @@ import {
 } from './generated/ast.js';
 import type { Type as LangiumType } from './generated/ast.js';
 import {
-    TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
-    builtinOf, fun, listOf, maybeOf, prim, queryOf, rowOf, truthType,
+    ConstraintError, TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
+    builtinOf, fun, isTypeClassInstance, listOf, maybeOf, prim, queryOf, rowOf, truthType,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
@@ -37,10 +38,10 @@ import { checkBinding, parseStringLiteral } from './interpreter.js';
 import type { Diagnostic, Value } from './interpreter.js';
 import { labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
-import { CAST_TYPES, LIST_ARITY } from './builtin.js';
+import { CAST_TYPES, LIST_ARITY, coreBuiltinName, CORE_TYPE_NAMES, type CoreTypeName } from './builtin.js';
 import {
-    BINARY_OPERATORS, isBinaryOperator, operatorIntrinsicName, sectionName, sectionSpelling,
-    type BinaryOperator,
+    INTRINSIC_OPERATORS, isBinaryOperator, isIntrinsicOperator, operatorIntrinsicName,
+    sectionName, sectionSpelling, type BinaryOperator, type IntrinsicOperator,
 } from './operators.js';
 
 export interface InferDiagnostic {
@@ -49,7 +50,20 @@ export interface InferDiagnostic {
 }
 
 /** Builtins whose application takes ALL arguments at once (no currying). */
-const LIST_BUILTINS = new Set(['concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'regex_extract', 'lag', 'lead']);
+const LIST_BUILTINS = new Set(['concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'lag', 'lead']);
+
+const JOIN_BUILTINS = {
+    joinInner: 'inner',
+    joinLeft: 'left',
+    joinRight: 'right',
+    joinFull: 'full',
+} as const;
+type JoinBuiltinName = keyof typeof JOIN_BUILTINS;
+type JoinKindName = (typeof JOIN_BUILTINS)[JoinBuiltinName];
+
+function isJoinBuiltinName(name: string | null): name is JoinBuiltinName {
+    return name !== null && Object.hasOwn(JOIN_BUILTINS, name);
+}
 
 /** Date/time builtins whose value arguments must be date or timestamp. */
 const DATE_VALUE_ARGUMENTS = new Set(['extract', 'year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second', 'date_add', 'date_diff', 'date_trunc', 'date_format', 'to_unixtime']);
@@ -71,14 +85,16 @@ export interface InferProjectResult {
     fieldsOf(node: AstNode): { name: string; type: string }[] | undefined;
 }
 
-const PRIM_NAMES = ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp'] as const;
-type PrimName = (typeof PRIM_NAMES)[number];
+const PRIM_NAMES = CORE_TYPE_NAMES;
+type PrimName = CoreTypeName;
 
 /** Synthetic access inserted by completion; it must not constrain the receiver row. */
 const SYNTHETIC_FIELD_PREFIX = '_tetaue_field';
 
-function isPrimName(name: string): name is PrimName {
-    return (PRIM_NAMES as readonly string[]).includes(name);
+function primitiveName(name: string): PrimName | null {
+    if (!name.startsWith('@')) return null;
+    const spelling = name.slice(1);
+    return (PRIM_NAMES as readonly string[]).includes(spelling) ? spelling as PrimName : null;
 }
 
 /** A literal is `float` iff its source text contains '.', so `100.0` is float. */
@@ -87,7 +103,7 @@ function numberLiteralType(e: NumberLiteral): 'int' | 'float' {
 }
 
 function isNumericPrim(t: Type): boolean {
-    return t.kind === 'prim' && (t.name === 'int' || t.name === 'float');
+    return t.kind === 'prim' && isTypeClassInstance('Num', t.name);
 }
 
 /**
@@ -193,24 +209,25 @@ export class Inferencer {
 
     /**
      * Build the primitive environment from the builtin catalog plus the hidden
-     * operator intrinsics consumed by `prelude.tetaue`. The join kinds are a
-     * dedicated `jkind` type, aggregates return `agg t`, `group` returns
-     * `group t`, and the list-argument builtins take one list argument, so
-     * `join "inner"`, plain fold entries and non-order sort lambdas are all
+     * operator intrinsics consumed by `prelude.tetaue`. Aggregates return
+     * `agg t`, `group` returns `group t`, and the list-argument builtins take
+     * one list argument, so plain fold entries and non-order sort lambdas are
      * STATIC type errors, not runtime checks.
      */
     prelude(): void {
         for (const spec of BUILTIN_SPECS) {
             const scheme = spec.scheme(this.u);
-            this.env.set(spec.name, { ...scheme, type: builtinOf(spec.name, scheme.type) });
+            const tagged = { ...scheme, type: builtinOf(spec.name, scheme.type) };
+            this.env.set(coreBuiltinName(spec.name), tagged);
         }
         for (const [name, target] of Object.entries(BUILTIN_ALIASES)) {
-            const scheme = this.env.get(target);
+            const scheme = this.env.get(coreBuiltinName(target));
             if (scheme) {
-                this.env.set(name, { ...scheme, type: builtinOf(name, this.u.peel(scheme.type)) });
+                const tagged = { ...scheme, type: builtinOf(name, this.u.peel(scheme.type)) };
+                this.env.set(coreBuiltinName(name), tagged);
             }
         }
-        for (const operator of BINARY_OPERATORS) {
+        for (const operator of INTRINSIC_OPERATORS) {
             const type = this.operatorIntrinsicType(operator);
             const scheme = this.u.generalize([], type);
             this.env.set(operatorIntrinsicName(operator), {
@@ -223,27 +240,29 @@ export class Inferencer {
     }
 
     /** Static shape of a hidden SQL-aware operator primitive. */
-    private operatorIntrinsicType(op: BinaryOperator): Type {
+    private operatorIntrinsicType(op: IntrinsicOperator): Type {
         const a = this.u.fresh();
         const b = this.u.fresh();
         const c = this.u.fresh();
         switch (op) {
-            case '>>>': return fun(fun(a, b), fun(fun(b, c), fun(a, c)));
-            case '<<<': return fun(fun(b, c), fun(fun(a, b), fun(a, c)));
-            case '&': return fun(a, fun(fun(a, b), b));
-            case '$': return fun(fun(a, b), fun(a, b));
             case '&&': case '||':
                 return fun(prim('bool'), fun(prim('bool'), prim('bool')));
-            case '==': case '!=': case '<': case '<=': case '>': case '>=':
+            case '==': case '!=':
+                this.u.constrain(a, 'Eq');
+                return fun(a, fun(a, prim('bool')));
+            case '<': case '<=': case '>': case '>=':
+                this.u.constrain(a, 'Ord');
                 return fun(a, fun(a, prim('bool')));
             case '/': return fun(prim('float'), fun(prim('float'), prim('float')));
             case '<>': return fun(a, fun(b, c));
-            case '+': case '-': case '*': return fun(a, fun(a, a));
+            case '+': case '-': case '*':
+                this.u.constrain(a, 'Num');
+                return fun(a, fun(a, a));
         }
     }
 
-    /** Compatibility value for low-level inference, which does not load prelude.tetaue. */
-    private fallbackOperatorType(op: BinaryOperator): Type {
+    /** Core type of infix syntax before a source-defined `_op_` binding exists. */
+    private fallbackOperatorType(op: IntrinsicOperator): Type {
         return builtinOf(`operator:${op}`, this.operatorIntrinsicType(op));
     }
 
@@ -251,6 +270,12 @@ export class Inferencer {
         if (type.kind !== 'builtin' || !type.name.startsWith('operator:')) return null;
         const operator = type.name.slice('operator:'.length);
         return isBinaryOperator(operator) ? operator : null;
+    }
+
+    /** Preserve the core function behind an ordinary source-level alias. */
+    private taggedBuiltin(type: Type): string | null {
+        const resolved = this.u.resolve(type);
+        return resolved.kind === 'builtin' ? resolved.name : null;
     }
 
     // -----------------------------------------------------------------------
@@ -266,21 +291,32 @@ export class Inferencer {
      * diagnostics dedupe. Only `export`ed bindings are recorded for
      * importers, as schemes (so qualified access stays polymorphic).
      */
-    inferProject(modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map()): void {
+    inferProject(
+        modules: readonly ProjectModule[],
+        importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map(),
+        prelude?: ProjectModule,
+    ): void {
         this.prelude();
         const exportsByModule = new Map<ProjectModule, Map<string, Scheme>>();
         const typeExportsByModule = new Map<ProjectModule, Map<string, LangiumType>>();
-        for (const module of modules) {
+        const allModules = prelude ? [prelude, ...modules] : [...modules];
+        let standardTypes = new Map<string, LangiumType>();
+        for (const module of allModules) {
             const exported = this.inferModule(
                 module,
                 importsByModule.get(module) ?? module.imports ?? [],
                 exportsByModule,
                 typeExportsByModule,
+                standardTypes,
             );
             exportsByModule.set(module, exported);
             typeExportsByModule.set(module, new Map(
                 module.model.types.filter(a => a.export).map(a => [a.name, a.type]),
             ));
+            if (module === prelude) {
+                standardTypes = new Map(module.model.types.filter(a => a.export).map(a => [a.name, a.type]));
+                this.preludeEnv = new Map([...this.preludeEnv, ...exported]);
+            }
         }
         this.flushDeferred();
     }
@@ -299,6 +335,7 @@ export class Inferencer {
         imports: readonly ResolvedImportEdge[],
         exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, Scheme>>,
         typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, LangiumType>>,
+        standardTypes: ReadonlyMap<string, LangiumType> = new Map(),
     ): { scope: ReadonlyMap<string, string> } {
         this.env = new Map(this.preludeEnv);
         this.modules = new Map<string, Map<string, Scheme>>();
@@ -309,10 +346,11 @@ export class Inferencer {
         for (const [name, scheme] of imported.flat) this.env.set(name, scheme);
         for (const [alias, selected] of imported.namespaces) this.modules.set(alias, new Map(selected));
         const scope = new Map(imported.scope);
-        this.typeAliases = new Map(importedTypes.flat);
+        this.typeAliases = new Map(standardTypes);
+        for (const [name, type] of importedTypes.flat) this.typeAliases.set(name, type);
         this.typeNamespaces = new Map([...importedTypes.namespaces].map(([k, v]) => [k, new Map(v)]));
         for (const alias of module.model.types) {
-            if (this.typeAliases.has(alias.name)) {
+            if (importedTypes.flat.has(alias.name)) {
                 this.diag(alias, `type alias '${alias.name}' conflicts with an imported type alias`);
                 continue;
             }
@@ -332,8 +370,9 @@ export class Inferencer {
         imports: readonly ResolvedImportEdge[],
         exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, Scheme>>,
         typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, LangiumType>>,
+        standardTypes: ReadonlyMap<string, LangiumType> = new Map(),
     ): Map<string, Scheme> {
-        const { scope } = this.beginModule(module, imports, exportsByModule, typeExportsByModule);
+        const { scope } = this.beginModule(module, imports, exportsByModule, typeExportsByModule, standardTypes);
         const exported = new Map<string, Scheme>();
         for (const binding of module.model.bindings) {
             this.inferBinding(binding, exported, scope);
@@ -365,8 +404,9 @@ export class Inferencer {
             // narrows downstream uses.
             const v = b.value as Expr;
             const isBareTable = isApplication(v) && isIdentifier(v.func)
-                && v.func.name === 'table' && v.arguments.length === 1
-                && this.isPreludeBuiltin('table', this.env);
+                && (v.func.name === 'table' || v.func.name === coreBuiltinName('table'))
+                && v.arguments.length === 1
+                && this.isPreludeBuiltin(v.func.name, this.env);
             let ok = true;
             if (isBareTable) {
                 try {
@@ -431,7 +471,11 @@ export class Inferencer {
         diagnostics.push(...this.takeDiagnosticsFrom(inferenceStart));
         scope.set(b.name, `local binding '${b.name}'`);
 
-        const result = checkBinding(b, valueEnv, moduleBindings, seen, nodeValues ? { nodeValues } : {});
+        const result = checkBinding(b, valueEnv, moduleBindings, seen, {
+            typeAliases: this.typeAliases,
+            typeNamespaces: this.typeNamespaces,
+            ...(nodeValues ? { nodeValues } : {}),
+        });
         diagnostics.push(...result.diagnostics);
         return { env: result.env, seen: result.seen, value: result.value, diagnostics };
     }
@@ -472,8 +516,9 @@ export class Inferencer {
                 const ann = this.translateType(e.type);
                 const value = e.value as Expr;
                 const isBareTable = isApplication(value) && isIdentifier(value.func)
-                    && value.func.name === 'table' && value.arguments.length === 1
-                    && this.isPreludeBuiltin('table', env);
+                    && (value.func.name === 'table' || value.func.name === coreBuiltinName('table'))
+                    && value.arguments.length === 1
+                    && this.isPreludeBuiltin(value.func.name, env);
                 const sk = isBareTable ? null : this.u.skolemize(inferred);
                 let ok = true;
                 try {
@@ -498,8 +543,10 @@ export class Inferencer {
         }
         if (isUnaryMinus(e)) {
             const t = this.inferExpr(e.operand, env);
-            const r = this.u.peel(t);
-            if (r.kind === 'prim' && !isNumericPrim(r)) {
+            try {
+                this.u.constrain(t, 'Num');
+            } catch (err) {
+                if (!(err instanceof ConstraintError)) throw err;
                 this.diag(e, `unary '-' requires a numeric expression, got ${this.u.pretty(t)}`);
             }
             return t;
@@ -667,10 +714,29 @@ export class Inferencer {
         const lt = this.inferExpr(e.left, env);
         const rt = this.inferExpr(e.right, env);
         const scheme = env.get(sectionSpelling(op));
-        const operator = scheme ? this.u.instantiate(scheme) : this.fallbackOperatorType(op);
+        const operator = scheme
+            ? this.u.instantiate(scheme)
+            : isIntrinsicOperator(op)
+                ? this.fallbackOperatorType(op)
+                : null;
+        if (!operator) {
+            this.diag(e, `operator '${op}' is not defined`);
+            return this.u.fresh();
+        }
         const intrinsic = this.taggedOperator(operator);
         if (intrinsic) {
-            return this.inferBinaryTypes(intrinsic, lt, rt, e, e.left, e.right, env);
+            return this.inferBinaryTypes(intrinsic, lt, rt, e, e.left, e.right);
+        }
+        const closed = this.taggedBuiltin(operator);
+        switch (closed) {
+            case 'fmap': return this.inferFmapTypes(lt, rt, e.left, e.right);
+            case 'replaceWith': return this.inferReplaceTypes(lt, rt, e.left, e.right);
+            case 'ap': return this.inferApTypes(lt, rt, e.left, e.right);
+            case 'applyLeft': return this.inferSequenceTypes(lt, rt, e.left, e.right, 'applyLeft', 'left');
+            case 'applyRight': return this.inferSequenceTypes(lt, rt, e.left, e.right, 'applyRight', 'right');
+            case 'orElse': return this.inferOrElseTypes(lt, rt, e.left, e.right);
+            case 'bind': return this.inferBindTypes(lt, rt, e.left, e.right);
+            case 'then': return this.inferSequenceTypes(lt, rt, e.left, e.right, 'then', 'right');
         }
         const partial = this.applyInferredFunction(operator, lt, e.left, null);
         return this.applyInferredFunction(partial, rt, e.right, null);
@@ -684,77 +750,7 @@ export class Inferencer {
         node: AstNode,
         leftNode: AstNode,
         rightNode: AstNode,
-        env: Map<string, Scheme>,
     ): Type {
-        if (op === '&') {
-            // a & f ⇔ f a — ordinary function application with the operands
-            // reversed. Type mismatches are reported here as well as by the
-            // interpreter; the two passes are deduped when the messages match.
-            const a = lt;
-            const f = rt;
-            const a1 = this.u.fresh();
-            const b1 = this.u.fresh();
-            try {
-                this.u.unify(f, fun(a1, b1));
-                this.u.unify(a, a1);
-                return b1;
-            } catch (err) {
-                if (err instanceof UnifyError) {
-                    if (!this.reportNumericMix(node, err)) {
-                        this.reportApplyMismatch(node, f, a, rightNode, env);
-                    }
-                } else {
-                    throw err;
-                }
-                return this.u.fresh();
-            }
-        }
-        if (op === '$') {
-            const f = lt;
-            const a = rt;
-            const a1 = this.u.fresh();
-            const b1 = this.u.fresh();
-            try {
-                this.u.unify(f, fun(a1, b1));
-                this.u.unify(a, a1);
-                return b1;
-            } catch (err) {
-                if (err instanceof UnifyError) {
-                    if (!this.reportNumericMix(node, err)) {
-                        this.reportApplyMismatch(node, f, a, rightNode, env);
-                    }
-                } else {
-                    throw err;
-                }
-                return this.u.fresh();
-            }
-        }
-        if (op === '>>>' || op === '<<<') {
-            const l = lt;
-            const r = rt;
-            const a = this.u.fresh();
-            const b = this.u.fresh();
-            const c = this.u.fresh();
-            try {
-                if (op === '<<<') { // (b -> c) -> (a -> b) -> a -> c
-                    this.u.unify(l, fun(b, c));
-                    this.u.unify(r, fun(a, b));
-                } else { // (a -> b) -> (b -> c) -> a -> c
-                    this.u.unify(l, fun(a, b));
-                    this.u.unify(r, fun(b, c));
-                }
-                return fun(a, c);
-            } catch (err) {
-                if (err instanceof UnifyError) {
-                    if (!this.reportNumericMix(node, err)) {
-                        this.diag(node, `cannot compose ${this.u.pretty(l)} with ${this.u.pretty(r)} — both must be functions`);
-                    }
-                } else {
-                    throw err;
-                }
-                return this.u.fresh();
-            }
-        }
         if (op === '==' || op === '!=' || op === '<' || op === '<=' || op === '>' || op === '>=') {
             const leftNull = this.isNullLiteralNode(leftNode);
             const rightNull = this.isNullLiteralNode(rightNode);
@@ -771,6 +767,7 @@ export class Inferencer {
                         this.diag(node, `comparison expects non-null values — use is_null/is_not_null or from_maybe, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                         return prim('bool');
                     }
+                    this.u.constrain(lt, op === '==' || op === '!=' ? 'Eq' : 'Ord');
                 }
             } catch (err) {
                 if (err instanceof UnifyError) {
@@ -794,9 +791,50 @@ export class Inferencer {
             }
             return prim('bool');
         }
-        // `<>` — the record-merge monoid (right record wins on overlap);
-        // same typing as the `merge` builtin.
+        // `<>` has closed Semigroup/Monoid instances for strings and lists;
+        // records retain their structural right-biased merge behavior.
         if (op === '<>') {
+            const left = this.u.peel(lt);
+            const right = this.u.peel(rt);
+            if (left.kind === 'prim' && right.kind === 'prim'
+                && left.name === 'string' && right.name === 'string') {
+                return prim('string');
+            }
+            if (left.kind === 'list' && right.kind === 'list') {
+                this.u.unify(left.of, right.of);
+                return listOf(left.of);
+            }
+            const rowLike = (t: Type): boolean => {
+                const peeled = this.u.peel(t);
+                if (peeled.kind === 'row') return true;
+                if (peeled.kind !== 'var') return false;
+                return this.u.varInfo(peeled.id).kind === 'row';
+            };
+            const unwrapZeroArg = (node: AstNode): AstNode => {
+                let current = node;
+                while (isApplication(current) && current.arguments.length === 0) current = current.func;
+                return current;
+            };
+            const bareIdentifier = isIdentifier(unwrapZeroArg(leftNode));
+            const concreteNonSemigroup = (t: Type): boolean => {
+                const peeled = this.u.peel(t);
+                return peeled.kind === 'prim' && peeled.name !== 'string';
+            };
+            if ((bareIdentifier && concreteNonSemigroup(right))
+                || (isIdentifier(unwrapZeroArg(rightNode)) && concreteNonSemigroup(left))) {
+                return this.inferMerge(lt, rt, node);
+            }
+            if (!rowLike(left) && !rowLike(right)) {
+                try {
+                    return this.u.unifyConstrained(lt, rt, 'Semigroup');
+                } catch (err) {
+                    if (err instanceof UnifyError) {
+                        this.diag(node, `'<>' requires matching Semigroup operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                        return this.u.fresh();
+                    }
+                    throw err;
+                }
+            }
             return this.inferMerge(lt, rt, node);
         }
         // Haskell-base numerics: + - * require the same numeric type; / is
@@ -815,17 +853,9 @@ export class Inferencer {
             }
             return prim('float');
         }
-        // + - *
+        // + - *: constrained polymorphism, `Num t => t -> t -> t`.
         try {
-            const unified = this.u.unify(lt, rt);
-            const rl = this.u.peel(lt);
-            const rr = this.u.peel(rt);
-            if (rl.kind === 'prim' && rr.kind === 'prim' && isNumericPrim(rl) && isNumericPrim(rr) && rl.name !== rr.name) {
-                this.diag(node, `'${op}' requires numeric operands of the same type, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
-            } else if (rl.kind === 'prim' && rr.kind === 'prim' && !isNumericPrim(rl) && !isNumericPrim(rr)) {
-                this.diag(node, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
-            }
-            return unified;
+            return this.u.unifyConstrained(lt, rt, 'Num');
         } catch (err) {
             if (err instanceof UnifyError) {
                 const rl = this.u.peel(lt);
@@ -861,7 +891,9 @@ export class Inferencer {
             this.diag(e, `unknown operator section '${e.value}' — '${op}' is not defined`);
             return this.u.fresh();
         }
-        return this.fallbackOperatorType(op);
+        if (isIntrinsicOperator(op)) return this.fallbackOperatorType(op);
+        this.diag(e, `unknown operator section '${e.value}' — '${op}' is not defined`);
+        return this.u.fresh();
     }
 
     private inferOperatorApplication(
@@ -879,7 +911,7 @@ export class Inferencer {
         const rightNode = e.arguments[1]!;
         const left = this.inferArg(leftNode, env);
         const right = this.inferArg(rightNode, env);
-        let result = this.inferBinaryTypes(op, left, right, e, leftNode, rightNode, env);
+        let result = this.inferBinaryTypes(op, left, right, e, leftNode, rightNode);
         for (const argument of e.arguments.slice(2)) {
             result = this.applyInferredFunction(result, this.inferArg(argument, env), argument, null);
         }
@@ -905,8 +937,14 @@ export class Inferencer {
             this.u.unify(f, fun(param, result));
             this.u.unify(param, arg);
         } catch (err) {
+            if (err instanceof ConstraintError) {
+                this.diag(node, err.constraint === 'Num'
+                    ? `${err.constraint} requires a numeric type, got ${this.u.pretty(arg)}`
+                    : `${err.constraint} requires a supported instance, got ${this.u.pretty(arg)}`);
+                return this.u.fresh();
+            }
             if (err instanceof UnifyError) {
-                this.argError(name, 0, node, arg, param, f);
+                if (!this.reportNumericMix(node, err)) this.argError(name, 0, node, arg, param, f);
                 return this.u.fresh();
             }
             throw err;
@@ -967,7 +1005,9 @@ export class Inferencer {
         // `fold`/`map` — the DSL's mode checks: fold entries must be
         // aggregate/group mode (a plain column is a type error), and the
         // result row strips the modes so downstream sees plain columns.
-        if (funcName === 'join' && e.arguments.length === 4) return this.inferJoin(e, env);
+        if (isJoinBuiltinName(funcName) && e.arguments.length === 3) {
+            return this.inferJoin(e, env, funcName, JOIN_BUILTINS[funcName]);
+        }
         if (funcName === 'scalar' && e.arguments.length === 1) return this.inferScalar(e, env);
         if ((funcName === 'in_query' || funcName === 'not_in_query') && e.arguments.length === 2) return this.inferInQuery(e, env);
         if ((funcName === 'is_true' || funcName === 'is_false' || funcName === 'is_unknown') && e.arguments.length === 1) {
@@ -981,6 +1021,33 @@ export class Inferencer {
         // record wins on overlapping fields), which the generic fun-type
         // application path cannot express; compute the union directly.
         if (funcName === 'coalesce' && e.arguments.length === 1) return this.inferCoalesceList(e, env);
+        if (funcName === 'fmap' && e.arguments.length === 2) return this.inferFmap(e, env);
+        if (funcName === 'replaceWith' && e.arguments.length === 2) {
+            const left = this.inferArg(e.arguments[0]!, env);
+            const right = this.inferArg(e.arguments[1]!, env);
+            return this.inferReplaceTypes(left, right, e.arguments[0]!, e.arguments[1]!);
+        }
+        if (funcName === 'ap' && e.arguments.length === 2) {
+            const left = this.inferArg(e.arguments[0]!, env);
+            const right = this.inferArg(e.arguments[1]!, env);
+            return this.inferApTypes(left, right, e.arguments[0]!, e.arguments[1]!);
+        }
+        if ((funcName === 'applyLeft' || funcName === 'applyRight' || funcName === 'then') && e.arguments.length === 2) {
+            const left = this.inferArg(e.arguments[0]!, env);
+            const right = this.inferArg(e.arguments[1]!, env);
+            const keep = funcName === 'applyLeft' ? 'left' : 'right';
+            return this.inferSequenceTypes(left, right, e.arguments[0]!, e.arguments[1]!, funcName, keep);
+        }
+        if (funcName === 'orElse' && e.arguments.length === 2) {
+            const left = this.inferArg(e.arguments[0]!, env);
+            const right = this.inferArg(e.arguments[1]!, env);
+            return this.inferOrElseTypes(left, right, e.arguments[0]!, e.arguments[1]!);
+        }
+        if (funcName === 'bind' && e.arguments.length === 2) {
+            const left = this.inferArg(e.arguments[0]!, env);
+            const right = this.inferArg(e.arguments[1]!, env);
+            return this.inferBindTypes(left, right, e.arguments[0]!, e.arguments[1]!);
+        }
         if (funcName === 'merge' && e.arguments.length === 1) {
             return this.inferMergePartial(e.arguments[0]!, e, env);
         }
@@ -991,7 +1058,6 @@ export class Inferencer {
         }
         if (funcName === 'over') return this.inferOver(e, env);
         if (funcName === 'cast' && e.arguments.length === 2) return this.inferCast(e, env, funcName);
-        if (funcName === 'try_cast' && e.arguments.length === 2) return this.inferCast(e, env, funcName);
         let f = this.u.peel(rawF);
         const argTypes: Type[] = [];
         for (let i = 0; i < e.arguments.length; i++) {
@@ -1013,8 +1079,15 @@ export class Inferencer {
             try {
                 this.u.unify(param, argType);
             } catch (err) {
-                if (err instanceof UnifyError) {
-                    this.argError(funcName, i, argExpr, argType, param, f);
+                if (err instanceof ConstraintError) {
+                    this.diag(argExpr, err.constraint === 'Num'
+                        ? `${err.constraint} requires a numeric type, got ${this.u.pretty(argType)}`
+                        : `${err.constraint} requires a supported instance, got ${this.u.pretty(argType)}`);
+                    return this.u.fresh();
+                } else if (err instanceof UnifyError) {
+                    if (!this.reportNumericMix(argExpr, err)) {
+                        this.argError(funcName, i, argExpr, argType, param, f);
+                    }
                     failed = true;
                 } else {
                     throw err;
@@ -1063,6 +1136,295 @@ export class Inferencer {
     }
 
     /**
+     * Closed Functor dispatch for the executable instances currently supported
+     * by the evaluator: maybe values, lists, and query rows.
+     */
+    private inferFmap(
+        e: import('./generated/ast.js').Application,
+        env: Map<string, Scheme>,
+    ): Type {
+        const functionExpr = e.arguments[0]!;
+        const mappedExpr = e.arguments[1]!;
+        const functionType = this.inferArg(functionExpr, env);
+        const mappedType = this.inferArg(mappedExpr, env);
+        return this.inferFmapTypes(functionType, mappedType, functionExpr, mappedExpr);
+    }
+
+    private inferFmapTypes(
+        functionType: Type,
+        mappedType: Type,
+        functionExpr: AstNode,
+        mappedExpr: AstNode,
+    ): Type {
+        const input = this.u.fresh();
+        const output = this.u.fresh();
+        try {
+            this.u.unify(functionType, fun(input, output));
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.diag(functionExpr, `fmap expects a function of one argument, got ${this.u.pretty(functionType)}`);
+                return this.u.fresh();
+            }
+            throw err;
+        }
+
+        const container = this.u.peel(mappedType);
+        try {
+            if (container.kind === 'maybe') {
+                this.u.unify(input, container.of);
+                return maybeOf(output);
+            }
+            if (container.kind === 'list') {
+                this.u.unify(input, container.of);
+                return listOf(output);
+            }
+            if (container.kind === 'var') {
+                // A row field may still be an unresolved variable while its
+                // enclosing map lambda is being inferred. Preserve the
+                // original Maybe default until the row/schema constraint
+                // arrives; concrete list and query containers take the
+                // branches above.
+                this.u.unify(mappedType, maybeOf(input));
+                return maybeOf(output);
+            }
+            if (container.kind === 'query') {
+                const inputRow = this.u.peel(container.row);
+                if (inputRow.kind !== 'row' && inputRow.kind !== 'var') {
+                    throw new UnifyError(inputRow, container.row);
+                }
+                this.u.unify(input, container.row);
+                const outputRow = this.u.peel(output);
+                if (outputRow.kind === 'var') {
+                    const tail = this.u.fresh('row');
+                    this.u.bind(outputRow.id, rowOf([], tail));
+                } else if (outputRow.kind !== 'row') {
+                    throw new UnifyError(outputRow, output);
+                }
+                return queryOf(output);
+            }
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.diag(mappedExpr, `fmap function and mapped value have incompatible types: ${this.u.pretty(functionType)} and ${this.u.pretty(mappedType)}`);
+                return this.u.fresh();
+            }
+            throw err;
+        }
+
+        this.diag(mappedExpr, `fmap has no Functor instance for ${this.u.pretty(mappedType)} — expected maybe, list, or query`);
+        return this.u.fresh();
+    }
+
+    /** Closed `<$`: replace every value in a Functor with one constant. */
+    private inferReplaceTypes(
+        valueType: Type,
+        mappedType: Type,
+        valueExpr: AstNode,
+        mappedExpr: AstNode,
+    ): Type {
+        const container = this.u.peel(mappedType);
+        if (container.kind === 'maybe') return maybeOf(valueType);
+        if (container.kind === 'list') return listOf(valueType);
+        if (container.kind === 'var') {
+            const input = this.u.fresh();
+            try {
+                this.u.unify(mappedType, maybeOf(input));
+                return maybeOf(valueType);
+            } catch (err) {
+                if (!(err instanceof UnifyError)) throw err;
+            }
+        }
+        if (container.kind === 'query') {
+            const output = this.u.peel(valueType);
+            try {
+                if (output.kind === 'var') {
+                    this.u.bind(output.id, rowOf([], this.u.fresh('row')));
+                } else if (output.kind !== 'row') {
+                    throw new UnifyError(output, valueType);
+                }
+                return queryOf(valueType);
+            } catch (err) {
+                if (err instanceof UnifyError) {
+                    this.diag(valueExpr, `replaceWith over a query requires a record value, got ${this.u.pretty(valueType)}`);
+                    return this.u.fresh();
+                }
+                throw err;
+            }
+        }
+        this.diag(mappedExpr, `replaceWith has no Functor instance for ${this.u.pretty(mappedType)} — expected maybe, list, or query`);
+        return this.u.fresh();
+    }
+
+    /** Closed `<*>`: apply functions inside the same maybe/list container. */
+    private inferApTypes(
+        functionsType: Type,
+        valuesType: Type,
+        functionsExpr: AstNode,
+        valuesExpr: AstNode,
+    ): Type {
+        const input = this.u.fresh();
+        const output = this.u.fresh();
+        const container = this.u.peel(functionsType);
+        try {
+            if (container.kind === 'maybe') {
+                this.u.unify(container.of, fun(input, output));
+                this.u.unify(valuesType, maybeOf(input));
+                return maybeOf(output);
+            }
+            if (container.kind === 'list') {
+                this.u.unify(container.of, fun(input, output));
+                this.u.unify(valuesType, listOf(input));
+                return listOf(output);
+            }
+            if (container.kind === 'var') {
+                const values = this.u.peel(valuesType);
+                if (values.kind === 'list') {
+                    this.u.unify(functionsType, listOf(fun(values.of, output)));
+                    return listOf(output);
+                }
+                this.u.unify(functionsType, maybeOf(fun(input, output)));
+                this.u.unify(valuesType, maybeOf(input));
+                return maybeOf(output);
+            }
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.diag(valuesExpr, `ap requires matching Applicative containers and compatible function/value types, got ${this.u.pretty(functionsType)} and ${this.u.pretty(valuesType)}`);
+                return this.u.fresh();
+            }
+            throw err;
+        }
+        this.diag(functionsExpr, `ap has no Applicative instance for ${this.u.pretty(functionsType)} — expected maybe or list`);
+        return this.u.fresh();
+    }
+
+    /** Closed `<*`, `*>`, and `>>`: sequence effects in matching containers. */
+    private inferSequenceTypes(
+        leftType: Type,
+        rightType: Type,
+        leftExpr: AstNode,
+        rightExpr: AstNode,
+        name: 'applyLeft' | 'applyRight' | 'then',
+        keep: 'left' | 'right',
+    ): Type {
+        const left = this.u.peel(leftType);
+        const rightItem = this.u.fresh();
+        try {
+            if (left.kind === 'maybe') {
+                this.u.unify(rightType, maybeOf(rightItem));
+                return maybeOf(keep === 'left' ? left.of : rightItem);
+            }
+            if (left.kind === 'list') {
+                this.u.unify(rightType, listOf(rightItem));
+                return listOf(keep === 'left' ? left.of : rightItem);
+            }
+            if (left.kind === 'var') {
+                const leftItem = this.u.fresh();
+                const right = this.u.peel(rightType);
+                if (right.kind === 'list') {
+                    this.u.unify(leftType, listOf(leftItem));
+                    return listOf(keep === 'left' ? leftItem : right.of);
+                }
+                this.u.unify(leftType, maybeOf(leftItem));
+                this.u.unify(rightType, maybeOf(rightItem));
+                return maybeOf(keep === 'left' ? leftItem : rightItem);
+            }
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.diag(rightExpr, `${name} requires two values in the same Applicative container, got ${this.u.pretty(leftType)} and ${this.u.pretty(rightType)}`);
+                return this.u.fresh();
+            }
+            throw err;
+        }
+        this.diag(leftExpr, `${name} has no Applicative instance for ${this.u.pretty(leftType)} — expected maybe or list`);
+        return this.u.fresh();
+    }
+
+    /** Closed `<|>`: left-biased maybe choice or list concatenation. */
+    private inferOrElseTypes(
+        leftType: Type,
+        rightType: Type,
+        leftExpr: AstNode,
+        rightExpr: AstNode,
+    ): Type {
+        const left = this.u.peel(leftType);
+        try {
+            if (left.kind === 'maybe') {
+                this.u.unify(rightType, maybeOf(left.of));
+                return maybeOf(left.of);
+            }
+            if (left.kind === 'list') {
+                this.u.unify(rightType, listOf(left.of));
+                return listOf(left.of);
+            }
+            if (left.kind === 'var') {
+                const item = this.u.fresh();
+                const right = this.u.peel(rightType);
+                if (right.kind === 'list') {
+                    this.u.unify(leftType, listOf(right.of));
+                    return listOf(right.of);
+                }
+                this.u.unify(leftType, maybeOf(item));
+                this.u.unify(rightType, maybeOf(item));
+                return maybeOf(item);
+            }
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.diag(rightExpr, `orElse requires matching Alternative values, got ${this.u.pretty(leftType)} and ${this.u.pretty(rightType)}`);
+                return this.u.fresh();
+            }
+            throw err;
+        }
+        this.diag(leftExpr, `orElse has no Alternative instance for ${this.u.pretty(leftType)} — expected maybe or list`);
+        return this.u.fresh();
+    }
+
+    /** Closed `>>=`: Maybe short-circuiting and list flat-map. */
+    private inferBindTypes(
+        valueType: Type,
+        functionType: Type,
+        valueExpr: AstNode,
+        functionExpr: AstNode,
+    ): Type {
+        const value = this.u.peel(valueType);
+        const output = this.u.fresh();
+        try {
+            if (value.kind === 'maybe') {
+                this.u.unify(functionType, fun(value.of, maybeOf(output)));
+                return maybeOf(output);
+            }
+            if (value.kind === 'list') {
+                this.u.unify(functionType, fun(value.of, listOf(output)));
+                return listOf(output);
+            }
+            if (value.kind === 'var') {
+                const functionShape = this.u.peel(functionType);
+                if (functionShape.kind === 'fun') {
+                    const returned = this.u.peel(functionShape.to);
+                    if (returned.kind === 'list') {
+                        this.u.unify(valueType, listOf(functionShape.from));
+                        return listOf(returned.of);
+                    }
+                    if (returned.kind === 'maybe') {
+                        this.u.unify(valueType, maybeOf(functionShape.from));
+                        return maybeOf(returned.of);
+                    }
+                }
+                const input = this.u.fresh();
+                this.u.unify(valueType, maybeOf(input));
+                this.u.unify(functionType, fun(input, maybeOf(output)));
+                return maybeOf(output);
+            }
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.diag(functionExpr, `bind expects a function returning the same Monad container as ${this.u.pretty(valueType)}, got ${this.u.pretty(functionType)}`);
+                return this.u.fresh();
+            }
+            throw err;
+        }
+        this.diag(valueExpr, `bind has no Monad instance for ${this.u.pretty(valueType)} — expected maybe or list`);
+        return this.u.fresh();
+    }
+
+    /**
      * `merge r` as a partial application: the returned function still
      * carries the row-union typing, so `extend = merge { active = true }`
      * is a reusable row transformer instead of forgetting the left row.
@@ -1096,8 +1458,8 @@ export class Inferencer {
         return raw.of;
     }
 
-    /** `cast x "int"` / `try_cast x "float"` — the result type is the target. */
-    private inferCast(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, name: 'cast' | 'try_cast'): Type {
+    /** `cast x "int"` — the result type is the target. */
+    private inferCast(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, name: 'cast'): Type {
         this.inferArg(e.arguments[0]!, env);
         const targetExpr = e.arguments[1]!;
         if (isStringLiteral(targetExpr)) {
@@ -1111,35 +1473,44 @@ export class Inferencer {
     }
 
     /**
-     * `join kind right on merger` — for LEFT/RIGHT/FULL joins the
+     * `joinKind right on merger` — for LEFT/RIGHT/FULL joins the
      * null-extended side can produce SQL NULLs, so the merger's output row is
      * explicitly `maybe` on every projected field. INNER joins keep the
      * merger's exact row type.
      */
-    private inferJoin(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
-        const kindName = this.joinKindNameOf(e.arguments[0]);
-        if (kindName === null) {
-            this.argError('join', 0, e.arguments[0]!, this.inferArg(e.arguments[0]!, env), undefined, undefined);
-            return this.u.fresh();
-        }
+    private inferJoin(
+        e: import('./generated/ast.js').Application,
+        env: Map<string, Scheme>,
+        name: JoinBuiltinName,
+        kindName: JoinKindName,
+    ): Type {
         const r = this.u.fresh('row');
         const s = this.u.fresh('row');
         const t = this.u.fresh('flex');
-        const rightT = this.inferArg(e.arguments[1]!, env);
-        const onT = this.inferArg(e.arguments[2]!, env);
-        const mergerT = this.inferArg(e.arguments[3]!, env);
+        const rightT = this.inferArg(e.arguments[0]!, env);
+        const onT = this.inferArg(e.arguments[1]!, env);
+        const mergerT = this.inferArg(e.arguments[2]!, env);
         try {
             this.u.unify(rightT, queryOf(s));
-            this.u.unify(onT, fun(r, fun(s, prim('bool'))));
         } catch (err) {
             if (err instanceof UnifyError) {
-                this.diag(e, `cannot apply a function of type ${this.u.pretty(mergerT)} to the join arguments`);
+                this.argError(name, 0, e.arguments[0]!, rightT, queryOf(s), undefined);
             } else {
                 throw err;
             }
             return this.u.fresh();
         }
-        // `join ... merge` is the advertised full-row-union shorthand. The
+        try {
+            this.u.unify(onT, fun(r, fun(s, prim('bool'))));
+        } catch (err) {
+            if (err instanceof UnifyError) {
+                this.argError(name, 1, e.arguments[1]!, onT, fun(r, fun(s, prim('bool'))), undefined);
+            } else {
+                throw err;
+            }
+            return this.u.fresh();
+        }
+        // A plain `merge` is the advertised full-row-union shorthand. The
         // generic merge scheme returns an unconstrained fresh row, which would
         // lose every projected field and the outer-join nullability of the
         // result. Compute the merge row directly from the left and right rows
@@ -1157,13 +1528,13 @@ export class Inferencer {
                 const resolved = this.u.resolveRow(rt);
                 return rowOf([...resolved.fields], resolved.tail);
             };
-            row = this.inferMerge(mergeInput(r), mergeInput(s), e.arguments[3]!);
+            row = this.inferMerge(mergeInput(r), mergeInput(s), e.arguments[2]!);
         } else {
             try {
                 this.u.unify(mergerT, fun(r, fun(s, t)));
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    this.diag(e, `cannot apply a function of type ${this.u.pretty(mergerT)} to the join arguments`);
+                    this.argError(name, 2, e.arguments[2]!, mergerT, fun(r, fun(s, t)), undefined);
                 } else {
                     throw err;
                 }
@@ -1177,7 +1548,7 @@ export class Inferencer {
             }
         }
         if (row.kind !== 'row') {
-            this.argError('join', 3, e.arguments[3]!, mergerT, undefined, undefined);
+            this.argError(name, 2, e.arguments[2]!, mergerT, undefined, undefined);
             return this.u.fresh();
         }
         if (kindName === 'inner') return fun(queryOf(r), queryOf(row));
@@ -1195,16 +1566,6 @@ export class Inferencer {
             if (tailRoot.kind === 'var') this.u.setVarAbsorbAsMaybe(tailRoot.id, true);
         }
         return fun(queryOf(r), queryOf({ kind: 'row', fields: new Map(fields), tail: resolved.tail }));
-    }
-
-    private joinKindNameOf(node: AstNode | undefined): string | null {
-        let cur = node;
-        while (cur && isApplication(cur) && cur.arguments.length === 0) cur = cur.func;
-        if (cur && isIdentifier(cur)) {
-            const name = cur.name;
-            return name === 'inner' || name === 'left' || name === 'right' || name === 'full' ? name : null;
-        }
-        return null;
     }
 
     /**
@@ -1595,7 +1956,6 @@ export class Inferencer {
             case 'round': expect(0, 'numeric'); expect(1, 'int'); break;
             case 'substring': expect(0, 'string'); expect(1, 'int'); expect(2, 'int'); break;
             case 'lpad': case 'rpad': expect(0, 'string'); expect(1, 'int'); expect(2, 'string'); break;
-            case 'regex_extract': expect(0, 'string'); expect(1, 'string'); expect(2, 'int'); break;
             case 'lag': case 'lead':
                 if (elements.length >= 2) {
                     const offset = this.inferExpr(elements[1]!, env);
@@ -1774,29 +2134,17 @@ export class Inferencer {
         return e;
     }
 
-    /** Report a failed `&` / `$` application when the numeric-mix special case did not apply. */
-    private reportApplyMismatch(node: AstNode, fType: Type, aType: Type, applied: AstNode | undefined, env: Map<string, Scheme>): void {
-        const r = this.u.peel(fType);
-        if (r.kind !== 'fun') {
-            this.diag(node, `cannot apply an expression of type ${this.u.pretty(fType)}`);
-            return;
-        }
-        const name = this.directBuiltinName(applied, env);
-        if (name) {
-            // Builtin argument errors are already produced with the exact
-            // interpreter wording when the expression is evaluated; adding a
-            // second inference message here would only create duplicates.
-            return;
-        }
-        this.diag(node, `cannot apply a function of type ${this.u.pretty(fType)} to an argument of type ${this.u.pretty(aType)}`);
-    }
-
-    /** int/float mixing is invisible to the interpreter (comparable/isNumeric allow it) — inference must report it. */
+    /** Report strict numeric mixing discovered by an enclosing application. */
     private reportNumericMix(node: AstNode, err: UnifyError): boolean {
         const a = this.resolveBase(err.a);
         const b = this.resolveBase(err.b);
         if (a.kind === 'prim' && b.kind === 'prim' && isNumericPrim(a) && isNumericPrim(b) && a.name !== b.name) {
-            this.diag(node, `cannot mix int and float (${a.name} vs ${b.name}) — write a literal of the matching type, e.g. ${a.name === 'int' ? '18' : '18.0'}`);
+            const pair = new Set([a.name, b.name]);
+            if (pair.has('int') && pair.has('float')) {
+                this.diag(node, `cannot mix int and float (${a.name} vs ${b.name}) — write a literal of the matching type, e.g. ${a.name === 'int' ? '18' : '18.0'}`);
+            } else {
+                this.diag(node, `cannot mix numeric types (${a.name} vs ${b.name}) — use values of the same type`);
+            }
             return true;
         }
         return false;
@@ -1847,12 +2195,14 @@ export class Inferencer {
                 else this.diag(node, `sort expects a one-parameter lambda or function, e.g. sort (u => [asc u.name])`);
                 break;
             }
-            case 'join':
-                if (index === 0) this.diag(node, `join expects a join kind as its first argument: inner, left, right or full (a bare identifier, e.g. inner), got an expression of type ${p(argType)}`);
-                else if (index === 1) this.diag(node, `join expects a query as its second argument, got an expression of type ${p(argType)} — bind a table or pipeline first, e.g. join inner orders (l => r => ...)`);
-                else if (index === 2) this.diag(node, `join 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got an expression of type ${p(argType)}`);
-                else if (index === 3) this.diag(node, `join 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got an expression of type ${p(argType)}`);
-                else this.diag(node, `join takes exactly four arguments: a join kind, the right query, the 'on' function, and the merger function`);
+            case 'joinInner':
+            case 'joinLeft':
+            case 'joinRight':
+            case 'joinFull':
+                if (index === 0) this.diag(node, `${name} expects a query as its first argument, got an expression of type ${p(argType)} — bind a table or pipeline first, e.g. ${name} orders (l => r => ...)`);
+                else if (index === 1) this.diag(node, `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got an expression of type ${p(argType)}`);
+                else if (index === 2) this.diag(node, `${name} 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got an expression of type ${p(argType)}`);
+                else this.diag(node, `${name} takes exactly three arguments: the right query, the 'on' function, and the merger function`);
                 break;
             case 'over':
                 this.diag(node, `over expects a window function (row_number, rank, sum, lag, ...), got ${p(argType)}`);
@@ -1876,8 +2226,15 @@ export class Inferencer {
             case 'coalesce':
                 this.diag(node, `coalesce requires matching types, got ${p(param ?? argType)} and ${p(argType)}`);
                 break;
-            default:
-                this.diag(node, `cannot apply an expression of type ${p(fType ?? argType)}`);
+            default: {
+                const applied = fType ? this.u.peel(fType) : null;
+                if (applied?.kind === 'fun') {
+                    this.diag(node, `cannot apply a function of type ${p(fType!)} to an argument of type ${p(argType)}`);
+                } else {
+                    this.diag(node, `cannot apply an expression of type ${p(fType ?? argType)}`);
+                }
+                break;
+            }
         }
     }
 
@@ -2015,7 +2372,8 @@ export class Inferencer {
         }
         if (isTypeVar(t)) {
             const name = t.name;
-            if (isPrimName(name)) return prim(name);
+            const primitive = primitiveName(name);
+            if (primitive) return prim(primitive);
             const alias = this.typeAliases.get(name);
             if (alias) {
                 if (this.activeTypeAliases.has(name)) {
@@ -2186,9 +2544,13 @@ export class Inferencer {
 }
 
 /** Infer a project: modules in import order (imports first, root last). */
-export function inferProject(modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map()): InferProjectResult {
+export function inferProject(
+    modules: readonly ProjectModule[],
+    importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map(),
+    prelude?: ProjectModule,
+): InferProjectResult {
     const inferencer = new Inferencer();
-    inferencer.inferProject(modules, importsByModule);
+    inferencer.inferProject(modules, importsByModule, prelude);
     return {
         diagnostics: inferencer.diagnostics,
         nodeTypes: inferencer.nodeTypes,
@@ -2198,8 +2560,8 @@ export function inferProject(modules: readonly ProjectModule[], importsByModule:
 }
 
 /** Infer a single module (no imports). */
-export function infer(model: Model): { diagnostics: InferDiagnostic[] } {
-    return inferProject([{ model, uri: undefined, imports: [] }], new Map());
+export function infer(model: Model, prelude?: ProjectModule): { diagnostics: InferDiagnostic[] } {
+    return inferProject([{ model, uri: undefined, imports: [] }], new Map(), prelude);
 }
 
 /**

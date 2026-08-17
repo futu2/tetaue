@@ -92,7 +92,7 @@ describe('tetaue formatter', () => {
             '    total_spent: float,',
             '} = adults',
             '    & map (u => { uid = u.id, name = u.name })',
-            '    & join inner orders ',
+            '    & joinInner orders ',
             '      (l => r => l.uid == r.user_id) ',
             '      (l => r => {',
             '        user_id = r.user_id,',
@@ -116,7 +116,7 @@ describe('tetaue formatter', () => {
             '    total_spent: float,',
             '} = adults',
             '    & map (u => { uid = u.id, name = u.name })',
-            '    & join inner orders',
+            '    & joinInner orders',
             '    (l => r => l.uid == r.user_id)',
             '    (l => r => {',
             '        user_id = r.user_id,',
@@ -138,14 +138,14 @@ describe('tetaue formatter', () => {
     test('a comment between continuation lines stays in the expression', () => {
         const input = [
             'q = users',
-            '    & join inner orders',
+            '    & joinInner orders',
             '# the on clause',
             '    (l => r => l.uid == r.user_id)',
             '    & take 5',
         ].join('\n');
         const expected = [
             'q = users',
-            '    & join inner orders',
+            '    & joinInner orders',
             '    # the on clause',
             '    (l => r => l.uid == r.user_id)',
             '    & take 5',

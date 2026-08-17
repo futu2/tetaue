@@ -40,7 +40,7 @@ describe('derived columns (review fixes)', () => {
             orders: query { user_id: int } = table "orders"
             q = users
                 & map (u => { a = u.id })
-                & join inner orders (u => o => u.a == o.user_id) (u => o => { a = u.a, oid = o.user_id })
+                & joinInner orders (u => o => u.a == o.user_id) (u => o => { a = u.a, oid = o.user_id })
         `);
         expect(sql).toContain('ON users.id = orders.user_id');
     });
@@ -224,7 +224,7 @@ describe('aggregation edges (review fixes)', () => {
             users: query { id: int } = table "users"
             q = orders
                 & fold (o => { user_id = group o.user_id, total = sum o.total })
-                & join inner users (o => u => o.user_id == u.id) (o => u => { user_id = o.user_id, id = u.id })
+                & joinInner users (o => u => o.user_id == u.id) (o => u => { user_id = o.user_id, id = u.id })
         `);
         expect(sql).toBe([
             'SELECT',
@@ -247,7 +247,7 @@ describe('aggregation edges (review fixes)', () => {
             users: query { id: int } = table "users"
             q = orders
                 & fold (o => { user_id = group o.user_id, total = sum o.total })
-                & join inner users (o => u => o.user_id == u.id) (o => u => { user_id = o.user_id, id = u.id })
+                & joinInner users (o => u => o.user_id == u.id) (o => u => { user_id = o.user_id, id = u.id })
                 & filter (r => is_in r.id [1, 2])
         `);
         expect(sql).toContain('WHERE users.id IN (1, 2)');
@@ -260,7 +260,7 @@ describe('aggregation edges (review fixes)', () => {
             users: query { id: int, name: string } = table "users"
             totals = orders & fold (o => { user_id = group o.user_id, total = sum o.total })
             q = totals
-                & join left users ($1.user_id == $2.id) merge
+                & joinLeft users ($1.user_id == $2.id) merge
                 & filter (r => is_in r.user_id [1, 2])
         `);
         expect(sql).toBe([
@@ -295,7 +295,7 @@ describe('self-joins (review fix)', () => {
         const sql = render(`
             a: query { id: int } = table "users"
             b: query { uid: int } = table "users"
-            q = a & join inner b (l => r => l.id == r.uid) (l => r => { id = l.id, uid = r.uid })
+            q = a & joinInner b (l => r => l.id == r.uid) (l => r => { id = l.id, uid = r.uid })
         `);
         // The right side is the named binding `b`, so its alias is the binding
         // name (not a table-derived `users_1`) — the SQL reads like the source.
@@ -308,8 +308,8 @@ describe('self-joins (review fix)', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q1 = users & join inner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
-            q2 = users & join inner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q1 = users & joinInner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q2 = users & joinInner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
         expect(sql).toContain('INNER JOIN orders ON');
         expect(sql).not.toContain('orders_1');

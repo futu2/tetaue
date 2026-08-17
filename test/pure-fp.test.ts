@@ -1,13 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { analyze, evalExpr, BUILTINS, type Value } from '../src/language/interpreter.ts';
 import { collectModuleTree } from '../src/language/imports.ts';
+import { standardPrelude } from '../src/language/prelude.ts';
 import { renderQuery, renderQueryWithCtes, DIALECTS } from '../src/language/render.ts';
-import { allErrors, parseModel, render, typeErrors } from './helpers.ts';
+import { allErrors, parseModel, render, services, typeErrors } from './helpers.ts';
 
 describe('pure evaluation API', () => {
     test('evalExpr returns diagnostics instead of mutating shared state', () => {
-        const valid = parseModel(`users: query { id: int } = table "users"\nq = users & take 1`);
-        const analyzed = analyze(valid);
+        const valid = parseModel(`users: query { id: int } = table "users"\nq = take 1 users`);
+        const analyzed = analyze(valid, standardPrelude(services));
         expect(analyzed.value.kind).toBe('query');
         if (analyzed.value.kind !== 'query') return;
 
@@ -17,22 +18,20 @@ describe('pure evaluation API', () => {
         expect(ok.ok).toBe(true);
         if (ok.ok) expect(ok.value.kind).toBe('query');
 
-        const badModel = parseModel(`users: query { id: int } = table "users"\nq = users & filter (u => u.id == "x")`);
+        const badModel = parseModel(`users: query { id: int } = table "users"\nq = filter (u => u.id == "x") users`);
         const bad = evalExpr(badModel.bindings[1]!.value, env, new Set(['users', 'q']));
         expect(bad.ok).toBe(false);
         expect(bad.diagnostics.map(d => d.message).join('\n')).toContain('cannot compare int with string');
     });
 
-    test('renderQuery returns capability errors as data', () => {
+    test('renderQuery lowers scalar functions without capability errors', () => {
         const model = parseModel(`users: query { name: string } = table "users"\nq = users & map (u => { v = reverse u.name })`);
-        const { value } = analyze(model);
+        const { value } = analyze(model, standardPrelude(services));
         expect(value.kind).toBe('query');
         if (value.kind !== 'query') return;
         const result = renderQuery(value.query, DIALECTS.sqlite!);
-        expect(result.ok).toBe(false);
-        if (!result.ok) {
-            expect(result.diagnostics.map(d => d.message).join('\n')).toContain('reverse is not supported for the sqlite dialect');
-        }
+        expect(result.ok).toBe(true);
+        if (result.ok) expect(result.sql).toContain('WITH RECURSIVE __tetaue_reverse');
     });
 
     test('collectModuleTree does not mutate the caller root imports', () => {
@@ -54,9 +53,9 @@ const USERS_B = `b: query { id: int, name: string } = table "b"`;
 
 describe('opt-in CTE rendering', () => {
     test('named intermediates can render as WITH clauses', () => {
-        const src = `users: query { id: int } = table \"users\"\norders: query { id: int, user_id: int } = table \"orders\"\npaid = orders & filter (o => o.id > 0)\nq = users & join inner paid (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.id })`;
+        const src = `users: query { id: int } = table \"users\"\norders: query { id: int, user_id: int } = table \"orders\"\npaid = orders & filter (o => o.id > 0)\nq = users & joinInner paid (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.id })`;
         const model = parseModel(src);
-        const { value } = analyze(model);
+        const { value } = analyze(model, standardPrelude(services));
         expect(value.kind).toBe('query');
         if (value.kind !== 'query') return;
         const result = renderQueryWithCtes(value.query, DIALECTS.postgresql!);
@@ -90,7 +89,7 @@ describe('pure set combinators', () => {
     test('dialect join capabilities are enforced', () => {
         const src = `a: query { id: int } = table "a"
 b: query { id: int } = table "b"
-q = a & join full b (l => r => l.id == r.id) (l => r => { id = l.id })`;
+q = a & joinFull b (l => r => l.id == r.id) (l => r => { id = l.id })`;
         expect(() => render(src, 'mysql')).toThrow(/full join is not supported/);
         expect(render(src, 'postgresql')).toContain('FULL JOIN');
     });
@@ -143,7 +142,7 @@ describe('record update sugar', () => {
 describe('set-operation capabilities', () => {
     test('hive rejects INTERSECT and EXCEPT', () => {
         const model = parseModel(`${USERS_A}\n${USERS_B}\nq = a & except b`);
-        const { value } = analyze(model);
+        const { value } = analyze(model, standardPrelude(services));
         expect(value.kind).toBe('query');
         if (value.kind !== 'query') return;
         const result = renderQuery(value.query, DIALECTS.hive!);

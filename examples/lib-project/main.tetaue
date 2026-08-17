@@ -20,7 +20,7 @@ adult_users = users
 
 # spending: per-user order totals from the vendored acme tables.
 spending = users
-    & join inner orders (l => r => l.id == r.user_id) (l => r => {
+    & joinInner orders (l => r => l.id == r.user_id) (l => r => {
         user_id = r.user_id,
         name = l.name,
         total = r.total,

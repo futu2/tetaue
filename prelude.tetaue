@@ -1,23 +1,156 @@
+# The public language surface is ordinary source; only @ names are core.
+# Scalar types are aliases for the reserved core type namespace.
+export type int = @int
+export type float = @float
+export type decimal = @decimal
+export type string = @string
+export type bool = @bool
+export type date = @date
+export type timestamp = @timestamp
+
+# Public SQL functions are ordinary aliases of the reserved core namespace.
+export param = @param
+export table = @table
+export filter = @filter
+export select = @select
+export map = @map
+export fold = @fold
+export group_by = @group_by
+export sort = @sort
+export take = @take
+export drop = @drop
+export recursive = @recursive
+export distinct = @distinct
+export join_lateral = @join_lateral
+export joinInner = @joinInner
+export joinLeft = @joinLeft
+export joinRight = @joinRight
+export joinFull = @joinFull
+export union = @union
+export union_all = @union_all
+export intersect = @intersect
+export except = @except
+export asc = @asc
+export desc = @desc
+export count_distinct = @count_distinct
+export count_where = @count_where
+export sum_where = @sum_where
+export avg_where = @avg_where
+export min_where = @min_where
+export max_where = @max_where
+export count = @count
+export sum = @sum
+export avg = @avg
+export min = @min
+export max = @max
+export list = @list
+export group = @group
+export merge = @merge
+export exists = @exists
+export scalar = @scalar
+export not = @not
+export in_query = @in_query
+export is_in = @is_in
+export like = @like
+export upper = @upper
+export lower = @lower
+export length = @length
+export abs = @abs
+export coalesce = @coalesce
+export date = @date
+export timestamp = @timestamp
+export current_date = @current_date
+export current_timestamp = @current_timestamp
+export extract = @extract
+export year = @year
+export month = @month
+export day = @day
+export day_of_week = @day_of_week
+export hour = @hour
+export minute = @minute
+export second = @second
+export date_add = @date_add
+export date_diff = @date_diff
+export date_trunc = @date_trunc
+export date_format = @date_format
+export date_parse = @date_parse
+export to_unixtime = @to_unixtime
+export from_unixtime = @from_unixtime
+export ceil = @ceil
+export floor = @floor
+export sqrt = @sqrt
+export pow = @pow
+export div = @div
+export mod = @mod
+export trim = @trim
+export reverse = @reverse
+export position = @position
+export replace = @replace
+export left_substring = @left_substring
+export fmap = @fmap
+export replaceWith = @replaceWith
+export ap = @ap
+export applyLeft = @applyLeft
+export applyRight = @applyRight
+export orElse = @orElse
+export bind = @bind
+export then = @then
+export just = @just
+export nothing = @nothing
+export from_maybe = @from_maybe
+export null_if = @null_if
+export is_null = @is_null
+export is_true = @is_true
+export is_false = @is_false
+export is_unknown = @is_unknown
+export cast = @cast
+export concat = @concat
+export greatest = @greatest
+export round = @round
+export substring = @substring
+export lpad = @lpad
+export lag = @lag
+export over = @over
+export row_number = @row_number
+export rank = @rank
+export dense_rank = @dense_rank
+export percent_rank = @percent_rank
+export ntile = @ntile
+export is_not_in = @is_not_in
+export right_substring = @right_substring
+export least = @least
+export rpad = @rpad
+export lead = @lead
+export not_in_query = @not_in_query
+
 # The standard library is intentionally ordinary tetaue code. Keep SQL
 # implementation primitives in the TypeScript core and put reusable
 # functional definitions here.
-export _>>>_ = __op_compose_forward
-export _<<<_ = __op_compose_backward
-export _*_ = __op_multiply
-export _/_ = __op_divide
-export _+_ = __op_add
-export _-_ = __op_subtract
-export _<>_ = __op_merge
-export _==_ = __op_equal
-export _!=_ = __op_not_equal
-export _<_ = __op_less_than
-export _<=_ = __op_less_than_or_equal
-export _>_ = __op_greater_than
-export _>=_ = __op_greater_than_or_equal
-export _&&_ = __op_and
-export _||_ = __op_or
-export _&_ = __op_pipeline
-export _$_ = __op_apply
+export _>>>_ = f => g => x => g (f x)
+export _<<<_ = f => g => x => f (g x)
+export _*_ = @op_multiply
+export _/_ = @op_divide
+export _+_ = @op_add
+export _-_ = @op_subtract
+export _<>_ = @op_merge
+export _==_ = @op_equal
+export _!=_ = @op_not_equal
+export _<_ = @op_less_than
+export _<=_ = @op_less_than_or_equal
+export _>_ = @op_greater_than
+export _>=_ = @op_greater_than_or_equal
+export _&&_ = @op_and
+export _||_ = @op_or
+export _&_ = x => f => f x
+export _$_ = f => x => f x
+export _<$>_ = fmap
+export _<$_ = replaceWith
+export _<*>_ = ap
+export _<*_ = applyLeft
+export _*>_ = applyRight
+export _<|>_ = orElse
+export _>>=_ = bind
+export _>>_ = then
 
 export id = x => x
 export const = x => y => x

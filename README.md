@@ -4,13 +4,13 @@ A pure functional SQL query language, built with [Langium](https://github.com/ec
 on bun + TypeScript.
 
 **Syntax** is inspired by [moria](https://codeberg.org/mikitori/moria) (maps `{ k = v }`,
-`a => a` lambdas, bare builtin names from a small prelude, `#` comments, multi-file
+`a => a` lambdas, public names from a source prelude, `#` comments, multi-file
 modules via `import`).
 **Semantics** follow [teta](https://github.com/futu2/teta): queries are immutable values
 composed from curried functions with the `&` operator, and rendered to SQL per dialect
 at render time. Records are first-class values accessed with plain field syntax
 (`u.age`), and every pipeline step is a function over row lambdas (`filter`, `map`,
-`sort`, `fold`, `join`, ...).
+`sort`, `fold`, `joinInner`, ...).
 
 ```
 # examples/adults.tetaue
@@ -200,8 +200,10 @@ type annotation IS the table's schema.
 ### Core and standard prelude
 
 The language is checked and evaluated by one shared pass (`checkProject`). Its
-TypeScript core is limited to SQL-aware primitives. Reusable functional
-helpers live in [`prelude.tetaue`](prelude.tetaue) and are processed by the
+TypeScript core is limited to SQL-aware primitives, all reserved under `@`
+(`@filter`, `@table`, `@int`, ...). Reusable functional helpers and public
+aliases (`filter = @filter`, `type int = @int`) live in
+[`prelude.tetaue`](prelude.tetaue) and are processed by the
 same parser, inference engine, and interpreter as application code. The
 standard helpers include the `_op_` bindings, `id`, `const`, `compose`, `flip`,
 `pipe`, and the derived Maybe predicates; local bindings and imports may shadow
@@ -218,7 +220,7 @@ adults = users & filter (u => u.active) & take 5
 
 (That module's query is `adults`.) Application arguments may be literals,
 maps, lists, lambdas, parenthesized expressions, `u.field` access chains, or
-**bare identifiers** — `filter adult`, `join inner orders (l => r => ...)`. Bindings
+**bare identifiers** — `filter adult`, `joinInner orders (l => r => ...)`. Bindings
 still need no terminator because an identifier lexes as an *argument* only when
 it is not followed by `:` or `=` (ignoring whitespace) — so the next binding's
 name (`x = ...`, `x: T = ...`) can never be swallowed as an argument.
@@ -243,7 +245,7 @@ report: query {
     order_count: int,
 } = adults
     & map { uid = $1.id, name = $1.name }
-    & join inner orders (l => r => l.uid == r.user_id) (l => r => { user_id = r.user_id, name = l.name, order_id = r.id })
+    & joinInner orders (l => r => l.uid == r.user_id) (l => r => { user_id = r.user_id, name = l.name, order_id = r.id })
     & fold (r => { user_id = group r.user_id, name = group r.name, order_count = count r.order_id })
     & take 20
 ```
@@ -368,14 +370,14 @@ u & filter ...        # pipeline: apply the step to the query
   new `sort` replaces the previous one.
 - `filter` keeps the rows whose predicate is true. After a `fold` it becomes
   `HAVING`.
-- A `fold` ends the flat `FROM` scope: `map`, `join`, and further `fold`s
+- A `fold` ends the flat `FROM` scope: `map`, joins, and further `fold`s
   after a `fold` run on the aggregated result, which is wrapped as a derived
   table (teta-style) — so you can project the aggregate
   (`fold ... & map (r => { t = r.total })`), aggregate it again
   (`map (r => { g = sum r.total })` or another `fold`), or join it:
   ```
   totals = orders & fold (o => { user_id = group o.user_id, total = sum o.total })
-  enriched = totals & join left users (t => u => t.user_id == u.id) (t => u => { uid = t.user_id, name = u.name })
+  enriched = totals & joinLeft users (t => u => t.user_id == u.id) (t => u => { uid = t.user_id, name = u.name })
   # SELECT
   #     totals.user_id, totals.total, users.id, users.name
   # FROM (SELECT user_id, SUM(total) AS total FROM orders
@@ -387,15 +389,14 @@ u & filter ...        # pipeline: apply the step to the query
   ```
   users & map (u => { id = u.id, name = upper u.name, age = u.age, active = u.active })
   ```
-- `merge l r` (also written infix `l <> r`) combines two records — extend a
-  row with computed fields (`map (u => u <> { active = u.age >= 18 })`), or
-  layer two projections. The right record wins on overlapping fields
-  (JS/Nix object-spread style); the result keeps the left row's other
-  fields, and row polymorphism sees the full union
-  (`query { id, name, active | r }`). With the empty record as identity it
-  is a monoid, hence the `<>` spelling (Haskell/PureScript). Merging a row
-  with an unknown schema (an un-annotated table) is an error — annotate the
-  table.
+- `merge l r` combines two records — extend a row with computed fields
+  (`map (u => u <> { active = u.age >= 18 })`), or layer two projections.
+  The right record wins on overlapping fields (JS/Nix object-spread style);
+  the result keeps the left row's other fields, and row polymorphism sees the
+  full union (`query { id, name, active | r }`). The `<>` operator also
+  concatenates strings and lists as closed Semigroup/Monoid instances; string
+  concatenation uses the dialect-aware `concat` lowering. Merging a row with
+  an unknown schema (an un-annotated table) is an error — annotate the table.
 - `<<<`/`>>>` compose **functions** point-free (`f <<< g` = `x => f (g x)`),
   so bound predicates are reusable: `adult = u => u.age >= 18` then
   `filter (adult)`. Query steps compose too:
@@ -409,6 +410,13 @@ u & filter ...        # pipeline: apply the step to the query
   resolves an exact `_name_` binding first and then an ordinary function, so
   `_div_ 5 2` calls `div`, and `_combine_ x y` can call a user-defined curried
   function named `_combine_` or `combine`.
+- The closed container classes use their familiar operators. Functor supplies
+  `<$` and `<$>`; Applicative supplies `<*>`, `<*`, and `*>`; Alternative
+  supplies `<|>`; Monad supplies `>>=` and `>>`. Maybe values and lists support
+  the Applicative/Alternative/Monad family. Lists use Cartesian-product
+  sequencing and `>>=` is flat-map. Queries intentionally support only
+  Functor mapping; relational composition stays explicit through query steps
+  and fixed join functions.
 
 ### Types
 
@@ -419,11 +427,22 @@ column. There is **no implicit `T` -> `(maybe T)` conversion**: `null` has
 type `forall a. (maybe a)`, `is_null`/`is_not_null` test a maybe value,
 and `from_maybe default x` unwraps it (`COALESCE`). `just x` lifts a
 non-null value into maybe, `nothing` is the maybe constant, and
-`fmap f x` lifts a function over maybe (`fmap upper email`). `int` and
-`float` are distinct — no implicit promotion: `u.age >= 18` is fine, but
+`fmap f x` lifts a function over a maybe, list, or query (`fmap upper email`,
+`fmap (x => x + 1) [1, 2]`, or `fmap (u => { id = u.id }) users`). The same
+closed operations have named forms: `replaceWith`, `ap`, `applyLeft`,
+`applyRight`, `orElse`, `bind`, and `then`. Their infix forms are normally more
+compact: `0 <$ xs`, `f <$> xs`, `fs <*> xs`, `a <|> b`, and `xs >>= f`.
+`int` and `float` are distinct — no implicit promotion: `u.age >= 18` is fine, but
 `u.age >= 18.0` (int column vs float literal) is a type error; write
 `18.0` against a `float` column. Haskell-base numerics: `/` is fractional
-division (`float -> float -> float`), `div`/`mod` are integral.
+division (`float -> float -> float`), `div`/`mod` are integral. `+`, `-`, and
+`*` use constrained polymorphism: `Num t => t -> t -> t`, with `int`, `float`,
+and `decimal` as the current `Num` instances; unary `-` has type
+`Num t => t`. Equality uses the closed `Eq` scalar instances, ordering uses
+`Ord`, and `<>` uses closed string/list Semigroup instances in addition to
+structural record merge. Consequently
+`add = x => y => x + y` stays numeric when generalized and cannot later be
+applied to strings.
 
 SQL three-valued predicates are explicit: `is_true x` and `is_false x` test
 the TRUE/FALSE branches, while `is_unknown x` tests SQL `NULL`. They accept
@@ -478,9 +497,6 @@ type errors, so they never disagree.
 The type system encodes the SQL phases a query step lives in, so mode mistakes
 are static errors, not runtime surprises:
 
-- **Join kinds** (`inner`, `left`, `right`, `full`) are a dedicated `join kind`
-  type — `join "inner" ...` is a type error, the kind is a constant, not a
-  string.
 - **Aggregates** (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `list`) have aggregate
   mode (`sum o.total : agg float`) and `group` has group mode
   (`group o.user_id : group int`). A `fold` entry that is neither is a type
@@ -510,22 +526,22 @@ are static errors, not runtime surprises:
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
 | `fold (o => { k = group o.k, s = sum o.v })` | aggregation | `SELECT ... GROUP BY ...` |
 | `group_by (o => { k = group o.k })` | grouping without aggregates | `SELECT ... GROUP BY ...` |
-| `join inner table ($1.id == $2.user_id) { uid = $1.id }` | join | `... JOIN ... ON ...` |
+| `joinInner table ($1.id == $2.user_id) { uid = $1.id }` | inner join; `joinLeft`, `joinRight`, and `joinFull` select the outer variants | `... JOIN ... ON ...` |
 | `join_lateral (l => right) (l => r => on) (l => r => row)` | lateral join | `INNER JOIN LATERAL (...) ON ...` (PG/MySQL) |
 | `recursive (self => termQuery)` | fixed point | `WITH RECURSIVE ... UNION ALL ...` |
 
 Everything is curried: `filter (u => ...)` is a *step* value; applying it to a query
 (`users & filter (u => ...)`) builds a new query. Steps are first-class values, so you
-can bind them and reuse them. `join` composes the same way. It takes FOUR positional
-arguments — the join kind (`inner`, `left`, `right` or `full`, a bare identifier), the
-right-hand query, and the two-argument (curried) `on` and `merger` functions
-that projects the result row (like `map`, with both rows in scope). The merger may
+can bind them and reuse them. The four join steps are `joinInner`, `joinLeft`,
+`joinRight`, and `joinFull`. Each takes three positional arguments: the right-hand
+query and the two-argument (curried) `on` and `merger` functions. The merger projects
+the result row (like `map`, with both rows in scope) and may
 also be a plain two-argument function — `merge` itself works, giving the full union
 of both rows (right wins on overlap):
 
 ```
 paid_orders = orders & filter (o => o.status == "paid")
-q = users & join inner paid_orders ($1.id == $2.user_id) merge
+q = users & joinInner paid_orders ($1.id == $2.user_id) merge
 ```
 
 The right side is a first-class query VALUE (any binding or pipeline — stepped right
@@ -550,6 +566,10 @@ exists (orders & filter ...)   # correlated EXISTS subquery
 scalar (orders & ... & take 1) # scalar subquery, one nullable column
 in_query u.id (orders & map ...) # IN (SELECT ...)
 fmap upper u.email             # lift a function over (maybe T)
+0 <$ [1, 2]                    # [0, 0]
+(x => x + 1) <$> [1, 2]        # [2, 3]
+[1, 2] <|> [3]                 # Alternative choice / list concatenation
+[1, 2] >>= (x => [x, x + 10])  # Monad bind / list flat-map
 param "user_id"                # SQL bind parameter
 upper u.name  lower u.name     # UPPER / LOWER
 length u.name                  # LENGTH
@@ -579,16 +599,14 @@ trim u.name  reverse u.name  replace u.name "x" "y"
 substring [u.name, 1, 3]             # optional length; sqlite renders SUBSTR
 position u.name "a"                    # POSITION / LOCATE / INSTR, per dialect
 left_substring u.name 3  right_substring u.name 2
-lpad [u.code, 8, "0"]  rpad [u.code, 8, "0"]   # sqlite has no LPAD/RPAD (render error)
-regex_like u.name "^[A-Z]"  regex_replace u.name "[0-9]" "#"
-regex_extract [u.name, "([0-9]+)", 1]   # group arg is Trino-only
+lpad [u.code, 8, "0"]  rpad [u.code, 8, "0"]
 like u.name "a%"                       # x LIKE pattern
 null_if u.name ""  is_null u.name  is_not_null u.name
 is_true u.flag  is_false u.flag  is_unknown u.flag
 case { u.active => u.name, _ => "inactive" }    # CASE WHEN active THEN name ELSE 'inactive' END
 case { u.age < 18 => "minor", u.age >= 65 => "senior", _ => "adult" }   # multi-branch; `_` is the fallback
 case u.code { "101" => "one", "102" => "two", _ => u.code }   # simple case: branches compare with the subject
-cast u.id "string"  try_cast u.name "int"   # TRY_CAST is Trino-only
+cast u.id "string"
 over row_number { partition = [u.dept], order = [desc u.salary] }   # window functions — parens optional for zero-arg fns
 over rank { partition = [u.dept] }          # rank / dense_rank / percent_rank
 over (ntile 4) { partition = [u.dept] }     # multi-arg fns keep parens
@@ -626,7 +644,7 @@ Lambdas abstract over a row. Two ways to write them:
   ```
   filter ($1.active && $1.age >= 18)          # ≡ filter (u => u.active && u.age >= 18)
   map { id = $1.id, name = $1.name }          # braces delimit the lambda — no extra parens
-  join inner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.id }   # $1 left row, $2 right row; the merger projects the result row
+  joinInner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.id }   # $1 left row, $2 right row; the merger projects the result row
   ```
   Parens inside are pure grouping: `map { a = ($1.id + 1) }` means exactly the same
   as `map { a = $1.id + 1 }` — `$n` binds to the enclosing argument (the outermost
@@ -636,7 +654,7 @@ Lambdas abstract over a row. Two ways to write them:
   available inside an explicit body.
 
 A lambda body extends until the next `&` (pipeline) or `$` (application) at the same
-level — `join inner orders (l => r => l.id == r.user_id) (l => r => { id = l.id }) & take 3`
+level — `joinInner orders (l => r => l.id == r.user_id) (l => r => { id = l.id }) & take 3`
 ends the merger at the record and pipelines `take 3` to the join. To use `&`/`$`
 inside a lambda body, parenthesize it: `u => (u.a & take 1)`.
 
@@ -648,19 +666,24 @@ value, so `users & adults` works.
 Columns are only accessible through a lambda's row parameter (a first-class record),
 and the schema follows the pipeline: after `map (u => { id = u.id, name = u.name })`
 the row only has `id` and `name`. After a
-`join`, both tables' columns are in scope inside the `on` and `merger` lambdas and
+a join, both tables' columns are in scope inside the `on` and `merger` lambdas and
 rendered qualified (`users.id`, `orders.user_id`). The result row is exactly
 what the merger projects — overlapping column names are fine, just pick them apart
 in the merger (e.g. `{ left_id = l.id, right_id = r.id }`).
 
 ## Dialects
 
-Built-in renderers: `sqlite`, `postgresql`, `mysql`, `trino`, `hive`. Rendering is capability-driven:
-identifier quoting, boolean literals, and string-literal escaping resolve at render time,
-so one query can target any dialect. Capability gaps are render errors, never
-silently invalid SQL: SQLite `greatest`/`least` lower to scalar `MAX`/`MIN`,
-PostgreSQL `regex_like` uses the `~` operator, and two-argument `lpad`/`rpad`
-get an explicit space pad. Hive supports `UNION`/`UNION ALL` only — `intersect` and `except` are render errors.
+Built-in renderers: `sqlite`, `postgresql`, `mysql`, `trino`, `hive`. Rendering is
+dialect-aware: identifier quoting, boolean literals, string escaping, and every
+scalar/date builtin resolve at render time, so the same query source can target
+any dialect. Functions use native names where available and compositional
+fallbacks elsewhere (for example SQLite `greatest`/`least` use `MAX`/`MIN`,
+`lpad`/`rpad` use `printf`/`substr`, and `reverse` uses a scalar recursive CTE).
+Backend-specific functions without a semantics-preserving lowering, including
+regular-expression helpers and `try_cast`, are not part of the common prelude.
+Capability diagnostics are reserved for query-shape features that a backend
+cannot express natively, such as Hive recursive CTEs or a dialect's missing
+lateral join form; they are reported before SQL text is emitted.
 
 ## VS Code extension
 
@@ -772,6 +795,9 @@ builds the typed SQL IR and returns exact-deduped diagnostics — so `check` and
 ## Roadmap
 
 - external schema/catalog declarations and a strict-schema project mode
+- user-declared type classes and instances (the compiler currently owns closed
+  `Num`, `Eq`, `Ord`, `Semigroup`, `Monoid`, `Functor`, `Applicative`,
+  `Alternative`, and `Monad` instances)
 - query cardinality types for scalar and singleton subqueries
 - more pure optimizer rewrites: projection pruning, safe predicate pushdown,
   and common-subexpression/CTE sharing

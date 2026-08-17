@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { render, errors, typeErrors, allErrors, parseModel } from './helpers.ts';
+import { render, errors, typeErrors, allErrors, parseModel, services } from './helpers.ts';
+import { checkProject } from '../src/language/checker.ts';
+import { standardPrelude } from '../src/language/prelude.ts';
+import type { SqlNode, Value } from '../src/language/interpreter.ts';
 
 const USERS = `users: query {
     id: int,
@@ -7,6 +10,35 @@ const USERS = `users: query {
     balance: float,
     active: bool,
 } = table "users"`;
+
+function checkedPureValue(source: string): Value {
+    const result = checkProject(
+        [{ model: parseModel(source), uri: undefined, imports: [] }],
+        { requireQuery: false, prelude: standardPrelude(services) },
+    );
+    expect(result.diagnostics.map(d => d.message)).toEqual([]);
+    return result.value;
+}
+
+function literalList(source: string): unknown[] {
+    const value = checkedPureValue(source);
+    expect(value.kind).toBe('list');
+    if (value.kind !== 'list') return [];
+    return value.items.map(item => item.kind === 'expr' ? constantSqlValue(item.node) : item.kind);
+}
+
+function constantSqlValue(node: SqlNode): unknown {
+    if (node.kind === 'lit') return node.value;
+    if (node.kind === 'bin') {
+        const left = constantSqlValue(node.left);
+        const right = constantSqlValue(node.right);
+        if (typeof left === 'number' && typeof right === 'number') {
+            if (node.op === '+') return left + right;
+            if (node.op === '*') return left * right;
+        }
+    }
+    return node.kind;
+}
 
 describe('math functions', () => {
     test('ceil/floor/sqrt/pow/mod/round render (default dialects)', () => {
@@ -103,39 +135,18 @@ describe('string functions', () => {
         expect(render(src, 'sqlite')).toContain('SUBSTR(name, -2) AS r');
     });
 
-    test('lpad/rpad render directly; sqlite errors', () => {
+    test('lpad/rpad render directly in every dialect', () => {
         const src = `${USERS}\nq = users & map (u => { l = lpad [u.name, 8, "0"], r = rpad [u.name, 8, "0"] })`;
         expect(render(src, 'trino')).toContain(`LPAD(name, 8, '0') AS l`);
         expect(render(src, 'trino')).toContain(`RPAD(name, 8, '0') AS r`);
-        expect(() => render(src, 'sqlite')).toThrow('lpad is not supported for the sqlite dialect');
+        expect(render(src, 'sqlite')).toContain("ELSE SUBSTR(REPLACE(PRINTF('%*s', 8, ''), ' ', '0'), 1, 8 - LENGTH(name)) || name END AS l");
+        expect(render(src, 'sqlite')).toContain("ELSE name || SUBSTR(REPLACE(PRINTF('%*s', 8, ''), ' ', '0'), 1, 8 - LENGTH(name)) END AS r");
     });
 
-    test('reverse errors on sqlite only', () => {
+    test('reverse renders on every dialect', () => {
         const src = `${USERS}\nq = users & map (u => { v = reverse u.name })`;
-        expect(() => render(src, 'sqlite')).toThrow('reverse is not supported for the sqlite dialect');
+        expect(render(src, 'sqlite')).toContain('WITH RECURSIVE __tetaue_reverse');
         expect(render(src, 'hive')).toContain('REVERSE(name) AS v');
-    });
-});
-
-describe('regex functions', () => {
-    test('regex_like lowers per dialect', () => {
-        const src = `${USERS}\nq = users & filter (u => regex_like u.name "^[A-Z]")`;
-        expect(render(src, 'trino')).toContain(`REGEXP_LIKE(name, '^[A-Z]')`);
-        expect(render(src, 'postgresql')).toContain(`name ~ '^[A-Z]'`);
-        expect(render(src, 'mysql')).toContain(`REGEXP_LIKE(name, '^[A-Z]')`);
-        expect(render(src, 'hive')).toContain(`name RLIKE '^[A-Z]'`);
-        expect(() => render(src, 'sqlite')).toThrow('regex_like is not supported for the sqlite dialect');
-    });
-
-    test('regex_replace and regex_extract', () => {
-        const src = `${USERS}\nq = users & map (u => { r = regex_replace u.name "[0-9]" "#", e = regex_extract [u.name, "([0-9]+)"] })`;
-        expect(render(src, 'trino')).toContain(`REGEXP_REPLACE(name, '[0-9]', '#') AS r`);
-        expect(render(src, 'trino')).toContain(`REGEXP_EXTRACT(name, '([0-9]+)') AS e`);
-        expect(render(src, 'postgresql')).toContain(`REGEXP_SUBSTR(name, '([0-9]+)') AS e`);
-        expect(() => render(src, 'sqlite')).toThrow('regex_replace is not supported for the sqlite dialect');
-        const extract = `${USERS}\nq = users & map (u => { e = regex_extract [u.name, "([0-9]+)"] })`;
-        expect(() => render(extract, 'sqlite')).toThrow('regex_extract is not supported for the sqlite dialect');
-        expect(() => render(extract, 'mysql')).toThrow('regex_extract is not supported for the mysql dialect');
     });
 });
 
@@ -280,7 +291,7 @@ describe('case / CASE WHEN', () => {
     });
 });
 
-describe('cast / try_cast', () => {
+describe('cast', () => {
     test('cast uses per-dialect SQL types', () => {
         const src = `${USERS}\nq = users & map (u => { i = cast u.balance "int", f = cast u.id "float", s = cast u.id "string", d = cast u.name "date", t = cast u.name "timestamp" })`;
         expect(render(src, 'trino')).toContain('CAST(balance AS INTEGER) AS i');
@@ -299,19 +310,22 @@ describe('cast / try_cast', () => {
         expect(render(src, 'postgresql')).toContain('CAST(active AS BOOLEAN) AS b');
     });
 
-    test('cast to bool errors on sqlite', () => {
+    test('cast to bool uses SQLite integer booleans', () => {
         const src = `${USERS}\nq = users & map (u => { b = cast u.active "bool" })`;
-        expect(() => render(src, 'sqlite')).toThrow('casting to bool is not supported for the sqlite dialect');
-    });
-
-    test('try_cast is trino-only', () => {
-        const src = `${USERS}\nq = users & map (u => { i = try_cast u.name "int" })`;
-        expect(render(src, 'trino')).toContain('TRY_CAST(name AS INTEGER) AS i');
-        expect(() => render(src, 'postgresql')).toThrow('try_cast is not supported for the postgresql dialect');
+        expect(render(src, 'sqlite')).toContain('CAST(active AS INTEGER) AS b');
     });
 
     test('cast validates the target type', () => {
         expect(errors(`${USERS}\nq = users & map (u => { i = cast u.id "integer" })`).join('\n')).toContain('cast expects a target type as a string literal — one of: int, float, decimal, string, bool, date, timestamp');
+    });
+});
+
+describe('non-portable functions are not in the common prelude', () => {
+    test('regex helpers and try_cast are unknown in every dialect', () => {
+        for (const name of ['regex_like', 'regex_replace', 'regex_extract', 'try_cast']) {
+            const source = `${USERS}\nq = users & map (u => { x = ${name} u.name })`;
+            expect(allErrors(source).join('\n')).toContain(`unknown identifier '${name}'`);
+        }
     });
 });
 
@@ -348,7 +362,7 @@ describe('validation', () => {
     });
 });
 
-describe('fmap over maybe', () => {
+describe('closed fmap instances', () => {
     test('fmap lifts a function over a nullable SQL expression', () => {
         const src = `t: query { email: (maybe string), age: (maybe int) } = table "t"
 q = t & map (u => { e = fmap upper u.email, a = fmap (x => x + 1) u.age })`;
@@ -362,6 +376,82 @@ q = t & map (u => { e = fmap upper u.email, a = fmap (x => x + 1) u.age })`;
         const bad = `t: query { age: (maybe int) } = table "t"
 q = t & map (u => { a = fmap upper u.age })`;
         expect(typeErrors(bad).join('\n')).toContain('cannot apply');
+    });
+
+    test('fmap maps list values', () => {
+        const src = `values = fmap (x => x + 1) [1, 2]
+q = table "users"`;
+        expect(typeErrors(src)).toEqual([]);
+        expect(allErrors(src)).toEqual([]);
+    });
+
+    test('fmap maps query rows as a query step', () => {
+        const src = `users: query { id: int, name: string } = table "users"
+q = fmap (u => { id2 = u.id + 1, label = u.name }) users`;
+        expect(typeErrors(src)).toEqual([]);
+        expect(render(src, 'postgresql', 'compact'))
+            .toBe('SELECT id + 1 AS id2, name AS label FROM users');
+    });
+
+    test('fmap rejects values without a closed Functor instance', () => {
+        const bad = `users: query { id: int } = table "users"
+q = fmap upper users`;
+        expect(typeErrors(bad).join('\n')).toContain('incompatible types');
+    });
+});
+
+describe('closed Applicative, Alternative, and Monad instances', () => {
+    test('maybe operators preserve nullable SQL semantics', () => {
+        const src = `t: query { a: (maybe int), b: (maybe int) } = table "t"
+q = t & map (u => {
+    mapped = (x => x + 1) <$> u.a,
+    constant = (x => 7) <$> u.a,
+    replaced = 0 <$ u.a,
+    applied = just (x => x + 1) <*> u.a,
+    left = u.a <* u.b,
+    right = u.a *> u.b,
+    choice = u.a <|> u.b,
+    bound = u.a >>= (x => just (x + 1)),
+    sequenced = u.a >> u.b,
+})`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'postgresql', 'compact');
+        expect(sql).toContain('a + 1 AS mapped');
+        expect(sql).toContain('CASE WHEN a IS NULL THEN NULL ELSE 7 END AS constant');
+        expect(sql).toContain('CASE WHEN a IS NULL THEN NULL ELSE 0 END AS replaced');
+        expect(sql).toContain('CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE a END AS "left"');
+        expect(sql).toContain('COALESCE(a, b) AS choice');
+        expect(sql).toContain('CASE WHEN a IS NULL THEN NULL ELSE a + 1 END AS bound');
+    });
+
+    test('list operators map, apply, sequence, choose, and flat-map', () => {
+        expect(literalList('q = (x => x + 1) <$> [1, 2]')).toEqual([2, 3]);
+        expect(literalList('q = 0 <$ [1, 2]')).toEqual([0, 0]);
+        expect(literalList('q = [x => x + 1, x => x * 2] <*> [3, 4]')).toEqual([4, 5, 6, 8]);
+        expect(literalList('q = [1, 2] <* [3, 4]')).toEqual([1, 1, 2, 2]);
+        expect(literalList('q = [1, 2] *> [3, 4]')).toEqual([3, 4, 3, 4]);
+        expect(literalList('q = [1] <|> [2]')).toEqual([1, 2]);
+        expect(literalList('q = [1, 2] >>= (x => [x, x + 10])')).toEqual([1, 11, 2, 12]);
+        expect(literalList('q = [1, 2] >> [3, 4]')).toEqual([3, 4, 3, 4]);
+    });
+
+    test('named helpers and operator sections use the same closed dispatch', () => {
+        expect(literalList('q = replaceWith 0 [1, 2]')).toEqual([0, 0]);
+        expect(literalList('q = _<|>_ [1] [2]')).toEqual([1, 2]);
+        expect(literalList('q = bind [1, 2] (x => [x + 1])')).toEqual([2, 3]);
+    });
+
+    test('<$ replaces each query row with a constant projection', () => {
+        const src = `users: query { id: int } = table "users"
+q = { tag = "fixed" } <$ users`;
+        expect(typeErrors(src)).toEqual([]);
+        expect(render(src, 'postgresql', 'compact')).toBe("SELECT 'fixed' AS tag FROM users");
+    });
+
+    test('unsupported and mismatched instances are rejected', () => {
+        expect(allErrors('bad = 1 <|> 2\nq = table "t"').join('\n')).toContain('Alternative instance');
+        expect(allErrors('bad = [1] >>= (x => x + 1)\nq = table "t"').join('\n')).toContain('same Monad container');
+        expect(allErrors('bad = [1] <* just 2\nq = table "t"').join('\n')).toContain('same Applicative container');
     });
 });
 
@@ -499,7 +589,7 @@ q = t & fold (o => { x = case { o.status == "paid" => sum o.a, _ => o.a } })`;
 describe('recursive CTEs', () => {
     test('recursive computes transitive closure', () => {
         const src = `edges: query { src: int, dst: int } = table "edges"
-q = edges & recursive (self => (edges & join inner self (l => r => l.dst == r.src) (l => r => { src = l.src, dst = r.dst }))) & map (u => { src, dst })`;
+q = edges & recursive (self => (edges & joinInner self (l => r => l.dst == r.src) (l => r => { src = l.src, dst = r.dst }))) & map (u => { src, dst })`;
         expect(typeErrors(src)).toEqual([]);
         const sql = render(src, 'sqlite', 'compact');
         expect(sql).toContain('WITH RECURSIVE');
@@ -513,7 +603,7 @@ q = edges & recursive (self => (edges & join inner self (l => r => l.dst == r.sr
 
     test('recursive CTEs are capability-gated for Hive', () => {
         const src = `edges: query { src: int, dst: int } = table "edges"
-q = edges & recursive (self => (edges & join inner self (l => r => l.dst == r.src) (l => r => { src = l.src, dst = r.dst })))`;
+q = edges & recursive (self => (edges & joinInner self (l => r => l.dst == r.src) (l => r => { src = l.src, dst = r.dst })))`;
         expect(() => render(src, 'hive')).toThrow(/recursive CTEs are not supported/);
     });
 });

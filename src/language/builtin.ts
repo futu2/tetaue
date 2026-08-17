@@ -9,8 +9,6 @@
  * prelude.tetaue and therefore do not appear in either table.
  *
  * The schemes encode the DSL's MODES as types:
- *   - join kinds are a dedicated `jkind` type, so `join "inner"` is a type
- *     error (the kind is a constant, not a string);
  *   - aggregates return `agg t` and `group` returns `group t`, so a fold's
  *     entries must be aggregate/group mode (a plain column is a type error);
  *   - `asc`/`desc` return the `order` type, so sort's lambda must produce
@@ -21,7 +19,7 @@
  * inference.ts inspect the raw field types.
  *
  * The list-argument builtins (concat, greatest, least, round, substring,
- * lpad, rpad, regex_extract, lag, lead) take a SINGLE list argument —
+ * lpad, rpad, lag, lead) take a SINGLE list argument —
  * `concat [u.first, u.last]` — instead of the old variadic application, so
  * they are ordinary curried functions: composable, partially applicable and
  * typed uniformly. The interpreter validates element kinds/arity at runtime;
@@ -29,14 +27,13 @@
  ******************************************************************************/
 import {
     type PrimName, type Scheme, type Type, type TypeUniverse, type VarKind,
-    aggOf, fun, groupOf, jkindType, listOf, maybeOf, prim, queryOf, rowOf, truthType, windowOf,
+    aggOf, fun, groupOf, listOf, maybeOf, prim, queryOf, rowOf, truthType, windowOf,
 } from './types.js';
 
 export type BuiltinCategory =
     | 'query-root'      // table
-    | 'query-step'      // filter, map, sort, take, distinct, fold, join
+    | 'query-step'      // filter, map, sort, take, distinct, fold, joins
     | 'set'              // union, union_all, intersect, except
-    | 'join-kind'       // inner, left, right, full
     | 'aggregate'       // count, sum, avg, min, max, list
     | 'group'           // group
     | 'order'           // asc, desc
@@ -45,9 +42,9 @@ export type BuiltinCategory =
     | 'scalar'          // upper, lower, length, abs, coalesce, trim, ...
     | 'date'            // current_date, extract, year, date_add, ...
     | 'math'            // ceil, floor, sqrt, pow, mod
-    | 'string'          // concat, substring, lpad, rpad, regex_*, ...
+    | 'string'          // concat, substring, lpad, rpad, ...
     | 'window'          // over, row_number, rank, lag, lead, ...
-    | 'cast'            // cast, try_cast
+    | 'cast'            // cast
     | 'constant';       // current_timestamp
 
 export interface BuiltinSpec {
@@ -58,6 +55,15 @@ export interface BuiltinSpec {
     /** Build the type scheme; needs the universe for fresh variables. */
     scheme: (u: TypeUniverse) => Scheme;
 }
+
+/** Spelling used for a primitive in the language core namespace. */
+export const coreBuiltinName = (name: string): string => `@${name}`;
+
+/** Primitive scalar types supplied by the core and re-exported by the prelude. */
+export const CORE_TYPE_NAMES = ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp'] as const;
+export type CoreTypeName = (typeof CORE_TYPE_NAMES)[number];
+
+export const coreTypeName = (name: CoreTypeName): string => `@${name}`;
 
 /** Build a polymorphic scheme: named free variables, generalized. */
 function poly(u: TypeUniverse, vars: [string, VarKind][], build: (...types: Type[]) => Type): Scheme {
@@ -83,6 +89,15 @@ function projectionScheme(u: TypeUniverse): Scheme {
         fun(fun(r, rowOf([], s)), fun(queryOf(r), queryOf(rowOf([], s)))));
 }
 
+/** The scheme shared by fixed-kind joins. */
+function joinScheme(u: TypeUniverse): Scheme {
+    return poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
+        const on = fun(r, fun(s, p('bool')));       // l => r => bool
+        const merger = fun(r, fun(s, t));           // l => r => row t
+        return fun(queryOf(s), fun(on, fun(merger, fun(queryOf(r), queryOf(t)))));
+    });
+}
+
 export const BUILTIN_SPECS = [
     // --- query roots -----------------------------------------------------
     { name: 'param', category: 'scalar', doc: 'param "name" — a query parameter placeholder', scheme: u => poly(u, [tVar], t => fun(p('string'), t)) },
@@ -105,23 +120,16 @@ export const BUILTIN_SPECS = [
         const merger = fun(r, fun(s, t));       // l => r => row t
         return fun(rightFn, fun(on, fun(merger, fun(queryOf(r), queryOf(t)))));
     }) },
-    { name: 'join', category: 'query-step', doc: 'join <kind> <right> <on> <merger>', scheme: u => poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
-        const on = fun(r, fun(s, p('bool')));       // l => r => bool
-        const merger = fun(r, fun(s, t));           // l => r => row t
-        return fun(jkindType(), fun(queryOf(s), fun(on, fun(merger, fun(queryOf(r), queryOf(t))))));
-    }) },
+    { name: 'joinInner', category: 'query-step', doc: 'joinInner right on merger — INNER JOIN', scheme: joinScheme },
+    { name: 'joinLeft', category: 'query-step', doc: 'joinLeft right on merger — LEFT JOIN', scheme: joinScheme },
+    { name: 'joinRight', category: 'query-step', doc: 'joinRight right on merger — RIGHT JOIN', scheme: joinScheme },
+    { name: 'joinFull', category: 'query-step', doc: 'joinFull right on merger — FULL JOIN', scheme: joinScheme },
 
     // --- set operations (pure query -> query functions) -----------------
     { name: 'union', category: 'set', doc: 'UNION (distinct set union)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
     { name: 'union_all', category: 'set', doc: 'UNION ALL', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
     { name: 'intersect', category: 'set', doc: 'INTERSECT (distinct set intersection)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
     { name: 'except', category: 'set', doc: 'EXCEPT (distinct set difference)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
-
-    // --- join kinds (a dedicated type, not strings) ----------------------
-    { name: 'inner', category: 'join-kind', doc: 'INNER JOIN', scheme: () => mono(jkindType()) },
-    { name: 'left', category: 'join-kind', doc: 'LEFT JOIN', scheme: () => mono(jkindType()) },
-    { name: 'right', category: 'join-kind', doc: 'RIGHT JOIN', scheme: () => mono(jkindType()) },
-    { name: 'full', category: 'join-kind', doc: 'FULL JOIN', scheme: () => mono(jkindType()) },
 
     // --- ordering --------------------------------------------------------
     { name: 'asc', category: 'order', doc: 'an ascending ORDER BY item', scheme: u => poly(u, [tVar], t => fun(t, { kind: 'order' })) },
@@ -151,6 +159,7 @@ export const BUILTIN_SPECS = [
     { name: 'not', category: 'logic', doc: 'NOT', scheme: () => mono(fun(p('bool'), p('bool'))) },
     { name: 'in_query', category: 'logic', doc: 'IN (SELECT ...) — in_query x subquery', scheme: u => poly(u, [tVar, rowVar], (t, r) => fun(t, fun(queryOf(r), p('bool')))) },
     { name: 'is_in', category: 'logic', doc: 'IN — is_in x [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(t, fun(listOf(t), p('bool')))) },
+    { name: 'like', category: 'logic', doc: 'LIKE — portable SQL pattern matching', scheme: () => mono(fun(p('string'), fun(p('string'), p('bool')))) },
 
     // --- scalar functions ------------------------------------------------
     { name: 'upper', category: 'scalar', doc: 'UPPER', scheme: () => mono(fun(p('string'), p('string'))) },
@@ -190,15 +199,22 @@ export const BUILTIN_SPECS = [
 
     // --- strings ---------------------------------------------------------
     { name: 'trim', category: 'string', doc: 'TRIM', scheme: () => mono(fun(p('string'), p('string'))) },
-    { name: 'reverse', category: 'string', doc: 'REVERSE (not sqlite)', scheme: () => mono(fun(p('string'), p('string'))) },
+    { name: 'reverse', category: 'string', doc: 'REVERSE (dialect fallback where needed)', scheme: () => mono(fun(p('string'), p('string'))) },
     { name: 'position', category: 'string', doc: 'POSITION / LOCATE / INSTR', scheme: () => mono(fun(p('string'), fun(p('string'), p('int')))) },
     { name: 'replace', category: 'string', doc: 'REPLACE', scheme: () => mono(fun(p('string'), fun(p('string'), fun(p('string'), p('string'))))) },
     { name: 'left_substring', category: 'string', doc: 'LEFT / SUBSTR', scheme: () => mono(fun(p('string'), fun(p('int'), p('string')))) },
-    { name: 'regex_like', category: 'string', doc: 'regex match', scheme: () => mono(fun(p('string'), fun(p('string'), p('bool')))) },
-    { name: 'regex_replace', category: 'string', doc: 'regex replace', scheme: () => mono(fun(p('string'), fun(p('string'), fun(p('string'), p('string'))))) },
 
-    // --- null handling ---------------------------------------------------
-    { name: 'fmap', category: 'scalar', doc: 'fmap f maybe_value — Functor lift over maybe (SQL NULL propagates)', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(fun(a, b), fun(maybeOf(a), maybeOf(b)))) },
+    // --- closed Functor / Applicative / Alternative / Monad operations ----
+    // Catalog schemes keep a Maybe shape for tooling and fallback application;
+    // inference specializes complete calls to the closed list/query variants.
+    { name: 'fmap', category: 'scalar', doc: 'fmap f value — closed Functor lift over maybe values, lists, and queries', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(fun(a, b), fun(maybeOf(a), maybeOf(b)))) },
+    { name: 'replaceWith', category: 'scalar', doc: 'replaceWith x value — closed (<$) over maybe values, lists, and queries', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(maybeOf(b), maybeOf(a)))) },
+    { name: 'ap', category: 'scalar', doc: 'ap functions values — closed Applicative application for maybe values and lists', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(maybeOf(fun(a, b)), fun(maybeOf(a), maybeOf(b)))) },
+    { name: 'applyLeft', category: 'scalar', doc: 'applyLeft left right — sequence two maybe values or lists, keeping the left', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(maybeOf(a), fun(maybeOf(b), maybeOf(a)))) },
+    { name: 'applyRight', category: 'scalar', doc: 'applyRight left right — sequence two maybe values or lists, keeping the right', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(maybeOf(a), fun(maybeOf(b), maybeOf(b)))) },
+    { name: 'orElse', category: 'scalar', doc: 'orElse first second — closed Alternative choice for maybe values and lists', scheme: u => poly(u, [aVar], a => fun(maybeOf(a), fun(maybeOf(a), maybeOf(a)))) },
+    { name: 'bind', category: 'scalar', doc: 'bind value function — closed Monad bind for maybe values and lists', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(maybeOf(a), fun(fun(a, maybeOf(b)), maybeOf(b)))) },
+    { name: 'then', category: 'scalar', doc: 'then first second — closed Monad sequencing for maybe values and lists', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(maybeOf(a), fun(maybeOf(b), maybeOf(b)))) },
     { name: 'just', category: 'scalar', doc: 'just x — lift a non-null SQL value into maybe', scheme: u => poly(u, [tVar], t => fun(t, maybeOf(t))) },
     { name: 'nothing', category: 'constant', doc: 'nothing — SQL NULL as maybe', scheme: u => poly(u, [tVar], t => maybeOf(t)) },
     { name: 'from_maybe', category: 'scalar', doc: 'from_maybe default maybe_value — COALESCE', scheme: u => poly(u, [tVar], t => fun(t, fun(maybeOf(t), t))) },
@@ -217,7 +233,6 @@ export const BUILTIN_SPECS = [
     { name: 'round', category: 'math', doc: 'round [x] or round [x, scale]', scheme: u => poly(u, [tVar], t => fun(listOf(t), t)) },
     { name: 'substring', category: 'string', doc: 'substring [s, start, length?]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
     { name: 'lpad', category: 'string', doc: 'lpad [s, n, pad?]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
-    { name: 'regex_extract', category: 'string', doc: 'regex_extract [s, pattern, group?]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
     { name: 'lag', category: 'window', doc: 'lag [x, offset?, default?] — window-only', scheme: u => poly(u, [tVar], t => fun(listOf(t), windowOf(t))) },
 
     // --- window functions ------------------------------------------------
@@ -237,8 +252,6 @@ export const BUILTIN_SPECS = [
 export const BUILTIN_ALIASES = {
     is_not_in: 'is_in',
     right_substring: 'left_substring',
-    like: 'regex_like',
-    try_cast: 'cast',
     least: 'greatest',
     rpad: 'lpad',
     lead: 'lag',
@@ -263,8 +276,8 @@ export const BUILTIN_NAMES = [
 export const LIST_ARITY = {
     concat: [2, Infinity], greatest: [2, Infinity], least: [2, Infinity],
     round: [1, 2], substring: [2, 3], lpad: [2, 3], rpad: [2, 3],
-    regex_extract: [2, 3], lag: [1, 3], lead: [1, 3],
+    lag: [1, 3], lead: [1, 3],
 } as Readonly<Record<string, readonly [number, number]>>;
 
-/** Target type names accepted by cast/try_cast. */
+/** Target type names accepted by cast. */
 export const CAST_TYPES = ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp'] as const;

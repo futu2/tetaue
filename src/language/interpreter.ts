@@ -22,10 +22,10 @@ import type { ProjectModule, ResolvedImportEdge } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
 import { labelName, parseStringLiteral } from './strings.js';
 export { parseStringLiteral };
-import { CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
+import { CAST_TYPES, LIST_ARITY, coreBuiltinName, type BuiltinName } from './builtin.js';
 import {
-    BINARY_OPERATORS, isBinaryOperator, isOperatorIntrinsicName, operatorIntrinsicName,
-    sectionName, sectionSpelling, type BinaryOperator,
+    INTRINSIC_OPERATORS, isBinaryOperator, isIntrinsicOperator, isOperatorIntrinsicName,
+    operatorIntrinsicName, sectionName, sectionSpelling, type BinaryOperator, type IntrinsicOperator,
 } from './operators.js';
 
 // ---------------------------------------------------------------------------
@@ -150,7 +150,6 @@ export type Value =
     | { kind: 'fn'; name: string; apply: (arg: Value, at: AstNode | undefined, ctx: Ctx) => Value; ast?: AstNode }
     | { kind: 'step'; name: string; apply: (q: Query, at: AstNode | undefined, ctx: Ctx) => Query | null; ast?: AstNode }
     | { kind: 'lambda'; params: string[]; body: Expr; closure: Map<string, Value>; ast?: AstNode }
-    | { kind: 'jkind'; name: JoinKind; ast?: AstNode }
     /**
      * A first-class record value. Field access (`r.name`) works over records.
      * A row inside a lambda is a record whose schema comes from the pipeline
@@ -234,7 +233,6 @@ export function describe(v: Value): string {
         case 'fn': return `a function (${v.name})`;
         case 'step': return `a query step (${v.name})`;
         case 'lambda': return 'a lambda';
-        case 'jkind': return `the join kind '${v.name}'`;
         case 'record': return 'a record';
         case 'expr': return `an expression of type ${typeName(v.node.type)}`;
         case 'list': return 'a list';
@@ -458,7 +456,7 @@ function schemaHasAggregates(q: Query): boolean {
  * run on the aggregated result, teta-style:
  *
  *     q = orders & fold (o => { user_id = group o.user_id, total = sum o.total })
- *     r = q & join inner users ...
+ *     r = q & joinInner users ...
  *     -- SELECT ... FROM (SELECT user_id, SUM(total) AS total FROM orders
  *     --                 GROUP BY user_id) AS q JOIN users ...
  *
@@ -687,31 +685,6 @@ function isApplicable(v: Value): v is Extract<Value, { kind: 'fn' }> | Extract<V
     return v.kind === 'fn' || v.kind === 'lambda';
 }
 
-/** Is the value composable with `<<<`/`>>>`? Steps are query functions too. */
-function isComposable(v: Value): v is Extract<Value, { kind: 'fn' }> | Extract<Value, { kind: 'lambda' }> | Extract<Value, { kind: 'step' }> {
-    return v.kind === 'fn' || v.kind === 'lambda' || v.kind === 'step';
-}
-
-/**
- * `l1 <<< l2` / `l1 >>> l2` — PureScript function composition:
- * `f <<< g` = `x => f (g x)`, `f >>> g` = `x => g (f x)`.
- */
-function composeValues(l: Value, r: Value, op: '>>>' | '<<<', at: AstNode, ctx: Ctx): Value {
-    if (isComposable(l) && isComposable(r)) {
-        const nameOf = (v: Value): string => v.kind === 'fn' || v.kind === 'step' ? v.name : 'λ';
-        const lName = nameOf(l);
-        const rName = nameOf(r);
-        return fn(`(${lName} ${op} ${rName})`, (x, at2, ctx2) => {
-            const first = op === '<<<' ? r : l;
-            const second = op === '<<<' ? l : r;
-            const v = applyWith(first, x, at2, ctx2);
-            return isError(v) ? ERROR : applyWith(second, v, at2, ctx2);
-        });
-    }
-    ctx.diagnostics.push({ node: at, message: `cannot compose ${describe(l)} with ${describe(r)} — both must be functions` });
-    return ERROR;
-}
-
 /** Turn an Agda-style `_op_` reference into an ordinary curried function. */
 function operatorSectionValue(raw: string, at: AstNode, ctx: Ctx): Value {
     const scoped = ctx.env.get(raw);
@@ -724,14 +697,13 @@ function operatorSectionValue(raw: string, at: AstNode, ctx: Ctx): Value {
         ctx.diagnostics.push({ node: at, message: `unknown operator section '${raw}' — '${op}' is not defined` });
         return ERROR;
     }
-    // `analyze` does not load the source prelude. Keep the primitive fallback
-    // for that compatibility API; production checking resolves the exported
-    // `_op_` binding above.
-    return operatorIntrinsicValue(op);
+    if (isIntrinsicOperator(op)) return operatorIntrinsicValue(op);
+    ctx.diagnostics.push({ node: at, message: `unknown operator section '${raw}' — '${op}' is not defined` });
+    return ERROR;
 }
 
 /** The hidden SQL-aware primitive exported under an ordinary prelude binding. */
-function operatorIntrinsicValue(op: BinaryOperator): Value {
+function operatorIntrinsicValue(op: IntrinsicOperator): Value {
     return fn(operatorIntrinsicName(op), (left, at1, ctx1) =>
         fn(operatorIntrinsicName(op), (right, at2, ctx2) =>
             applyBinaryOperator(op, left, right, at2 ?? at1 ?? fallbackNode(ctx1), ctx2)));
@@ -739,19 +711,23 @@ function operatorIntrinsicValue(op: BinaryOperator): Value {
 
 /** Apply the scoped `_op_` binding used by infix syntax. */
 function applyScopedBinaryOperator(op: BinaryOperator, left: Value, right: Value, at: AstNode, ctx: Ctx): Value {
-    // The fallback preserves the low-level `analyze` API, whose contract does
-    // not include parsing the standard prelude. `checkProject` always finds the
-    // source-defined binding unless application code has shadowed it.
-    const operator = ctx.env.get(sectionSpelling(op)) ?? operatorIntrinsicValue(op);
-    const partial = applyWith(operator, left, at, ctx);
+    // Infix syntax remains usable in the strict core so the source prelude can
+    // define `_op_` aliases. User modules normally resolve the exported alias.
+    const operator = ctx.env.get(sectionSpelling(op));
+    if (operator) {
+        const partial = applyWith(operator, left, at, ctx);
+        return isError(partial) ? ERROR : applyWith(partial, right, at, ctx);
+    }
+    if (!isIntrinsicOperator(op)) {
+        ctx.diagnostics.push({ node: at, message: `operator '${op}' is not defined` });
+        return ERROR;
+    }
+    const partial = applyWith(operatorIntrinsicValue(op), left, at, ctx);
     return isError(partial) ? ERROR : applyWith(partial, right, at, ctx);
 }
 
 /** SQL-aware semantics supplied only by hidden operator intrinsics. */
-function applyBinaryOperator(op: BinaryOperator, left: Value, right: Value, at: AstNode, ctx: Ctx): Value {
-    if (op === '&') return applyWith(right, left, at, ctx);
-    if (op === '$') return applyWith(left, right, at, ctx);
-    if (op === '>>>' || op === '<<<') return composeValues(left, right, op, at, ctx);
+function applyBinaryOperator(op: IntrinsicOperator, left: Value, right: Value, at: AstNode, ctx: Ctx): Value {
     return evalBinary(op, left, right, at, ctx);
 }
 
@@ -793,14 +769,22 @@ const dummyNode = { $type: 'Placeholder' } as unknown as AstNode;
 // ---------------------------------------------------------------------------
 
 function evalBinary(op: string, l: Value, r: Value, at: AstNode, ctx: Ctx): Value {
-    // `<>` — the record-merge monoid (right record wins on overlap); the
-    // operands are records, not scalar expressions.
+    // `<>` is a closed Semigroup operation for strings and lists, while
+    // records retain their structural right-biased merge behavior.
     if (op === '<>') {
-        if (l.kind !== 'record' || r.kind !== 'record') {
-            ctx.diagnostics.push({ node: at, message: `'<>' expects two records, got ${describe(l)} and ${describe(r)}` });
-            return ERROR;
+        if (l.kind === 'list' && r.kind === 'list') {
+            return { kind: 'list', items: [...l.items, ...r.items], ast: at };
         }
-        return mergeValues(l, r, at, ctx);
+        if (l.kind === 'record' && r.kind === 'record') {
+            return mergeValues(l, r, at, ctx);
+        }
+        const leftNode = exprNode(l);
+        const rightNode = exprNode(r);
+        if (leftNode?.type === 'string' && rightNode?.type === 'string') {
+            return mkExpr({ kind: 'call', name: 'concat', args: [leftNode, rightNode], type: 'string' }, at);
+        }
+        ctx.diagnostics.push({ node: at, message: `'<>' expects two records, strings, or lists, got ${describe(l)} and ${describe(r)}` });
+        return ERROR;
     }
     const ln = exprNode(l);
     const rn = exprNode(r);
@@ -915,7 +899,7 @@ function dollarArity(node: AstNode, env: ReadonlyMap<string, Value>): number {
  *   ($1 + 3)   ≡   u => u + 3
  *   ($1 + $2)  ≡   (u, v) => u + v
  * Lambda bodies are parenthesized, e.g. `filter ($1.active)`,
- * `join inner orders ($1.id == $2.user_id) { uid = $1.id }`.
+ * `joinInner orders ($1.id == $2.user_id) { uid = $1.id }`.
  */
 function evalArg(expr: Expr, ctx: Ctx): Value {
     const arity = dollarArity(expr, ctx.env);
@@ -1088,7 +1072,7 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
             ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}' — bindings must be defined before use` });
             return ERROR;
         }
-        const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
+        const known = [...ctx.env.keys()].filter(k => !k.startsWith('@') && !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
         ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
         return ERROR;
     }
@@ -1231,17 +1215,95 @@ function fn(name: string, impl: (arg: Value, at: AstNode | undefined, ctx: Ctx) 
     return { kind: 'fn', name, apply: impl };
 }
 
-function step(name: string, impl: (q: Query, at: AstNode | undefined, ctx: Ctx) => Query | null): Value {
-    return { kind: 'step', name, apply: impl };
+function sqlNodeReferences(node: SqlNode, target: SqlNode): boolean {
+    if (node === target) return true;
+    if (node.kind === 'col' && target.kind === 'col') {
+        return node.name === target.name && node.table === target.table;
+    }
+    if (node.kind === 'lit' && target.kind === 'lit') {
+        return node.type === target.type && node.value === target.value;
+    }
+    switch (node.kind) {
+        case 'bin': return sqlNodeReferences(node.left, target) || sqlNodeReferences(node.right, target);
+        case 'is-null': case 'not': case 'group': case 'order':
+            return sqlNodeReferences(node.expr, target);
+        case 'call': return node.args.some(arg => sqlNodeReferences(arg, target));
+        case 'in':
+            return sqlNodeReferences(node.expr, target) || node.list.some(arg => sqlNodeReferences(arg, target));
+        case 'agg':
+            return sqlNodeReferences(node.arg, target) || (node.filter ? sqlNodeReferences(node.filter, target) : false);
+        case 'window':
+            return sqlNodeReferences(node.fn, target)
+                || node.partition.some(part => sqlNodeReferences(part, target))
+                || node.order.some(item => sqlNodeReferences(item.node, target));
+        case 'case':
+            return node.branches.some(branch => sqlNodeReferences(branch.cond, target) || sqlNodeReferences(branch.value, target))
+                || (node.elseValue ? sqlNodeReferences(node.elseValue, target) : false);
+        case 'in-query': return sqlNodeReferences(node.expr, target);
+        case 'col': case 'lit': case 'param': case 'current-date': case 'date-literal':
+        case 'timestamp-literal': case 'current-timestamp': case 'exists': case 'scalar':
+            return false;
+    }
 }
 
-const JOIN_KINDS: Record<string, JoinKind> = {
-    inner: 'inner', left: 'left', right: 'right', full: 'full',
-};
+/** Preserve Maybe short-circuiting for operations that do not naturally propagate SQL NULL. */
+function nullableGuard(
+    name: string,
+    inputs: readonly Value[],
+    result: Value,
+    at: AstNode | undefined,
+    ctx: Ctx,
+): Value {
+    const nodes: SqlNode[] = [];
+    for (const input of inputs) {
+        const node = exprNode(input);
+        if (!node) {
+            ctx.diagnostics.push({ node: at ?? input.ast, message: `${name} expects maybe expressions, got ${describe(input)}` });
+            return ERROR;
+        }
+        if (node.kind === 'lit' && node.value === null) return mkExpr(node, at ?? input.ast);
+        nodes.push(node);
+    }
+    const output = exprNode(result);
+    if (!output) {
+        ctx.diagnostics.push({ node: at ?? result.ast, message: `${name} must produce a maybe expression, got ${describe(result)}` });
+        return ERROR;
+    }
+    if (output.type === 'null' || nodes.every(node => node.kind === 'lit')) return mkExpr(output, at ?? result.ast);
+    const nullChecks = nodes.map<SqlNode>(expr => ({ kind: 'is-null', expr, negated: false, type: 'bool' }));
+    const condition = nullChecks.slice(1).reduce<SqlNode>(
+        (left, right) => ({ kind: 'bin', op: 'OR', left, right, type: 'bool' }),
+        nullChecks[0]!,
+    );
+    return mkExpr({
+        kind: 'case',
+        branches: [{ cond: condition, value: lit(null, 'null') }],
+        elseValue: output,
+        type: output.type,
+    }, at ?? result.ast);
+}
 
-/** The join kind argument: a bare-identifier constant (`inner`, `left`, `right`, `full`). */
-function joinKindOf(v: Value): JoinKind | null {
-    return v.kind === 'jkind' ? (JOIN_KINDS[v.name] ?? null) : null;
+/** `<*`, `*>`, and `>>` share sequencing; lists use Cartesian-product order. */
+function sequenceBuiltin(name: 'applyLeft' | 'applyRight' | 'then', keep: 'left' | 'right'): () => Value {
+    return () => fn(name, (left, at, ctx) => fn(name, (right, at2, ctx2) => {
+        if (left.kind === 'list' || right.kind === 'list') {
+            if (left.kind !== 'list' || right.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? right.ast, message: `${name} expects two values in the same Applicative container, got ${describe(left)} and ${describe(right)}` });
+                return ERROR;
+            }
+            const items: Value[] = [];
+            for (const l of left.items) {
+                for (const r of right.items) items.push(keep === 'left' ? l : r);
+            }
+            return { kind: 'list', items, ast: at2 ?? at ?? right.ast ?? left.ast };
+        }
+        const result = keep === 'left' ? left : right;
+        return nullableGuard(name, [left, right], result, at2 ?? at, ctx2);
+    }));
+}
+
+function step(name: string, impl: (q: Query, at: AstNode | undefined, ctx: Ctx) => Query | null): Value {
+    return { kind: 'step', name, apply: impl };
 }
 
 /** A set operation: `left & union right`, `intersect`, `except`, `union_all`. */
@@ -1262,17 +1324,84 @@ function setOpBuiltin(name: string, op: SetOp): () => Value {
     });
 }
 
+/** A join whose SQL kind is encoded in its primitive name. */
+function joinBuiltin(name: string, joinKind: JoinKind): () => Value {
+    return () => fn(name, (right, at, ctx) => {
+        if (right.kind !== 'query') {
+            ctx.diagnostics.push({ node: at ?? right.ast, message: `${name} expects a query as its first argument, got ${describe(right)} — bind a table or pipeline first, e.g. ${name} orders (l => r => ...)` });
+            return ERROR;
+        }
+        return fn(name, (on, at2, ctx2) => {
+            if (!isApplicable(on)) {
+                ctx2.diagnostics.push({ node: at2 ?? on.ast, message: `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got ${describe(on)}` });
+                return ERROR;
+            }
+            return fn(name, (merge, at3, ctx3) => {
+                if (!isApplicable(merge)) {
+                    ctx3.diagnostics.push({ node: at3 ?? merge.ast, message: `${name} 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got ${describe(merge)}` });
+                    return ERROR;
+                }
+                return step(name, (q, at4, ctx4) => {
+                    // A fold ends the flat FROM scope: joining the aggregated
+                    // result wraps the folded part as a derived table.
+                    if (hasFoldStep(q)) q = wrapAsDerived(q);
+                    const rightName = right.query.root.name;
+                    const baseAlias = right.query.name ?? (rightName.split('.').at(-1) ?? rightName);
+                    let alias = baseAlias;
+                    let suffix = 1;
+                    while (q.aliases.includes(alias)) {
+                        alias = `${baseAlias}_${suffix++}`;
+                    }
+                    const rightSchema: Schema = new Map(
+                        [...querySchema(right.query)].map(([key, col]) => [key, { type: col.type, table: alias }]),
+                    );
+                    const rightQuery: Query = {
+                        ...right.query,
+                        root: { name: rightName, schema: rightSchema },
+                        aliases: [alias],
+                    };
+                    const rightRow: Value = { kind: 'record', schema: rightSchema, open: !right.query.known, defaultTable: alias, fields: [], ast: at4 };
+                    const leftRow = rowRecord(q, at4);
+                    const on1 = applyWith(on, leftRow, at4, ctx4);
+                    if (isError(on1)) return null;
+                    if (!isApplicable(on1)) {
+                        ctx4.diagnostics.push({ node: at4 ?? on.ast, message: `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got a one-argument function` });
+                        return null;
+                    }
+                    const onVal = applyWith(on1, rightRow, at4, ctx4);
+                    const node = exprNode(onVal);
+                    if (!node || (node.type !== 'bool' && node.type !== 'unknown')) {
+                        ctx4.diagnostics.push({ node: at4 ?? on.ast, message: `${name} 'on' condition must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(onVal)}` });
+                        return null;
+                    }
+                    if (forbid(node, ['agg', 'group', 'order', 'window'], 'the join condition', at4 ?? on.ast, ctx4)) return null;
+                    const m1 = applyWith(merge, leftRow, at4, ctx4);
+                    if (isError(m1)) return null;
+                    if (!isApplicable(m1)) {
+                        ctx4.diagnostics.push({ node: at4 ?? merge.ast, message: `${name} 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got a one-argument function` });
+                        return null;
+                    }
+                    const mv = applyWith(m1, rightRow, at4, ctx4);
+                    if (isError(mv)) return null;
+                    const proj = rowFromRecord(mv, at4, ctx4, 'join merger');
+                    if (!proj) return null;
+                    if (proj.fields.length === 0) {
+                        ctx4.diagnostics.push({ node: at4 ?? merge.ast, message: `${name} merger must produce a record with at least one field` });
+                        return null;
+                    }
+                    const next: Query = { ...q, aliases: [...q.aliases, alias] };
+                    return addStep(next, { kind: 'join', joinKind, right: rightQuery, on: node, proj }, at4);
+                });
+            });
+        });
+    });
+}
+
 const AGG_TYPES: Record<string, SqlType> = {
     count: 'int', sum: 'int', avg: 'float', min: 'int', max: 'int', list: 'array',
 };
 
 export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
-    // --- join kinds (bare identifiers, usable as `join`'s first argument) ---
-    inner: () => ({ kind: 'jkind', name: 'inner' }),
-    left: () => ({ kind: 'jkind', name: 'left' }),
-    right: () => ({ kind: 'jkind', name: 'right' }),
-    full: () => ({ kind: 'jkind', name: 'full' }),
-
     // --- query roots -----------------------------------------------------
     param: () => fn('param', (arg, at, ctx) => {
         const name = stringValue(arg);
@@ -1406,7 +1535,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
 
     recursive: () => fn('recursive', (f, at, ctx) => {
         if (!isApplicable(f)) {
-            ctx.diagnostics.push({ node: at ?? f.ast, message: `recursive expects a function query -> query, e.g. edges & recursive (self => edges & join inner self ...)` });
+            ctx.diagnostics.push({ node: at ?? f.ast, message: `recursive expects a function query -> query, e.g. edges & recursive (self => edges & joinInner self ...)` });
             return ERROR;
         }
         return step('recursive', (q, at2, ctx2) => {
@@ -1683,107 +1812,10 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         });
     }),
 
-    join: () => fn('join', (kindArg, at, ctx) => {
-        // `join` takes FOUR positional arguments: the join kind (inner, left,
-        // right or full — a bare-identifier constant), the right-hand query,
-        // the two-parameter `on` condition lambda, and the two-parameter
-        // `merger` lambda that projects the result row:
-        //   join inner orders (l => r => l.id == r.user_id) (l => r => { id = l.id })
-        // The right side is a first-class query VALUE (any query — pipelines
-        // render as subqueries), so joins compose like every other step. The
-        // merger replaces the old disjoint-union of both rows: the result row
-        // is exactly what it projects (like `map`, with both rows in scope).
-        const joinKind = joinKindOf(kindArg);
-        if (joinKind === null) {
-            ctx.diagnostics.push({ node: at ?? kindArg.ast, message: `join expects a join kind as its first argument: inner, left, right or full (a bare identifier, e.g. inner), got ${describe(kindArg)}` });
-            return ERROR;
-        }
-        return fn('join', (right, at2, ctx2) => {
-            if (right.kind !== 'query') {
-                ctx2.diagnostics.push({ node: at2 ?? right.ast, message: `join expects a query as its second argument, got ${describe(right)} — bind a table or pipeline first, e.g. join inner orders (l => r => ...)` });
-                return ERROR;
-            }
-            return fn('join', (on, at3, ctx3) => {
-                if (!isApplicable(on)) {
-                    ctx3.diagnostics.push({ node: at3 ?? on.ast, message: `join 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got ${describe(on)}` });
-                    return ERROR;
-                }
-                return fn('join', (merge, at4, ctx4) => {
-                    if (!isApplicable(merge)) {
-                        ctx4.diagnostics.push({ node: at4 ?? merge.ast, message: `join 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got ${describe(merge)}` });
-                        return ERROR;
-                    }
-                    return step('join', (q, at5, ctx5) => {
-                        // A fold ends the flat FROM scope: joining the
-                        // aggregated result wraps the folded part as a derived
-                        // table — `JOIN ... FROM (fold) AS <name>`.
-                        if (hasFoldStep(q)) q = wrapAsDerived(q);
-                        // Assign a unique alias for the right-hand side (self-joins).
-                        // The ON condition and merger reference the right side's
-                        // OUTPUT columns by alias — a stepped right side renders
-                        // as a subquery.
-                        const rightName = right.query.root.name;
-                        // A schema-qualified table name (`public.orders`) uses
-                        // its last segment as the base alias, so the SQL alias
-                        // stays a plain identifier (`AS "orders"`), and the
-                        // columns of the joined side qualify by that alias.
-                        // A right side that is a named binding (`paid = ...`)
-                        // reuses the binding name instead — `JOIN (...) AS paid`
-                        // reads like the source.
-                        const baseAlias = right.query.name ?? (rightName.split('.').at(-1) ?? rightName);
-                        let alias = baseAlias;
-                        let suffix = 1;
-                        while (q.aliases.includes(alias)) {
-                            alias = `${baseAlias}_${suffix++}`;
-                        }
-                        const rightSchema: Schema = new Map(
-                            [...querySchema(right.query)].map(([key, col]) => [key, { type: col.type, table: alias }]),
-                        );
-                        const rightQuery: Query = {
-                            ...right.query,
-                            root: { name: rightName, schema: rightSchema },
-                            aliases: [alias],
-                        };
-                        const rightRow: Value = { kind: 'record', schema: rightSchema, open: !right.query.known, defaultTable: alias, fields: [], ast: at5 };
-                        const leftRow = rowRecord(q, at5);
-                        // The ON condition: both rows in scope, must be boolean.
-                        // Functions are curried: apply once per row.
-                        const on1 = applyWith(on, leftRow, at5, ctx5);
-                        if (isError(on1)) return null;
-                        if (!isApplicable(on1)) {
-                            ctx5.diagnostics.push({ node: at5 ?? on.ast, message: `join 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got a one-argument function` });
-                            return null;
-                        }
-                        const onVal = applyWith(on1, rightRow, at5, ctx5);
-                        const node = exprNode(onVal);
-                        if (!node || (node.type !== 'bool' && node.type !== 'unknown')) {
-                            ctx5.diagnostics.push({ node: at5 ?? on.ast, message: `join 'on' condition must be a boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(onVal)}` });
-                            return null;
-                        }
-                        if (forbid(node, ['agg', 'group', 'order', 'window'], 'the join condition', at5 ?? on.ast, ctx5)) return null;
-                        // The merger: projects the result row (like `map`),
-                        // applied curried to both rows (a plain `merge` works).
-                        const m1 = applyWith(merge, leftRow, at5, ctx5);
-                        if (isError(m1)) return null;
-                        if (!isApplicable(m1)) {
-                            ctx5.diagnostics.push({ node: at5 ?? merge.ast, message: `join 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got a one-argument function` });
-                            return null;
-                        }
-                        const mv = applyWith(m1, rightRow, at5, ctx5);
-                        if (isError(mv)) return null;
-                        const proj = rowFromRecord(mv, at5, ctx5, 'join merger');
-                        if (!proj) return null;
-                        if (proj.fields.length === 0) {
-                            ctx5.diagnostics.push({ node: at5 ?? merge.ast, message: `join merger must produce a record with at least one field` });
-                            return null;
-                        }
-                        const next: Query = { ...q, aliases: [...q.aliases, alias] };
-                        return addStep(next, { kind: 'join', joinKind, right: rightQuery, on: node, proj }, at5);
-                    });
-                });
-            });
-        });
-    }),
+    joinInner: joinBuiltin('joinInner', 'inner'),
+    joinLeft: joinBuiltin('joinLeft', 'left'),
+    joinRight: joinBuiltin('joinRight', 'right'),
+    joinFull: joinBuiltin('joinFull', 'full'),
 
     // --- ordering --------------------------------------------------------
     asc: () => fn('asc', (arg, at, ctx) => {
@@ -2084,49 +2116,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             return mkExpr({ kind: 'call', name: 'right_substring', args: [node, len], type: 'string' }, at2);
         });
     }),
-    regex_like: () => fn('regex_like', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `regex_like expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'regex_like', at ?? arg.ast, ctx)) return ERROR;
-        return fn('regex_like', (patternArg, at2, ctx2) => {
-            const pattern = exprNode(patternArg);
-            if (!pattern || (pattern.type !== 'string' && pattern.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? patternArg.ast, message: `regex_like expects a string pattern, got ${pattern ? `type ${typeName(pattern.type)}` : describe(patternArg)}` });
-                return ERROR;
-            }
-            if (forbid(pattern, ['agg', 'group', 'order'], 'regex_like', at2 ?? patternArg.ast, ctx2)) return ERROR;
-            return mkExpr({ kind: 'call', name: 'regex_like', args: [node, pattern], type: 'bool' }, at2);
-        });
-    }),
-    regex_replace: () => fn('regex_replace', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `regex_replace expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'regex_replace', at ?? arg.ast, ctx)) return ERROR;
-        return fn('regex_replace', (patternArg, at2, ctx2) => {
-            const pattern = exprNode(patternArg);
-            if (!pattern || (pattern.type !== 'string' && pattern.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? patternArg.ast, message: `regex_replace expects a string pattern, got ${pattern ? `type ${typeName(pattern.type)}` : describe(patternArg)}` });
-                return ERROR;
-            }
-            if (forbid(pattern, ['agg', 'group', 'order'], 'regex_replace', at2 ?? patternArg.ast, ctx2)) return ERROR;
-            return fn('regex_replace', (replArg, at3, ctx3) => {
-                const repl = exprNode(replArg);
-                if (!repl || (repl.type !== 'string' && repl.type !== 'unknown')) {
-                    ctx3.diagnostics.push({ node: at3 ?? replArg.ast, message: `regex_replace expects a string replacement, got ${repl ? `type ${typeName(repl.type)}` : describe(replArg)}` });
-                    return ERROR;
-                }
-                if (forbid(repl, ['agg', 'group', 'order'], 'regex_replace', at3 ?? replArg.ast, ctx3)) return ERROR;
-                return mkExpr({ kind: 'call', name: 'regex_replace', args: [node, pattern, repl], type: 'string' }, at3);
-            });
-        });
-    }),
-
     // --- logical ----------------------------------------------------------
     like: () => fn('like', (arg, at, ctx) => {
         const node = exprNode(arg);
@@ -2146,16 +2135,31 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         });
     }),
 
-    // --- null handling ----------------------------------------------------
+    // --- closed Functor / Applicative / Alternative / Monad operations ----
     fmap: () => fn('fmap', (f, at, ctx) => {
         if (!isApplicable(f)) {
             ctx.diagnostics.push({ node: at ?? f.ast, message: `fmap expects a function as its first argument, e.g. fmap upper u.email — got ${describe(f)}` });
             return ERROR;
         }
         return fn('fmap', (m, at2, ctx2) => {
+            if (m.kind === 'list') {
+                const items: Value[] = [];
+                for (const item of m.items) {
+                    const mapped = applyWith(f, item, at2 ?? item.ast, ctx2);
+                    if (isError(mapped)) return ERROR;
+                    items.push(mapped);
+                }
+                return { kind: 'list', items, ast: at2 ?? m.ast };
+            }
+            if (m.kind === 'query') {
+                const mapFn = applyWith(BUILTINS.map!(), f, at2 ?? m.ast, ctx2);
+                if (isError(mapFn)) return ERROR;
+                const mapped = applyWith(mapFn, m, at2 ?? m.ast, ctx2);
+                return isError(mapped) ? ERROR : mapped;
+            }
             const node = exprNode(m);
             if (!node) {
-                ctx2.diagnostics.push({ node: at2 ?? m.ast, message: `fmap expects a nullable expression as its second argument, got ${describe(m)}` });
+                ctx2.diagnostics.push({ node: at2 ?? m.ast, message: `fmap expects a maybe value, list, or query as its second argument, got ${describe(m)}` });
                 return ERROR;
             }
             if (node.kind === 'agg' || node.kind === 'group' || node.kind === 'order' || node.kind === 'window') {
@@ -2168,11 +2172,125 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             const lifted = applyWith(f, mkExpr(node, m.ast), at2 ?? m.ast, ctx2);
             if (isError(lifted)) return ERROR;
             const out = exprNode(lifted);
-            return out ? mkExpr(out, at2 ?? m.ast) : ERROR;
+            if (!out) return ERROR;
+            return sqlNodeReferences(out, node)
+                ? mkExpr(out, at2 ?? m.ast)
+                : nullableGuard('fmap', [m], lifted, at2 ?? m.ast, ctx2);
         });
     }),
 
+    replaceWith: () => fn('replaceWith', (replacement, at, ctx) => fn('replaceWith', (mapped, at2, ctx2) => {
+        if (mapped.kind === 'list') {
+            return { kind: 'list', items: mapped.items.map(() => replacement), ast: at2 ?? mapped.ast };
+        }
+        if (mapped.kind === 'query') {
+            const constant = fn('replaceWith', () => replacement);
+            const mapFn = applyWith(BUILTINS.map!(), constant, at2 ?? mapped.ast, ctx2);
+            if (isError(mapFn)) return ERROR;
+            const result = applyWith(mapFn, mapped, at2 ?? mapped.ast, ctx2);
+            return isError(result) ? ERROR : result;
+        }
+        return nullableGuard('replaceWith', [mapped], replacement, at2 ?? at, ctx2);
+    })),
+
+    ap: () => fn('ap', (functions, at, ctx) => fn('ap', (values, at2, ctx2) => {
+        if (functions.kind === 'list' || values.kind === 'list') {
+            if (functions.kind !== 'list' || values.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? values.ast, message: `ap expects two values in the same Applicative container, got ${describe(functions)} and ${describe(values)}` });
+                return ERROR;
+            }
+            const items: Value[] = [];
+            for (const f of functions.items) {
+                if (!isApplicable(f)) {
+                    ctx2.diagnostics.push({ node: f.ast ?? at2, message: `ap list entries must be functions, got ${describe(f)}` });
+                    return ERROR;
+                }
+                for (const value of values.items) {
+                    const applied = applyWith(f, value, value.ast ?? at2, ctx2);
+                    if (isError(applied)) return ERROR;
+                    items.push(applied);
+                }
+            }
+            return { kind: 'list', items, ast: at2 ?? values.ast };
+        }
+        const functionNode = exprNode(functions);
+        if (functionNode?.kind === 'lit' && functionNode.value === null) return mkExpr(functionNode, at2 ?? at);
+        if (!isApplicable(functions)) {
+            ctx2.diagnostics.push({ node: at ?? functions.ast, message: `ap expects a function inside maybe as its first argument, got ${describe(functions)}` });
+            return ERROR;
+        }
+        const valueNode = exprNode(values);
+        if (!valueNode) {
+            ctx2.diagnostics.push({ node: at2 ?? values.ast, message: `ap expects a maybe expression as its second argument, got ${describe(values)}` });
+            return ERROR;
+        }
+        if (valueNode.kind === 'lit' && valueNode.value === null) return mkExpr(valueNode, at2 ?? values.ast);
+        const applied = applyWith(functions, values, at2 ?? values.ast, ctx2);
+        if (isError(applied)) return ERROR;
+        return nullableGuard('ap', [values], applied, at2 ?? at, ctx2);
+    })),
+
+    applyLeft: sequenceBuiltin('applyLeft', 'left'),
+    applyRight: sequenceBuiltin('applyRight', 'right'),
+
+    orElse: () => fn('orElse', (left, at, ctx) => fn('orElse', (right, at2, ctx2) => {
+        if (left.kind === 'list' || right.kind === 'list') {
+            if (left.kind !== 'list' || right.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? right.ast, message: `orElse expects two values in the same Alternative container, got ${describe(left)} and ${describe(right)}` });
+                return ERROR;
+            }
+            return { kind: 'list', items: [...left.items, ...right.items], ast: at2 ?? at ?? right.ast ?? left.ast };
+        }
+        const leftNode = exprNode(left);
+        const rightNode = exprNode(right);
+        if (!leftNode || !rightNode) {
+            ctx2.diagnostics.push({ node: at2 ?? at, message: `orElse expects two maybe expressions, got ${describe(left)} and ${describe(right)}` });
+            return ERROR;
+        }
+        if (leftNode.kind === 'lit' && leftNode.value === null) return mkExpr(rightNode, at2 ?? right.ast);
+        if (rightNode.kind === 'lit' && rightNode.value === null) return mkExpr(leftNode, at ?? left.ast);
+        if (!comparable(leftNode.type, rightNode.type)) {
+            ctx2.diagnostics.push({ node: at2 ?? right.ast, message: `orElse requires matching expression types, got ${typeName(leftNode.type)} and ${typeName(rightNode.type)}` });
+            return ERROR;
+        }
+        const type = leftNode.type === 'null' ? rightNode.type : leftNode.type;
+        if (type === 'null') return mkExpr(leftNode, at ?? left.ast);
+        return mkExpr({ kind: 'call', name: 'coalesce', args: [leftNode, rightNode], type }, at2 ?? at);
+    })),
+
+    bind: () => fn('bind', (value, at, ctx) => fn('bind', (f, at2, ctx2) => {
+        if (!isApplicable(f)) {
+            ctx2.diagnostics.push({ node: at2 ?? f.ast, message: `bind expects a function as its second argument, got ${describe(f)}` });
+            return ERROR;
+        }
+        if (value.kind === 'list') {
+            const items: Value[] = [];
+            for (const item of value.items) {
+                const applied = applyWith(f, item, item.ast ?? at2, ctx2);
+                if (isError(applied)) return ERROR;
+                if (applied.kind !== 'list') {
+                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `bind over a list requires the function to return a list, got ${describe(applied)}` });
+                    return ERROR;
+                }
+                items.push(...applied.items);
+            }
+            return { kind: 'list', items, ast: at2 ?? value.ast };
+        }
+        const node = exprNode(value);
+        if (!node) {
+            ctx2.diagnostics.push({ node: at ?? value.ast, message: `bind expects a maybe expression or list, got ${describe(value)}` });
+            return ERROR;
+        }
+        if (node.kind === 'lit' && node.value === null) return mkExpr(node, at ?? value.ast);
+        const applied = applyWith(f, value, at2 ?? value.ast, ctx2);
+        if (isError(applied)) return ERROR;
+        return nullableGuard('bind', [value], applied, at2 ?? at, ctx2);
+    })),
+
+    then: sequenceBuiltin('then', 'right'),
+
     just: () => fn('just', (arg, at, ctx) => {
+        if (isApplicable(arg)) return arg;
         const node = exprNode(arg);
         if (!node || node.type === 'null') {
             ctx.diagnostics.push({ node: at ?? arg.ast, message: `just expects a non-null expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
@@ -2243,11 +2361,10 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
 
     // --- type conversion --------------------------------------------------
     cast: castBuiltin('cast'),
-    try_cast: castBuiltin('try_cast'),
 
     // --- list-argument builtins (take a single list argument) ------------
     // concat [a, b], greatest [a, b], round [x, 2], substring [s, 1, 3],
-    // lpad [s, 8, "0"], regex_extract [s, "pat", 1], lag [x, 1, 0], ...
+    // lpad [s, 8, "0"], lag [x, 1, 0], ...
     // A single list argument keeps them ordinary curried functions — they
     // compose, bind and partial-apply like everything else. LIST_BUILTINS
     // owns the element-kind and arity validation.
@@ -2258,7 +2375,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     substring: listBuiltin('substring'),
     lpad: listBuiltin('lpad'),
     rpad: listBuiltin('rpad'),
-    regex_extract: listBuiltin('regex_extract'),
 
     // --- window functions ------------------------------------------------
     // Window-only functions must be wrapped in `over (...)` — a bare
@@ -2598,8 +2714,8 @@ function numericBinaryBuiltin(name: string, result: 'float' | 'first'): () => Va
     });
 }
 
-/** `cast x "int"` / `try_cast x "float"` — target type as a string literal. */
-function castBuiltin(name: 'cast' | 'try_cast'): () => Value {
+/** `cast x "int"` — target type as a string literal. */
+function castBuiltin(name: 'cast'): () => Value {
     return () => fn(name, (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
@@ -2620,7 +2736,7 @@ function castBuiltin(name: 'cast' | 'try_cast'): () => Value {
 
 // ---------------------------------------------------------------------------
 // List-argument builtins — concat, greatest, least, round, substring,
-// lpad/rpad, regex_extract, lag/lead take a SINGLE list argument
+// lpad/rpad and lag/lead take a SINGLE list argument
 // (`concat [a, b]`), so they are ordinary curried functions: composable,
 // bindable and partially applicable like everything else. LIST_BUILTINS owns
 // the element-kind and arity validation; render.ts lowers the call nodes.
@@ -2651,7 +2767,6 @@ function listExample(name: string): string {
         case 'substring': return 'substring [u.name, 1, 3]';
         case 'lpad': return 'lpad [u.code, 8, "0"]';
         case 'rpad': return 'rpad [u.code, 8, "0"]';
-        case 'regex_extract': return 'regex_extract [u.name, "([0-9]+)", 1]';
         case 'lag': return 'lag [u.salary, 1, 0]';
         case 'lead': return 'lead [u.salary, 1]';
     }
@@ -2732,19 +2847,6 @@ const LIST_BUILTINS: Readonly<Record<string, { min: number; max: number; apply: 
     rpad: {
         min: LIST_ARITY.rpad![0], max: LIST_ARITY.rpad![1],
         apply: (args, at, ctx) => listPad('rpad', args, at, ctx),
-    },
-    regex_extract: {
-        min: LIST_ARITY.regex_extract![0], max: LIST_ARITY.regex_extract![1],
-        apply: (args, at, ctx) => {
-            const value = exprArgs([args[0]!], 'regex_extract', 'string', at, ctx);
-            if (value === null) return ERROR;
-            const pattern = exprArgs([args[1]!], 'regex_extract', 'string', at, ctx);
-            if (pattern === null) return ERROR;
-            const hasGroup = args[2] !== undefined;
-            const group = hasGroup ? exprArgs([args[2]!], 'regex_extract', 'numeric', at, ctx) : null;
-            if (hasGroup && group === null) return ERROR;
-            return mkExpr({ kind: 'call', name: 'regex_extract', args: hasGroup ? [value[0]!, pattern[0]!, group![0]!] : [value[0]!, pattern[0]!], type: 'string' }, at);
-        },
     },
     lag: {
         min: LIST_ARITY.lag![0], max: LIST_ARITY.lag![1],
@@ -3097,7 +3199,8 @@ function scalarTypeOf(
         return scalarTypeOf(cur.type, aliases, namespaces, seen) === null ? null : 'array';
     }
     if (!isTypeVar(cur)) return null;
-    const name = cur.name;
+    if (!cur.name.startsWith('@')) return null;
+    const name = cur.name.slice(1);
     if (name === 'int' || name === 'float' || name === 'decimal' || name === 'string' || name === 'bool' || name === 'date' || name === 'timestamp') {
         return name;
     }
@@ -3182,9 +3285,9 @@ export interface ProjectAnalysisOptions {
 export function createPreludeEnv(): Map<string, Value> {
     const env = new Map<string, Value>();
     for (const [name, factory] of Object.entries(BUILTINS)) {
-        env.set(name, factory());
+        env.set(coreBuiltinName(name), factory());
     }
-    for (const operator of BINARY_OPERATORS) {
+    for (const operator of INTRINSIC_OPERATORS) {
         env.set(operatorIntrinsicName(operator), operatorIntrinsicValue(operator));
     }
     return env;
@@ -3210,6 +3313,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
 
     const allModules = prelude ? [prelude, ...modules] : [...modules];
     let standardValues = new Map<string, Value>();
+    let standardTypes = new Map<string, import('./generated/ast.js').Type>();
     let value: Value = ERROR;
     for (const module of allModules) {
         // Each module gets its OWN immutable scope: prelude, imports, then
@@ -3239,16 +3343,15 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         const scope = new Map(imported.scope);
 
         // --- local type aliases (after imports; declaration order matters) --
-        const typeAliases = new Map(importedTypes.flat);
+        const typeAliases = new Map(standardTypes);
+        for (const [name, type] of importedTypes.flat) typeAliases.set(name, type);
         for (const alias of module.model.types) {
-            if (typeAliases.has(alias.name)) {
+            if (importedTypes.flat.has(alias.name)) {
                 moduleDiagnostics.push({ node: alias, message: `type alias '${alias.name}' conflicts with an imported type alias` });
                 continue;
             }
             typeAliases.set(alias.name, alias.type);
         }
-        const ctx: Ctx = { env, diagnostics: moduleDiagnostics, moduleBindings, typeAliases, typeNamespaces };
-
         // --- local bindings (in order) ------------------------------------
         const exports = new Map<string, Value>();
         let seen = new Set<string>(); // within-module duplicate detection (immutably updated)
@@ -3259,7 +3362,10 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
                 moduleDiagnostics.push({ node: binding, message: conflictMessage(binding.name, scope.get(binding.name)!, 'a local binding') });
             }
             scope.set(binding.name, `local binding '${binding.name}'`);
-            const result = checkBinding(binding, env, moduleBindings, seen);
+            const result = checkBinding(binding, env, moduleBindings, seen, {
+                typeAliases,
+                typeNamespaces,
+            });
             moduleDiagnostics.push(...result.diagnostics);
             env = result.env;
             seen = result.seen;
@@ -3270,7 +3376,10 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         typeExportsByModule.set(module, new Map(
             module.model.types.filter(a => a.export).map(a => [a.name, a.type]),
         ));
-        if (module === prelude) standardValues = exports;
+        if (module === prelude) {
+            standardValues = exports;
+            standardTypes = new Map(module.model.types.filter(a => a.export).map(a => [a.name, a.type]));
+        }
         diagnostics.push(...moduleDiagnostics);
     }
 
@@ -3299,8 +3408,8 @@ function conflictMessage(name: string, existing: string, newcomer: string): stri
 }
 
 /** Evaluate a single module (no imports). */
-export function analyze(model: Model): AnalysisResult {
-    return analyzeProject([{ model, uri: undefined, imports: [] }], { importsByModule: new Map() });
+export function analyze(model: Model, prelude?: ProjectModule): AnalysisResult {
+    return analyzeProject([{ model, uri: undefined, imports: [] }], { importsByModule: new Map(), prelude });
 }
 
 export interface BindingResult {

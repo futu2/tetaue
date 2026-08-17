@@ -68,7 +68,7 @@ describe('merge', () => {
         const sql = render(`
             ${USERS}
             orders: query { id: int, user_id: int } = table "orders"
-            q = users & join inner orders (l => r => l.id == r.user_id) (l => r => merge l { uid = r.user_id })
+            q = users & joinInner orders (l => r => l.id == r.user_id) (l => r => merge l { uid = r.user_id })
         `, 'sqlite');
         expect(sql).toContain('orders.user_id AS uid');
         expect(sql).toContain('users.id');
@@ -78,7 +78,7 @@ describe('merge', () => {
         const sql = render(`
             ${USERS}
             orders: query { id: int, user_id: int } = table "orders"
-            q = users & join inner orders (l => r => l.id == r.user_id) (l => r => merge l r)
+            q = users & joinInner orders (l => r => l.id == r.user_id) (l => r => merge l r)
         `, 'sqlite');
         expect(sql).toContain('users.id');
         expect(sql).toContain('orders.user_id');
@@ -89,7 +89,7 @@ describe('merge', () => {
         const sql = render(`
             ${USERS}
             orders: query { id: int, user_id: int } = table "orders"
-            q = users & join inner orders (l => r => l.id == r.user_id) merge
+            q = users & joinInner orders (l => r => l.id == r.user_id) merge
         `, 'sqlite');
         // right-wins: orders.id shadows users.id, so id appears once in SELECT
         expect(sql).toContain([

@@ -17,7 +17,7 @@ report: query {
 } = adults
 # & map (u => { uid = u.id, name = u.name })
     & map { uid = $1.id, name = $1.name }
-    & join inner orders
+    & joinInner orders
     (l => r => l.uid == r.user_id)
     (l => r => {
         user_id = r.user_id,

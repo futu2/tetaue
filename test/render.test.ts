@@ -206,7 +206,7 @@ describe('joins', () => {
         users: query { id: int, name: string } = table "users"
         orders: query { oid: int, user_id: int, total: float } = table "orders"
         q = users
-            & join left orders (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.oid, total = o.total })
+            & joinLeft orders (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.oid, total = o.total })
     `;
 
     test('renders JOIN with qualified columns', () => {
@@ -219,11 +219,11 @@ describe('joins', () => {
         expect(sql).toContain('orders.oid');
     });
 
-    test('explicit inner kind renders INNER JOIN', () => {
+    test('joinInner renders INNER JOIN', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q = users & join inner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q = users & joinInner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
         expect(sql).toContain('INNER JOIN orders');
     });
@@ -232,7 +232,7 @@ describe('joins', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { id: int } = table "orders"
-            q = users & join inner orders (u => o => u.id == o.id) (u => o => { left_id = u.id, right_id = o.id })
+            q = users & joinInner orders (u => o => u.id == o.id) (u => o => { left_id = u.id, right_id = o.id })
         `);
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.id');
         expect(sql).toContain('users.id AS left_id');
@@ -263,7 +263,7 @@ describe('schema-qualified table names', () => {
             users: query { id: int, name: string } = table "public.users"
             orders: query { oid: int, user_id: int, total: float } = table "public.orders"
             q = users
-                & join left orders (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.oid, total = o.total })
+                & joinLeft orders (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.oid, total = o.total })
         `, 'postgresql');
         // Column references are `alias.column` — `schema.table.column` is
         // invalid in Hive, SQLite, and other engines.
@@ -279,7 +279,7 @@ describe('schema-qualified table names', () => {
         const sql = render(`
             users: query { id: int, name: string, boss_id: int } = table "public.users"
             q = users
-                & join left users (u => b => u.boss_id == b.id) (u => b => { uid = u.id, boss = b.name })
+                & joinLeft users (u => b => u.boss_id == b.id) (u => b => { uid = u.id, boss = b.name })
         `, 'postgresql');
         expect(sql).toContain('FROM public.users AS users');
         expect(sql).toContain('LEFT JOIN public.users AS users_1 ON users.boss_id = users_1.id');
@@ -290,8 +290,8 @@ describe('schema-qualified table names', () => {
         const sql = render(`
             users: query { id: int, name: string, boss_id: int } = table "public.users"
             q = users
-                & join left users (u => b => u.boss_id == b.id) (u => b => { uid = u.id, boss = b.name, boss_id = b.id })
-                & join left users (u2 => c => u2.boss_id == c.id) (u2 => c => { uid2 = u2.uid, ceo = c.name })
+                & joinLeft users (u => b => u.boss_id == b.id) (u => b => { uid = u.id, boss = b.name, boss_id = b.id })
+                & joinLeft users (u2 => c => u2.boss_id == c.id) (u2 => c => { uid2 = u2.uid, ceo = c.name })
         `, 'postgresql');
         expect(sql).toContain('FROM public.users AS users');
         expect(sql).toContain('LEFT JOIN public.users AS users_1 ON users.boss_id = users_1.id');
@@ -311,7 +311,7 @@ describe('schema-qualified table names', () => {
                 & filter ($1.pt_dt == current_date)
                 & map { customer_number = $1.individualid, birthday = $1.birthdate }
             q = cust
-                & join left bday (u => v => u.p_cino == v.customer_number) ($1 <> $2)
+                & joinLeft bday (u => v => u.p_cino == v.customer_number) ($1 <> $2)
         `, 'hive');
         expect(sql).toContain('FROM ecs.cust_f AS cust_f');
         expect(sql).toContain('cust_f.roleplayer AS p_cino');
@@ -479,9 +479,9 @@ describe('function composition and aliases', () => {
     test('composing a non-function is an error', () => {
         const messages = errors(`
             ${USERS}
-            q = users & filter (u => u.age >= (18 <<< 21))
+            q = users & filter (u => u.age >= ((18 <<< 21) 1))
         `);
-        expect(messages.join('\n')).toContain('cannot compose');
+        expect(messages.join('\n')).toContain('cannot apply');
     });
 });
 
@@ -490,7 +490,7 @@ describe('composable joins (review change)', () => {
         const sql = render(`
             users: query { id: int, name: string } = table "users"
             orders: query { user_id: int, total: float } = table "orders"
-            q = users & join inner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id, total = o.total })
+            q = users & joinInner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id, total = o.total })
         `);
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id');
     });
@@ -500,7 +500,7 @@ describe('composable joins (review change)', () => {
             users: query { id: int } = table "users"
             orders: query { user_id: int, total: float } = table "orders"
             o2 = orders & map (o => { uid = o.user_id, amount = o.total })
-            q = users & join inner o2 (u => o => u.id == o.uid) (u => o => { uid = u.id, amount = o.amount })
+            q = users & joinInner o2 (u => o => u.id == o.uid) (u => o => { uid = u.id, amount = o.amount })
         `);
         expect(sql).toContain('INNER JOIN (\n    SELECT\n        user_id AS uid,');
         expect(sql).toContain(') AS o2\n    ON users.id = o2.uid');
@@ -510,7 +510,7 @@ describe('composable joins (review change)', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             q = users
-                & join inner (users & map (u => { uid = u.id })) (l => r => l.id == r.uid) (l => r => { id = l.id, uid = r.uid })
+                & joinInner (users & map (u => { uid = u.id })) (l => r => l.id == r.uid) (l => r => { id = l.id, uid = r.uid })
         `);
         expect(sql).toContain([
             'INNER JOIN (',
@@ -525,7 +525,7 @@ describe('composable joins (review change)', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q = users & join inner (orders & distinct) (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q = users & joinInner (orders & distinct) (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
         expect(sql).toContain([
             'INNER JOIN (',
@@ -542,7 +542,7 @@ describe('composable joins (review change)', () => {
             orders: query { user_id: int, total: float } = table "orders"
             q = users
                 & filter (u => u.active)
-                & join left orders (u => o => u.id == o.user_id) (u => o => { uid = u.id, total = o.total })
+                & joinLeft orders (u => o => u.id == o.user_id) (u => o => { uid = u.id, total = o.total })
                 & take 5
         `);
         expect(sql).toContain('LEFT JOIN orders ON users.id = orders.user_id');
@@ -564,8 +564,8 @@ describe('composable joins (review change)', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q1 = users & join inner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
-            q2 = users & join inner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q1 = users & joinInner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
+            q2 = users & joinInner orders (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id');
         expect(sql).not.toContain('orders_1');
@@ -640,25 +640,32 @@ describe('implicit lambda parameters ($n)', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int, total: float } = table "orders"
-            q = users & join inner orders ($1.id == $2.user_id) { uid = $1.id, total = $2.total }
+            q = users & joinInner orders ($1.id == $2.user_id) { uid = $1.id, total = $2.total }
         `);
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id');
     });
 
-    test('join kind still applies with $n', () => {
-        const sql = render(`
-            users: query { id: int } = table "users"
-            orders: query { user_id: int } = table "orders"
-            q = users & join left orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }
-        `);
-        expect(sql).toContain('LEFT JOIN orders ON users.id = orders.user_id');
+    test('fixed join functions render their encoded SQL kind with $n', () => {
+        for (const [name, sqlKind] of [
+            ['joinInner', 'INNER'],
+            ['joinLeft', 'LEFT'],
+            ['joinRight', 'RIGHT'],
+            ['joinFull', 'FULL'],
+        ] as const) {
+            const sql = render(`
+                users: query { id: int } = table "users"
+                orders: query { user_id: int } = table "orders"
+                q = users & ${name} orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }
+            `);
+            expect(sql).toContain(`${sqlKind} JOIN orders ON users.id = orders.user_id`);
+        }
     });
 
     test('$n bound by the enclosing lambda resolves inside nested calls', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int, status: string } = table "orders"
-            q = users & join inner orders ($1.id == $2.user_id && is_in $2.status ["paid", "sent"]) { uid = $1.id, oid = $2.user_id }
+            q = users & joinInner orders ($1.id == $2.user_id && is_in $2.status ["paid", "sent"]) { uid = $1.id, oid = $2.user_id }
         `);
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id AND orders.status IN (\'paid\', \'sent\')');
     });
@@ -750,13 +757,6 @@ describe('review fixes: pure-local bindings, step composition, SQL escaping', ()
     test('date_format strings are quoted as SQL string literals', () => {
         const src = 'users: query { created_at: date } = table "users"\nq = users & map (u => { d = date_format u.created_at "it\'s" })';
         expect(render(src, 'sqlite')).toContain(`STRFTIME('it''s', created_at)`);
-    });
-
-    test('regex_extract group is not silently ignored on unsupported dialects', () => {
-        const src = 'users: query { name: string } = table "users"\nq = users & map (u => { e = regex_extract [u.name, "([0-9]+)", 1] })';
-        expect(() => render(src, 'postgresql')).toThrow('regex_extract group argument is not supported for the postgresql dialect');
-        expect(() => render(src, 'hive')).toThrow('regex_extract group argument is not supported for the hive dialect');
-        expect(render(src, 'trino')).toContain('REGEXP_EXTRACT(name, \'([0-9]+)\', 1)');
     });
 
     test('a let-bound table accepts a query-type schema annotation', () => {

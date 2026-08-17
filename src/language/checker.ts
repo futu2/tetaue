@@ -86,6 +86,7 @@ export function checkProject(
     const allModules = prelude ? [prelude, ...modules] : [...modules];
     let standardValues = new Map<string, Value>();
     let standardSchemes = new Map<string, Scheme>();
+    let standardTypes = new Map<string, import('./generated/ast.js').Type>();
     let rootEnv: Map<string, Value> | undefined;
     let value: Value = ERROR;
 
@@ -101,6 +102,7 @@ export function checkProject(
             moduleImports,
             schemeExportsByModule,
             typeExportsByModule,
+            standardTypes,
         ).scope;
         const scope = new Map(typedScope);
 
@@ -159,6 +161,11 @@ export function checkProject(
         if (module === prelude) {
             standardValues = exports;
             standardSchemes = exportedSchemes;
+            standardTypes = new Map(module.model.types.filter(a => a.export).map(a => [a.name, a.type]));
+            // Public aliases are the prelude for every following module. Keep
+            // their scheme identity so builtin-specific inference checks still
+            // recognize `filter`, `fold`, etc. while allowing local shadowing.
+            inferencer.preludeEnv = new Map([...inferencer.preludeEnv, ...standardSchemes]);
         }
         interpreterDiagnostics.push(...moduleDiagnostics);
     }

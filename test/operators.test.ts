@@ -4,6 +4,7 @@ import type { ProjectModule } from '../src/language/imports.ts';
 import { standardPrelude } from '../src/language/prelude.ts';
 import { DIALECTS, renderQuery } from '../src/language/render.ts';
 import { allErrors, parseModel, render, services, typeErrors } from './helpers.ts';
+import { isBinaryExpression } from '../src/language/generated/ast.ts';
 
 const NUMBERS = 'numbers: query { a: int, b: int } = table "numbers"';
 
@@ -29,6 +30,23 @@ function checkedSql(
 }
 
 describe('Agda-style operator sections', () => {
+    test('Functor, Applicative, Alternative, and Monad precedence is Haskell-like', () => {
+        const model = parseModel('q = f <$> xs <|> ys >>= g');
+        const root = model.bindings[0]!.value;
+        expect(isBinaryExpression(root) && root.operator).toBe('>>=');
+        if (!isBinaryExpression(root)) return;
+        expect(isBinaryExpression(root.left) && root.left.operator).toBe('<|>');
+        if (!isBinaryExpression(root.left)) return;
+        expect(isBinaryExpression(root.left.left) && root.left.left.operator).toBe('<$>');
+    });
+
+    test('the new operators are valid in lambda bodies', () => {
+        const source = `choose = xs => xs <|> [0]
+flatMap = xs => xs >>= (x => [x, x + 1])
+q = table "t"`;
+        expect(typeErrors(source)).toEqual([]);
+    });
+
     test('_+_ is the curried function form of +', () => {
         const sql = render(`${NUMBERS}
             q = numbers & map (r => {

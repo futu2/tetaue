@@ -1,8 +1,7 @@
-# Joins: the join kind, the right query, the `on` function, and the merger.
+# Joins: choose a fixed-kind function, then pass the right query, `on`, and merger.
 #
-# join takes FOUR positional arguments:
-#   join <kind> <right> <on> <merger>
-# - <kind> is a bare identifier: inner, left, right or full
+# joinInner, joinLeft, joinRight, and joinFull take THREE positional arguments:
+#   joinInner <right> <on> <merger>
 # - <right> is any query value (a table or a pipeline — a stepped right side
 #   renders as a subquery)
 # - <on> is a two-argument function (curried): l => r => bool — the
@@ -15,14 +14,14 @@
 # are fine; pick them apart in the merger instead of renaming a side first.
 # `&` and `$` end a lambda body, so a merger followed by a pipeline step
 # stops at the record: `... (l => r => { ... }) & take 5` pipelines `take 5`
-# to the join, not to the record.
+# to the join step, not to the record.
 
 import "tables.tetaue"
 
 # --- inner join with explicit lambdas ------------------------------------
 # Each order gets its user's name; the merger builds the output row.
 with_names = users
-    & join inner orders (u => o => u.id == o.user_id) (u => o => {
+    & joinInner orders (u => o => u.id == o.user_id) (u => o => {
         user_id = o.user_id,
         name = u.name,
         order_id = o.id,
@@ -35,7 +34,7 @@ with_names = users
 # `($1.id == $2.user_id)` ≡ `(l => r => l.id == r.user_id)`; the map-literal
 # merger `{ ... }` uses $1 (left row) and $2 (right row).
 spend_by_user = users
-    & join inner orders ($1.id == $2.user_id) { user_id = $1.id, total = $2.total }
+    & joinInner orders ($1.id == $2.user_id) { user_id = $1.id, total = $2.total }
     & fold (o => { user_id = group o.user_id, spent = sum o.total })
     & sort (r => [desc r.spent])
     & take 10
@@ -43,7 +42,7 @@ spend_by_user = users
 # --- left join keeps unmatched users -------------------------------------
 # Users without orders still appear; their order columns are NULL.
 all_users = users
-    & join left orders (u => o => u.id == o.user_id) (u => o => {
+    & joinLeft orders (u => o => u.id == o.user_id) (u => o => {
         user_id = u.id,
         name = u.name,
         order_id = o.id,
@@ -54,14 +53,14 @@ all_users = users
 # The right side is a first-class query value, so filter it before joining.
 paid = orders & filter (o => o.status == "paid")
 paid_orders = users
-    & join inner paid (u => o => u.id == o.user_id) (u => o => { user_id = u.id, order_id = o.id })
+    & joinInner paid (u => o => u.id == o.user_id) (u => o => { user_id = u.id, order_id = o.id })
 
 # --- a self-join renames one side with a map ------------------------------
 # Joining a table to itself needs distinct column names on each side; a map
 # renames the right side, and the merged row pairs each user with a younger
 # one born after them (id is a proxy for birth order here).
 pairs = users
-    & join inner (users & map (s => { sid = s.id, sname = s.name })) (l => r => l.id < r.sid) (l => r => {
+    & joinInner (users & map (s => { sid = s.id, sname = s.name })) (l => r => l.id < r.sid) (l => r => {
         elder = l.name,
         younger = r.sname,
     })

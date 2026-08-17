@@ -142,8 +142,8 @@ describe('date_trunc', () => {
     test('hive — TRUNC', () => {
         expect(render(src, 'hive')).toContain(`TRUNC(created_at, 'MM') AS ms`);
     });
-    test('mysql — unsupported, render-time capability error', () => {
-        expect(() => render(src, 'mysql')).toThrow('date_trunc is not supported for the mysql dialect');
+    test('mysql — DATE_FORMAT composition', () => {
+        expect(render(src, 'mysql')).toContain(`STR_TO_DATE(DATE_FORMAT(created_at, '%Y-%m-01'), '%Y-%m-%d') AS ms`);
     });
 });
 
@@ -220,11 +220,11 @@ describe('date function validation', () => {
         expect(errors(`${ORDERS}\nq = orders & fold (o => { x = year (group o.created_at) })`).join('\n')).toContain('year cannot contain group');
     });
 
-    test('unsupported dialect/unit combos fail at render time', () => {
+    test('all validated dialect/unit combinations render', () => {
         const trunc = `${ORDERS}\nq = orders & map (o => { x = date_trunc o.created_at "hour" })`;
-        expect(() => render(trunc, 'sqlite')).toThrow("date_trunc unit 'hour' is not supported for the sqlite dialect");
+        expect(render(trunc, 'sqlite')).toContain("STRFTIME('%Y-%m-%d %H:00:00', created_at) AS x");
         const parse = `${ORDERS}\nq = orders & map (o => { x = date_parse o.note "%Y" })`;
-        expect(() => render(parse, 'hive')).toThrow('date_parse is not supported for the hive dialect');
+        expect(render(parse, 'hive')).toContain("FROM_UNIXTIME(UNIX_TIMESTAMP(note, '%Y')) AS x");
     });
 });
 

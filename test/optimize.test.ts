@@ -2,10 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import { analyze } from '../src/language/interpreter.ts';
 import { optimizeQuery } from '../src/language/optimize.ts';
 import { DIALECTS, renderQuery } from '../src/language/render.ts';
-import { parseModel } from './helpers.ts';
+import { standardPrelude } from '../src/language/prelude.ts';
+import { parseModel, services } from './helpers.ts';
 
 function queryOf(source: string) {
-    const result = analyze(parseModel(source));
+    const result = analyze(parseModel(source), standardPrelude(services));
     expect(result.diagnostics).toEqual([]);
     expect(result.value.kind).toBe('query');
     if (result.value.kind !== 'query') throw new Error('expected query');

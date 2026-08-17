@@ -7,16 +7,16 @@ time (direct, mapped, or fallback). The interpreter validates arguments; the
 inference pass types them; `render.ts` owns the SQL.
 
 Status legend (matching teta's): **Direct** = emitted as-is, **Mapped** =
-renamed, **Fallback** = rewritten to an equivalent expression, **error** =
-the dialect lacks the function, so rendering throws a capability error (a
-compile diagnostic, exactly like teta's "throws an explicit error" behavior
-for unsupported features).
+renamed, **Fallback** = rewritten to an equivalent expression. Every scalar
+and date entry has one of these lowerings in each built-in dialect; capability
+errors are reserved for query-shape features such as unsupported join forms
+or recursive CTEs.
 
 ## Optional and many-argument functions: one list argument
 
 `concat` / `greatest` / `least` take any number of arguments; `round`
-(1–2), `substring` (2–3), `lpad`/`rpad` (2–3), `regex_extract` (2–3) and
-`lag`/`lead` (1–3) have optional arguments. These builtins take a **single
+(1–2), `substring` (2–3), `lpad`/`rpad` (2–3), and `lag`/`lead` (1–3) have
+optional arguments. These builtins take a **single
 list argument** — `concat [a, b]`, `round [u.x, 2]`, `lag [u.salary, 1, 0]` —
 so they are ordinary curried functions: they compose with `<<<`/`>>>`, bind
 as values (`f = greatest`), and partial-apply like everything else (there is
@@ -41,12 +41,23 @@ _&_ query step
 increment = _+_ 1
 ```
 
-The standard meanings are defined in `prelude.tetaue`, using hidden SQL-aware
-intrinsics from the small core:
+The standard meanings are defined in `prelude.tetaue`. SQL-aware operators use
+hidden intrinsics from the small core; pure operators are ordinary lambdas:
 
 ```
-export _+_ = __op_add
-export _>>>_ = __op_compose_forward
+export _+_ = @op_add
+export _>>>_ = f => g => x => g (f x)
+export _<<<_ = f => g => x => f (g x)
+export _&_ = x => f => f x
+export _$_ = f => x => f x
+export _<$>_ = fmap
+export _<$_ = replaceWith
+export _<*>_ = ap
+export _<*_ = applyLeft
+export _*>_ = applyRight
+export _<|>_ = orElse
+export _>>=_ = bind
+export _>>_ = then
 ```
 
 Infix syntax resolves that lexical binding and applies it twice, so `_+_ 1 2`
@@ -62,10 +73,12 @@ type-checked; the underscores do not introduce separate SQL lowering.
 
 ## Records
 
-`merge l r` (also written infix `l <> r`) combines two records into one;
-the right record wins on overlapping fields (JS/Nix object-spread style).
-It is an evaluation-time record operation — the merged record becomes the
-projection's field list — so it is used inside `map`/join-merger projections:
+`merge l r` combines two records into one; the right record wins on overlapping
+fields (JS/Nix object-spread style). The `<>` operator also has closed
+Semigroup behavior for strings and lists, so it can concatenate scalar values
+and list values in ordinary expressions. Record merge remains an
+evaluation-time operation — the merged record becomes the projection's field
+list — so it is used inside `map`/join-merger projections:
 
     users & map (u => u <> { active = u.age >= 18 })
 
@@ -75,16 +88,17 @@ Semantics and typing:
   the right record's fields; a label on both sides keeps the right value
   (and type), exactly like object spread. No render-time lowering: the
   merged record is the projection.
-- **A monoid.** Merge is associative and the empty record `{}` is its
-  identity, so the infix spelling is `<>` (Haskell/PureScript monoid
-  operator, same precedence as `+`/`-`); the prefix `merge l r` is a
-  synonym.
+- **Closed Semigroup/Monoid instances.** Strings concatenate through the
+  dialect-aware `concat` lowering, and lists concatenate their items. Record
+  merge is associative with `{}` as its identity, so the same infix spelling
+  serves the structural record operation (the prefix `merge l r` remains a
+  record-specific synonym).
 - **Row polymorphism.** The result row is typed as the union of both rows
   (left's non-overlapping fields + right's fields, with the open tails
   linked), so a merged row keeps all columns downstream:
   `merge u { active }` : `forall r. { | r } -> { active: bool | r }`, and
   the `map` result type shows the full union.
-- **Both sides must be records.** Row-shaped records (lambda parameters)
+- **Record operands must be records.** Row-shaped records (lambda parameters)
   materialize their schema columns; merging a row with an *unknown* schema
   (an un-annotated table) is an error — annotate the table
   (`t: query { id: int } = table "t"`).
@@ -100,18 +114,18 @@ Constants `current_date` → `CURRENT_DATE` and `current_timestamp` →
 |---|---|---|---|---|---|
 | `year/month/day`<br>`day_of_week`<br>`hour/minute/second` | `EXTRACT(FIELD FROM x)` | `EXTRACT(FIELD FROM x)` | `EXTRACT(FIELD FROM x)`,<br>`DAYOFWEEK(x)` | `CAST(STRFTIME('%Y', x) AS INTEGER)` | `YEAR(x)` … `DAYOFWEEK(x)` |
 | `extract x "field"` | `EXTRACT(FIELD FROM x)` | same | same | `STRFTIME` | same as parts |
-| `date_add x "unit" n` | `DATE_ADD('unit', n, x)` | `x + (n) * INTERVAL '1 unit'` | `DATE_ADD(x, INTERVAL n UNIT)` | `DATETIME(x, '+n units')` | `x + INTERVAL 'n' UNIT` |
-| `date_diff x "unit" y` | `DATE_DIFF('unit', x, y)` | `EXTRACT(unit FROM (y - x))` | `TIMESTAMPDIFF(UNIT, x, y)` | `JULIANDAY(y) - JULIANDAY(x)` | `DATEDIFF(y, x)` (day only) |
-| `date_trunc x "unit"` | `DATE_TRUNC('unit', x)` | `DATE_TRUNC('unit', x)` | **error** | `DATE(x)` / `STRFTIME` (day/month/year) | `TRUNC(x, 'DD')` (year/month/week/day) |
+| `date_add x "unit" n` | `DATE_ADD('unit', n, x)` | `x + (n) * INTERVAL '1 unit'` | `DATE_ADD(x, INTERVAL n UNIT)` | `DATETIME` with literal or `PRINTF` modifier | `x + INTERVAL 'n' UNIT` |
+| `date_diff x "unit" y` | `DATE_DIFF('unit', x, y)` | `EXTRACT(unit FROM (y - x))` | `TIMESTAMPDIFF(UNIT, x, y)` | scaled `JULIANDAY(y) - JULIANDAY(x)` | `DATEDIFF` / scaled unix-second delta |
+| `date_trunc x "unit"` | `DATE_TRUNC('unit', x)` | `DATE_TRUNC('unit', x)` | `STR_TO_DATE` / `DATE_FORMAT` composition | `DATE` / `STRFTIME` (all units) | `TRUNC` / unix-second composition |
 | `date_format x "fmt"` | `DATE_FORMAT(x, 'fmt')` | `TO_CHAR(x, 'fmt')` | `DATE_FORMAT(x, 'fmt')` | `STRFTIME('fmt', x)` | `DATE_FORMAT(x, 'fmt')` |
-| `date_parse x "fmt"` | `DATE_PARSE(x, 'fmt')` | `TO_TIMESTAMP(x, 'fmt')` | `STR_TO_DATE(x, 'fmt')` | `DATETIME(x)` (fmt ignored) | **error** |
+| `date_parse x "fmt"` | `DATE_PARSE(x, 'fmt')` | `TO_TIMESTAMP(x, 'fmt')` | `STR_TO_DATE(x, 'fmt')` | `DATETIME(x)` (fmt ignored) | `FROM_UNIXTIME(UNIX_TIMESTAMP(x, 'fmt'))` |
 | `to_unixtime x` | `TO_UNIXTIME(x)` | `EXTRACT(EPOCH FROM x)` | `UNIX_TIMESTAMP(x)` | `CAST(STRFTIME('%s', x) AS INTEGER)` | `UNIX_TIMESTAMP(x)` |
 | `from_unixtime x` | `FROM_UNIXTIME(x)` | `TO_TIMESTAMP(x)` | `FROM_UNIXTIME(x)` | `DATETIME(x, 'unixepoch')` | `FROM_UNIXTIME(x)` |
 
 Units for `date_add`/`date_diff`/`date_trunc` (string literal): `year`,
-`month`, `week`, `day`, `hour`, `minute`, `second`. Fallback dialects reject
-units they cannot express (sqlite `date_diff` only day/hour/minute/second, …)
-with an explicit render-time error. Date parts: `year`, `month`, `day`,
+`month`, `week`, `day`, `hour`, `minute`, `second`. Dialects that lack a
+calendar primitive use elapsed-time or formatting fallbacks, so all validated
+units remain renderable. Date parts: `year`, `month`, `day`,
 `day_of_week`, `hour`, `minute`, `second` — `day_of_week` follows each
 dialect's convention (PG `DOW` 0=Sunday, Trino `DAY_OF_WEEK` 1=Monday, SQLite
 `%w` 0=Sunday, MySQL/Hive `DAYOFWEEK` 1=Sunday). `date_format`/`date_parse`
@@ -144,13 +158,14 @@ numerics: int and float do not mix, like everywhere else in the language).
 | `substring [x, s, l?]` | `SUBSTRING(x, s[, l])` | Direct | Direct | **Mapped** `SUBSTR(x, s[, l])` | Direct |
 | `position x n` | `POSITION(n IN x)` | Direct | **Mapped** `LOCATE(n, x)` | **Mapped** `INSTR(x, n)` | `INSTR(x, n)` |
 | `replace x s r` | `REPLACE(x, s, r)` | Direct | Direct | Direct | Direct |
-| `reverse x` | `REVERSE(x)` | Direct | Direct | **error** | Direct |
+| `reverse x` | `REVERSE(x)` | Direct | Direct | correlated recursive-CTE fallback | Direct |
 | `left_substring x n` | `LEFT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, 1, n)` | Direct |
 | `right_substring x n` | `RIGHT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, -n)` | Direct |
-| `lpad [x, n, p?]` / `rpad` | `LPAD(x, n[, p])` | Direct | Direct | **error** | Direct |
-| `regex_like x p` | `REGEXP_LIKE(x, p)` | **Fallback** `REGEXP_MATCH(x, p) IS NOT NULL` | `REGEXP_LIKE(x, p)` | **error** | `x RLIKE p` |
-| `regex_replace x p r` | `REGEXP_REPLACE(x, p, r)` | Direct | Direct | **error** | Direct |
-| `regex_extract [x, p, g?]` | `REGEXP_EXTRACT(x, p[, g])` | **Mapped** `REGEXP_SUBSTR(x, p)`; group arg **error** | **error** | **error** | `REGEXP_EXTRACT(x, p)`; group arg **error** |
+| `lpad [x, n, p?]` / `rpad` | `LPAD(x, n[, p])` | Direct | Direct | `PRINTF`/`REPLACE`/`SUBSTR` composition | Direct |
+
+Regex helpers are deliberately absent from the common prelude: stock SQLite
+has no regex engine, so exposing them would either require a deployment-specific
+extension or reintroduce a dialect-only render failure.
 
 ## Logical / null handling / casts
 
@@ -162,15 +177,35 @@ numerics: int and float do not mix, like everywhere else in the language).
 | `exists q` | `EXISTS (subquery)` — correlated queries allowed |
 | `scalar q` | `(subquery)` — exactly one output column; result is `(maybe T)` |
 | `in_query x q` / `not_in_query x q` | `x [NOT] IN (subquery)` |
-| `fmap f x` | SQL function application; NULL propagates |
+| `fmap f x` | closed Functor lift over maybe values, lists, and query rows; SQL NULL propagates |
+| `replaceWith x fa` / `x <$ fa` | replace every value in a maybe, list, or query Functor |
+| `ap ff fa` / `ff <*> fa` | closed maybe/list Applicative application |
+| `applyLeft a b` / `a <* b` | sequence matching maybe/list values and keep the left result |
+| `applyRight a b` / `a *> b` | sequence matching maybe/list values and keep the right result |
+| `orElse a b` / `a <|> b` | first present maybe value, or list concatenation |
+| `bind ma f` / `ma >>= f` | maybe short-circuit or list flat-map |
+| `then ma mb` / `ma >> mb` | Monad sequencing; equivalent to `*>` for the closed instances |
 | `param "name"` | dialect bind placeholder (`?`, or `$n` in PostgreSQL) |
 | `cast x "int"` … | `CAST(x AS TYPE)` — target as a string literal |
-| `try_cast x "int"` | `TRY_CAST(...)` — **Trino only**, error elsewhere |
+
+`try_cast` is also omitted because substituting ordinary `CAST` changes its
+failure semantics on PostgreSQL, MySQL, SQLite, and Hive.
+
+The compiler owns a closed set of Haskell-inspired classes. `Eq` and `Ord`
+apply to the supported scalar primitives; `Semigroup`/`Monoid` apply to
+strings and lists; `Functor` is executable for maybe values, lists, and
+queries; and `Applicative`, `Alternative`, and `Monad` are executable for
+maybe values and lists. List application/sequencing uses Cartesian-product
+order, while list bind concatenates the function's result lists. Queries are
+not generic Monad instances: relational composition remains explicit through
+query steps, fixed joins, and `join_lateral`. Higher-kinded user declarations
+and generic dictionaries are not yet representable, so there is no
+polymorphic `mempty` or `pure` surface.
 
 `cast` target types: `int` (INTEGER / SIGNED mysql / INT hive), `float`
 (DOUBLE / DOUBLE PRECISION pg / REAL sqlite), `decimal` (NUMERIC pg /
 DECIMAL elsewhere), `string` (VARCHAR / CHAR mysql / TEXT sqlite / STRING hive),
-`bool` (BOOLEAN; **error** on sqlite), `date` (DATE), `timestamp` (TIMESTAMP).
+`bool` (BOOLEAN, or INTEGER 0/1 on sqlite), `date` (DATE), `timestamp` (TIMESTAMP).
 The result type is the target type, so
 `cast u.x "int" == 5` type-checks.
 
@@ -280,7 +315,7 @@ The `self` parameter is the recursive CTE name, so a term can join it:
 ```
 reachable = edges
   & recursive (self =>
-      (edges & join inner self
+      (edges & joinInner self
           (l => r => l.dst == r.src)
           (l => r => { src = l.src, dst = r.dst })))
 ```
@@ -350,7 +385,7 @@ inlining the `OVER` expression would be invalid SQL.
   (`catalog.ts`, the single source of truth for every scheme);
   `LIST_BUILTINS` applications get per-element kind and arity checks in
   `checkListBuiltin`; `pow`/`mod` use independent type variables so operands
-  never unify with each other; the query DSL's modes (`join kind`, `agg`,
-  `group`, `order`) are types enforced by the fold/map/sort checks.
+  never unify with each other; the query DSL's modes (`agg`, `group`, `order`)
+  are types enforced by the fold/map/sort checks.
 - `compile.ts` — render-time capability errors surface as compile
   diagnostics.

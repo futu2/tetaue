@@ -2,12 +2,12 @@
 #
 # fold is the aggregate projection: every entry is either group (a GROUP BY
 # key) or an aggregate (count, sum, avg, min, max). `filter` selects rows
-# before the join; `join` merges two tables.
+# before the join; a fixed-kind join function merges two tables.
 #
-# join takes four positional arguments: the join kind (inner, left, right or
-# full — a bare identifier), the right-hand query, and the two-argument
-# (curried) `on` and `merger` functions that project the result row:
-#   join inner paid (l => r => l.id == r.user_id) (l => r => { user_id = r.user_id, ... })
+# joinInner takes three positional arguments: the right-hand query and the
+# two-argument (curried) `on` and `merger` functions that project the result row.
+# Use joinLeft, joinRight, or joinFull for an outer join:
+#   joinInner paid (l => r => l.id == r.user_id) (l => r => { user_id = r.user_id, ... })
 # The merger replaces the old disjoint-union of both rows: the result row is
 # exactly what it projects, so colliding column names are fine.
 #
@@ -33,7 +33,7 @@ orders: query {
 paid = orders & filter (o: {status: string | r }) => o.status == "paid"
 
 by_user = users
-    & join inner paid (l => r => l.id == r.user_id) (l => r => {
+    & joinInner paid (l => r => l.id == r.user_id) (l => r => {
         user_id = r.user_id,
         name = l.name,
         order_id = r.id,

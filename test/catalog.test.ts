@@ -9,7 +9,6 @@
  ******************************************************************************/
 import { describe, expect, test } from 'bun:test';
 import { BUILTIN_ALIASES, BUILTIN_NAMES, BUILTIN_SPECS } from '../src/language/catalog.js';
-import type { BuiltinSpecName } from '../src/language/catalog.js';
 import { BUILTINS } from '../src/language/interpreter.js';
 
 describe('builtin catalog', () => {
@@ -39,26 +38,30 @@ describe('builtin catalog', () => {
     });
 
     test('the list-argument builtins are the catalog + interpreter list', () => {
-        const list = ['concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'regex_extract', 'lag', 'lead'];
+        const list = ['concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'lag', 'lead'];
         for (const name of list) {
             expect(BUILTIN_NAMES).toContain(name);
             expect(Object.keys(BUILTINS)).toContain(name);
         }
     });
 
-    test('the join kinds and aggregate modes are typed, not strings', async () => {
-        // These are the B-mode schemes: join kinds are a dedicated type,
-        // aggregates return agg, group returns group.
+    test('fixed-kind joins and aggregate modes have the expected schemes', async () => {
         const { TypeUniverse } = await import('../src/language/types.js');
         const spec = new Map(BUILTIN_SPECS.map(s => [s.name, s]));
-        for (const kind of ['inner', 'left', 'right', 'full']) {
-            const t = spec.get(kind as BuiltinSpecName)!.scheme(new TypeUniverse());
-            expect(t.vars).toEqual([]);
-            expect(t.type).toMatchObject({ kind: 'jkind' });
+        for (const name of ['joinInner', 'joinLeft', 'joinRight', 'joinFull'] as const) {
+            const t = spec.get(name)!.scheme(new TypeUniverse());
+            expect(t.type).toMatchObject({
+                kind: 'fun',
+                from: { kind: 'query' },
+                to: { kind: 'fun' },
+            });
         }
         const u = new TypeUniverse();
         expect(spec.get('sum')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'agg' } });
         expect(spec.get('group')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'group' } });
-        expect(spec.get('join')!.scheme(u).type).toMatchObject({ kind: 'fun', from: { kind: 'jkind' } });
+        const names = BUILTIN_SPECS.map(item => item.name) as string[];
+        for (const removed of ['join', 'inner', 'left', 'right', 'full']) {
+            expect(names).not.toContain(removed);
+        }
     });
 });

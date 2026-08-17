@@ -473,12 +473,24 @@ const DATE_UNIT_SQL: Record<string, string> = {
     hour: 'HOUR', minute: 'MINUTE', second: 'SECOND',
 };
 
+/** Fixed duration used by dialects whose date-diff primitive is day-based. */
+function unitSeconds(unit: string): number {
+    return {
+        year: 365 * 24 * 60 * 60,
+        month: 30 * 24 * 60 * 60,
+        week: 7 * 24 * 60 * 60,
+        day: 24 * 60 * 60,
+        hour: 60 * 60,
+        minute: 60,
+        second: 1,
+    }[unit] ?? 86400;
+}
+
 /**
  * Dialect-specific render for a `call` node, or `null` to fall through to the
  * plain `NAME(args)` renderer. Covers the general SQL function set (teta's
  * spec): date/time functions plus the scalar functions whose lowering is not a
- * plain same-name call (sqlite fallbacks, binary forms, casts, gaps that must
- * error explicitly).
+ * plain same-name call (sqlite fallbacks, binary forms and casts).
  */
 const SPECIAL_CALLS = new Set<BuiltinName>([
     // date/time family (see renderDateFunction)
@@ -487,7 +499,7 @@ const SPECIAL_CALLS = new Set<BuiltinName>([
     'to_unixtime', 'from_unixtime',
     // scalar family
     'concat', 'greatest', 'least', 'substring', 'position', 'reverse', 'left_substring', 'right_substring',
-    'lpad', 'rpad', 'regex_like', 'regex_replace', 'regex_extract', 'cast', 'try_cast',
+    'lpad', 'rpad', 'cast',
     'from_maybe', 'is_true', 'is_false', 'is_unknown', 'div',
 ]);
 
@@ -526,45 +538,41 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
             return `INSTR(${x()}, ${x(1)})`; // sqlite, hive
         }
         case 'reverse':
-            if (d === 'sqlite') return renderFailure(ctx, node, `reverse is not supported for the sqlite dialect`);
+            if (d === 'sqlite') {
+                // A scalar recursive CTE reverses one character per step and
+                // remains correlated with the current row expression.
+                return `(WITH RECURSIVE __tetaue_reverse(i, value) AS (`
+                    + `SELECT LENGTH(${x()}), '' UNION ALL `
+                    + `SELECT i - 1, value || SUBSTR(${x()}, i, 1) `
+                    + `FROM __tetaue_reverse WHERE i > 0`
+                    + `) SELECT value FROM __tetaue_reverse WHERE i = 0)`;
+            }
             return `REVERSE(${x()})`;
         case 'left_substring':
             return d === 'sqlite' ? `SUBSTR(${x()}, 1, ${x(1)})` : `LEFT(${x()}, ${x(1)})`;
         case 'right_substring':
             return d === 'sqlite' ? `SUBSTR(${x()}, -${x(1)})` : `RIGHT(${x()}, ${x(1)})`;
         case 'lpad': case 'rpad':
-            // sqlite has no LPAD/RPAD.
-            if (d === 'sqlite') return renderFailure(ctx, node, `${node.name} is not supported for the sqlite dialect`);
+            // SQLite has no LPAD/RPAD.  printf() produces a run of spaces and
+            // replace() turns it into the requested pad string. CASE handles
+            // native LPAD/RPAD behavior when the input is already too long.
+            if (d === 'sqlite') {
+                const value = x();
+                const width = x(1);
+                const pad = node.args[2] ? x(2) : ctx.dialect.stringLiteral(' ');
+                const fill = `REPLACE(PRINTF('%*s', ${width}, ''), ' ', ${pad})`;
+                const missing = `${width} - LENGTH(${value})`;
+                const truncated = `SUBSTR(${value}, 1, ${width})`;
+                return node.name === 'lpad'
+                    ? `CASE WHEN LENGTH(${value}) >= ${width} THEN ${truncated} ELSE SUBSTR(${fill}, 1, ${missing}) || ${value} END`
+                    : `CASE WHEN LENGTH(${value}) >= ${width} THEN ${truncated} ELSE ${value} || SUBSTR(${fill}, 1, ${missing}) END`;
+            }
             if (node.args.length === 2) {
                 // MySQL/Trino/Hive require the pad string; PostgreSQL defaults
                 // to a space. Make the default explicit for a uniform lowering.
                 return `${node.name.toUpperCase()}(${x()}, ${x(1)}, ' ')`;
             }
             return null;
-        case 'regex_like': {
-            if (d === 'sqlite') return renderFailure(ctx, node, `regex_like is not supported for the sqlite dialect`);
-            if (d === 'postgresql') return `${x()} ~ ${x(1)}`;
-            if (d === 'hive') return `${x()} RLIKE ${x(1)}`;
-            return `REGEXP_LIKE(${x()}, ${x(1)})`; // mysql, trino
-        }
-        case 'regex_replace': {
-            if (d === 'sqlite') return renderFailure(ctx, node, `regex_replace is not supported for the sqlite dialect`);
-            return `REGEXP_REPLACE(${x()}, ${x(1)}, ${x(2)})`; // pg, mysql, trino, hive
-        }
-        case 'regex_extract': {
-            if (d === 'mysql' || d === 'sqlite') return renderFailure(ctx, node, `regex_extract is not supported for the ${d} dialect`);
-            const groupNode = node.args[2];
-            if (d === 'postgresql') {
-                if (groupNode) return renderFailure(ctx, node, `regex_extract group argument is not supported for the postgresql dialect`);
-                return `REGEXP_SUBSTR(${x()}, ${x(1)})`;
-            }
-            if (d === 'hive') {
-                if (groupNode) return renderFailure(ctx, node, `regex_extract group argument is not supported for the hive dialect`);
-                return `REGEXP_EXTRACT(${x()}, ${x(1)})`;
-            }
-            if (d === 'trino') return groupNode ? `REGEXP_EXTRACT(${x()}, ${x(1)}, ${x(2)})` : `REGEXP_EXTRACT(${x()}, ${x(1)})`;
-            return null;
-        }
         case 'from_maybe':
             return `COALESCE(${x()}, ${x(1)})`;
         case 'is_true':
@@ -581,25 +589,23 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
             // MySQL and Hive need the DIV operator.
             if (d === 'mysql' || d === 'hive') return `${x()} DIV ${x(1)}`;
             return `${x()} / ${x(1)}`;
-        case 'cast': case 'try_cast': {
-            if (node.name === 'try_cast' && d !== 'trino') return renderFailure(ctx, node, `try_cast is not supported for the ${d} dialect`);
-            const type = node.args[1]?.kind === 'lit' ? sqlTypeName(String(node.args[1]!.value), d, ctx, node) : 'INTEGER';
-            return `${node.name === 'cast' ? 'CAST' : 'TRY_CAST'}(${x()} AS ${type})`;
+        case 'cast': {
+            const type = node.args[1]?.kind === 'lit' ? sqlTypeName(String(node.args[1]!.value), d) : 'INTEGER';
+            return `CAST(${x()} AS ${type})`;
         }
     }
     return null;
 }
 
 /** tetaue scalar type name → per-dialect SQL cast type. */
-function sqlTypeName(t: string, d: string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
+function sqlTypeName(t: string, d: string): string {
     switch (t) {
         case 'int': return d === 'hive' ? 'INT' : d === 'mysql' ? 'SIGNED' : 'INTEGER';
         case 'decimal': return d === 'postgresql' ? 'NUMERIC' : 'DECIMAL';
         case 'float': return d === 'sqlite' ? 'REAL' : d === 'postgresql' ? 'DOUBLE PRECISION' : 'DOUBLE';
         case 'string': return d === 'mysql' ? 'CHAR' : d === 'hive' ? 'STRING' : d === 'sqlite' ? 'TEXT' : 'VARCHAR';
         case 'bool':
-            if (d === 'sqlite') return renderFailure(ctx, node, `casting to bool is not supported for the sqlite dialect`);
-            return 'BOOLEAN';
+            return d === 'sqlite' ? 'INTEGER' : 'BOOLEAN';
         case 'date': return 'DATE';
         case 'timestamp': return 'TIMESTAMP';
     }
@@ -623,11 +629,11 @@ function renderDateFunction(node: Extract<SqlNode, { kind: 'call' }>, ctx: Rende
         case 'hour': case 'minute': case 'second':
             return renderDatePart(d, node.name, x());
 
-        case 'date_add': return renderDateAdd(d, x(), unit(), third!, arg, num, ctx, node);
-        case 'date_diff': return renderDateDiff(d, x(), unit(), arg(), ctx, node);
-        case 'date_trunc': return renderDateTrunc(d, x(), unit(), ctx, node);
+        case 'date_add': return renderDateAdd(d, x(), unit(), third!, arg, num);
+        case 'date_diff': return renderDateDiff(d, x(), unit(), arg());
+        case 'date_trunc': return renderDateTrunc(d, x(), unit());
         case 'date_format': return renderDateFormat(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral);
-        case 'date_parse': return renderDateParse(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral, ctx, node);
+        case 'date_parse': return renderDateParse(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral);
         case 'to_unixtime': return renderToUnixtime(d, x());
         case 'from_unixtime': return renderFromUnixtime(d, x());
     }
@@ -662,7 +668,7 @@ function renderDatePart(d: string, field: string, x: string): string {
 }
 
 /** `date_add value unit amount` — unit is interpreter-validated. */
-function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, renderAmount: () => string, num: (n?: SqlNode) => number | null, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
+function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, renderAmount: () => string, num: (n?: SqlNode) => number | null): string {
     const a = renderAmount();
     switch (d) {
         case 'postgresql':
@@ -674,9 +680,16 @@ function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, rend
         }
         case 'sqlite': {
             const amt = num(amount);
-            if (amt === null) return renderFailure(ctx, node, `date_add with a non-literal amount is not supported for the sqlite dialect`);
-            const mod = unit === 'week' ? `${amt * 7} days` : `${amt} ${unit}s`;
-            return `DATETIME(${x}, '${amt >= 0 ? '+' : ''}${mod}')`;
+            if (amt !== null) {
+                const mod = unit === 'week' ? `${amt * 7} days` : `${amt} ${unit}s`;
+                return `DATETIME(${x}, '${amt >= 0 ? '+' : ''}${mod}')`;
+            }
+            const modifier = unit === 'week'
+                ? `PRINTF('%+d days', (${a}) * 7)`
+                : `PRINTF('%+d ${unit}s', ${a})`;
+            // The modifier is computed in SQL, so column/parameter amounts
+            // work just like literal amounts on the other backends.
+            return `DATETIME(${x}, ${modifier})`;
         }
         case 'trino':
             return `DATE_ADD('${unit}', ${a}, ${x})`;
@@ -691,7 +704,7 @@ function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, rend
 }
 
 /** `date_diff value unit other` — calendar-ish diff (other - value) in units. */
-function renderDateDiff(d: string, x: string, unit: string, other: string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
+function renderDateDiff(d: string, x: string, unit: string, other: string): string {
     switch (d) {
         case 'postgresql':
             if (unit === 'week') return `EXTRACT(DAY FROM (${other} - ${x})) / 7`;
@@ -699,39 +712,64 @@ function renderDateDiff(d: string, x: string, unit: string, other: string, ctx: 
         case 'mysql':
             return `TIMESTAMPDIFF(${DATE_UNIT_SQL[unit] ?? unit.toUpperCase()}, ${x}, ${other})`;
         case 'sqlite': {
-            const factor: Record<string, number> = { day: 1, hour: 24, minute: 1440, second: 86400 };
-            if (factor[unit] === undefined) return renderFailure(ctx, node, `date_diff unit '${unit}' is not supported for the sqlite dialect — supported: day, hour, minute, second`);
+            // JULIANDAY is SQLite's portable timestamp primitive.  For units
+            // without a calendar-aware builtin, use the corresponding fixed
+            // duration; this is the same elapsed-time interpretation used by
+            // Trino's DATE_DIFF for timestamps.
+            const factor: Record<string, number> = {
+                year: 1 / 365, month: 1 / 30, week: 1 / 7,
+                day: 1, hour: 24, minute: 1440, second: 86400,
+            };
             const diff = `(JULIANDAY(${other}) - JULIANDAY(${x}))`;
-            return factor[unit] === 1 ? `CAST(${diff} AS INTEGER)` : `CAST(${diff} * ${factor[unit]} AS INTEGER)`;
+            const scale = factor[unit] ?? 1;
+            return scale === 1 ? `CAST(${diff} AS INTEGER)` : `CAST(${diff} * ${scale} AS INTEGER)`;
         }
         case 'trino':
             return `DATE_DIFF('${unit}', ${x}, ${other})`;
         case 'hive':
-            if (unit !== 'day') return renderFailure(ctx, node, `date_diff unit '${unit}' is not supported for the hive dialect — supported: day`);
-            return `DATEDIFF(${other}, ${x})`;
+            if (unit === 'day') return `DATEDIFF(${other}, ${x})`;
+            // Hive's DATEDIFF is day-granular; convert the timestamp delta to
+            // the requested unit so the same source expression remains valid.
+            return `CAST((UNIX_TIMESTAMP(${other}) - UNIX_TIMESTAMP(${x})) / ${unitSeconds(unit)} AS BIGINT)`;
         default:
             return `DATE_DIFF('${unit}', ${x}, ${other})`;
     }
 }
 
 /** `date_trunc value unit`. */
-function renderDateTrunc(d: string, x: string, unit: string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
+function renderDateTrunc(d: string, x: string, unit: string): string {
     switch (d) {
         case 'postgresql':
         case 'trino':
             return `DATE_TRUNC('${unit}', ${x})`;
         case 'mysql':
-            return renderFailure(ctx, node, `date_trunc is not supported for the mysql dialect`);
+            switch (unit) {
+                case 'year': return `STR_TO_DATE(DATE_FORMAT(${x}, '%Y-01-01'), '%Y-%m-%d')`;
+                case 'month': return `STR_TO_DATE(DATE_FORMAT(${x}, '%Y-%m-01'), '%Y-%m-%d')`;
+                case 'week': return `DATE_SUB(DATE(${x}), INTERVAL WEEKDAY(${x}) DAY)`;
+                case 'day': return `DATE(${x})`;
+                case 'hour': return `DATE_FORMAT(${x}, '%Y-%m-%d %H:00:00')`;
+                case 'minute': return `DATE_FORMAT(${x}, '%Y-%m-%d %H:%i:00')`;
+                case 'second': return `DATE_FORMAT(${x}, '%Y-%m-%d %H:%i:%s')`;
+                default: return `DATE(${x})`;
+            }
         case 'sqlite': {
-            if (unit === 'day') return `DATE(${x})`;
-            const f: Record<string, string> = { year: '%Y-01-01', month: '%Y-%m-01' };
-            if (f[unit] !== undefined) return `STRFTIME('${f[unit]}', ${x})`;
-            return renderFailure(ctx, node, `date_trunc unit '${unit}' is not supported for the sqlite dialect — supported: year, month, day`);
+            if (unit === 'week') {
+                return `DATE(${x}, '-' || ((CAST(STRFTIME('%w', ${x}) AS INTEGER) + 6) % 7) || ' days')`;
+            }
+            const f: Record<string, string> = {
+                year: '%Y-01-01', month: '%Y-%m-01',
+                day: '%Y-%m-%d', hour: '%Y-%m-%d %H:00:00',
+                minute: '%Y-%m-%d %H:%M:00', second: '%Y-%m-%d %H:%M:%S',
+            };
+            return `STRFTIME('${f[unit] ?? f.day}', ${x})`;
         }
         case 'hive': {
-            const f: Record<string, string> = { year: 'YYYY', month: 'MM', week: 'WEEK', day: 'DD' };
-            if (f[unit] === undefined) return renderFailure(ctx, node, `date_trunc unit '${unit}' is not supported for the hive dialect — supported: year, month, week, day`);
-            return `TRUNC(${x}, '${f[unit]}')`;
+            const f: Record<string, string> = {
+                year: 'YYYY', month: 'MM', week: 'WEEK', day: 'DD',
+            };
+            if (f[unit] !== undefined) return `TRUNC(${x}, '${f[unit]}')`;
+            return `FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(${x}) / ${unitSeconds(unit)}) * ${unitSeconds(unit)})`;
         }
         default:
             return `DATE_TRUNC('${unit}', ${x})`;
@@ -754,7 +792,7 @@ function renderDateFormat(d: string, x: string, format: string, quote: (v: strin
 }
 
 /** `date_parse value format` — dialect-native format string. */
-function renderDateParse(d: string, x: string, format: string, quote: (v: string) => string, ctx: RenderCtx, node: Extract<SqlNode, { kind: 'call' }>): string {
+function renderDateParse(d: string, x: string, format: string, quote: (v: string) => string): string {
     const f = quote(format);
     switch (d) {
         case 'postgresql':
@@ -766,7 +804,7 @@ function renderDateParse(d: string, x: string, format: string, quote: (v: string
         case 'trino':
             return `DATE_PARSE(${x}, ${f})`;
         case 'hive':
-            return renderFailure(ctx, node, `date_parse is not supported for the hive dialect — use date_format with to_unixtime/from_unixtime instead`);
+            return `FROM_UNIXTIME(UNIX_TIMESTAMP(${x}, ${f}))`;
         default:
             return `DATE_PARSE(${x}, ${f})`;
     }

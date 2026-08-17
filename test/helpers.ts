@@ -40,19 +40,22 @@ export function parseModel(text: string): Model {
 
 /** Interpret a module and return the diagnostic messages (empty = valid). */
 export function errors(text: string): string[] {
-    return analyze(parseModel(text)).diagnostics.map(d => d.message);
+    return analyze(parseModel(text), standardPrelude(services)).diagnostics.map(d => d.message);
 }
 
 /** Run the type-inference pass and return its diagnostic messages. */
 export function typeErrors(text: string): string[] {
-    return infer(parseModel(text)).diagnostics.map(d => d.message);
+    return infer(parseModel(text), standardPrelude(services)).diagnostics.map(d => d.message);
 }
 
 /** Interpreter + inference diagnostics merged exactly as check/render surface them. */
 export function allErrors(text: string): string[] {
     const model = parseModel(text);
     const project = [{ model, uri: undefined, imports: [] }];
-    const { diagnostics } = checkProject(project, { importsByModule: new Map() });
+    const { diagnostics } = checkProject(project, {
+        importsByModule: new Map(),
+        prelude: standardPrelude(services),
+    });
     return diagnostics.map(d => d.message);
 }
 
