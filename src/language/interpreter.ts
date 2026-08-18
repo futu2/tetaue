@@ -1617,57 +1617,15 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         });
     }),
 
-    group_by: () => fn('group_by', (sel, at, ctx) => {
-        if (!isApplicable(sel) || (sel.kind === 'lambda' && sel.params.length !== 1)) {
-            ctx.diagnostics.push({ node: at ?? sel.ast, message: `group_by expects a one-parameter projection lambda, e.g. group_by (o => { id = group o.id })` });
-            return ERROR;
-        }
-        return step('group_by', (q, at2, ctx2) => {
-            // Sorting before grouping has no observable effect; a second
-            // grouping step groups the already-grouped result (derived table).
-            if (!hasTakeStep(q) && !hasWindowProjection(q)) {
-                q = { ...q, steps: q.steps.filter(s => s.kind !== 'sort') };
-            }
-            if (hasFoldStep(q)) q = wrapAsDerived(q);
-            const v = applyWith(sel, rowRecord(q, at2), at2, ctx2);
-            if (v.kind !== 'record') {
-                ctx2.diagnostics.push({ node: at2 ?? sel.ast, message: `group_by expects a projection record, got ${describe(v)}` });
-                return null;
-            }
-            const row: { fields: { key: string; node: SqlNode }[] } = { fields: [] };
-            let groups = 0;
-            for (const { key, value } of v.fields) {
-                const node = exprNode(value);
-                if (!node) {
-                    ctx2.diagnostics.push({ node: value.ast ?? at2, message: `group_by entry '${key}' must be wrapped in group, e.g. group ${key}` });
-                    return null;
-                }
-                if (node.kind !== 'group') {
-                    ctx2.diagnostics.push({ node: value.ast ?? at2, message: `group_by entry '${key}' must be wrapped in group, e.g. group ${key}` });
-                    return null;
-                }
-                groups++;
-                row.fields.push({ key, node });
-            }
-            if (groups === 0) {
-                ctx2.diagnostics.push({ node: sel.ast ?? at2, message: `group_by must contain at least one group entry, e.g. group_by (o => { id = group o.id })` });
-                return null;
-            }
-            // The fold step is the GROUP BY projection; it has no aggregate.
-            return addStep(q, { kind: 'fold', proj: row }, at2);
-        });
-    }),
-
     fold: () => fn('fold', (sel, at, ctx) => {
         if (!isApplicable(sel) || (sel.kind === 'lambda' && sel.params.length !== 1)) {
             ctx.diagnostics.push({ node: at ?? sel.ast, message: `fold expects a projection function, e.g. fold (o => { user_id = group o.user_id, total = sum o.total })` });
             return ERROR;
         }
         return step('fold', (q, at2, ctx2) => {
-            // A sort before a fold has no observable effect (aggregation is
-            // over an unordered relation), so drop it before wrapping. A
-            // second fold aggregates the aggregated result: the first fold
-            // becomes a derived table (nested aggregation), teta-style.
+            // A sort before a fold has no observable effect (grouping and
+            // aggregation are over an unordered relation), so drop it before
+            // wrapping. A second fold runs on the first fold's derived result.
             if (!hasTakeStep(q) && !hasWindowProjection(q)) {
                 q = { ...q, steps: q.steps.filter(s => s.kind !== 'sort') };
             }
@@ -1686,7 +1644,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                     groupCols.add(`${node.expr.table}\u0000${node.expr.name}`);
                 }
             }
-            let aggregates = 0;
+            let modes = 0;
             for (const { key, value } of v.fields) {
                 const node = exprNode(value);
                 if (!node) {
@@ -1732,15 +1690,16 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                         && values.every(aggregateSafe)
                         && values.some(containsAgg);
                 }
-                if (isAggregate) aggregates++;
+                if (isAggregate) modes++;
                 if (!isAggregate && node.kind !== 'group') {
                     ctx2.diagnostics.push({ node: value.ast ?? at2, message: `fold entry '${key}' must be wrapped in an aggregate (count, sum, ...) or group` });
                     return null;
                 }
+                if (node.kind === 'group') modes++;
                 row.fields.push({ key, node });
             }
-            if (aggregates === 0) {
-                ctx2.diagnostics.push({ node: sel.ast ?? at2, message: `fold must contain at least one aggregate (count, sum, ...)` });
+            if (modes === 0) {
+                ctx2.diagnostics.push({ node: sel.ast ?? at2, message: `fold must contain at least one aggregate or group entry` });
                 return null;
             }
             return addStep(q, { kind: 'fold', proj: row }, at2);

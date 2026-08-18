@@ -59,9 +59,9 @@ describe('semantic errors', () => {
         expect(messages.join('\n')).toContain('must be wrapped in an aggregate');
     });
 
-    test('fold requires at least one aggregate', () => {
-        const messages = errors(`${USERS}\nq = users & fold (u => { id = group u.id })`);
-        expect(messages.join('\n')).toContain('at least one aggregate');
+    test('fold requires at least one group or aggregate', () => {
+        const messages = errors(`${USERS}\nq = users & fold (u => {})`);
+        expect(messages.join('\n')).toContain('at least one aggregate or group entry');
     });
 
     test('duplicate projection keys', () => {

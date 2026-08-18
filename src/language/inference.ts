@@ -1078,7 +1078,6 @@ export class Inferencer {
             return this.inferTruthPredicate(e, env, funcName);
         }
         if (funcName === 'fold' && e.arguments.length === 1) return this.inferFold(e, env);
-        if (funcName === 'group_by' && e.arguments.length === 1) return this.inferGroupBy(e, env);
         if (funcName === 'map' && e.arguments.length === 1) return this.inferMap(e, env);
         if (funcName === 'select' && e.arguments.length === 1) return this.inferSelect(e, env);
         // `merge` — the result row is the union of both rows (the right
@@ -1714,12 +1713,12 @@ export class Inferencer {
     }
 
     /**
-     * `fold (o => { k = group o.k, s = sum o.v })` — the DSL's aggregate-mode
-     * check. The lambda's result must be a record whose fields are ALL in
-     * aggregate or group mode (`agg t` / `group t`), with at least one
-     * aggregate — a plain column or computed expression is a static type
-     * error, no longer deferred to the runtime step application. The result
-     * row strips the modes, so downstream steps see plain columns
+     * `fold (o => { k = group o.k, s = sum o.v })` — the DSL's grouping and
+     * aggregate-mode check. The lambda's result must be a record whose fields
+     * are ALL in aggregate or group mode (`agg t` / `group t`); a plain column
+     * or computed expression is a static type error. A projection made only
+     * of group fields is therefore a valid grouping operation. The result row
+     * strips the modes, so downstream steps see plain columns
      * (`query { user_id: int, total: float }`), matching the interpreter's
      * derived-table semantics.
      */
@@ -1755,7 +1754,7 @@ export class Inferencer {
             if (sig) groupSigs.add(sig);
         }
         const out: [string, Type][] = [];
-        let aggregates = 0;
+        let modes = 0;
         for (const [key, ft] of res.fields) {
             const raw = this.u.peel(ft);
             if (raw.kind === 'agg') {
@@ -1768,60 +1767,18 @@ export class Inferencer {
                         this.diag(entry ?? argExpr, `fold entry '${key}' case conditions must be constant or use grouped columns`);
                     }
                 }
-                aggregates++;
+                modes++;
                 out.push([key, raw.of]);
             } else if (raw.kind === 'group') {
+                modes++;
                 out.push([key, raw.of]);
             } else {
                 this.diag(entryNodes?.get(key) ?? argExpr, `fold entry '${key}' must be wrapped in an aggregate (count, sum, ...) or group`);
                 out.push([key, ft]);
             }
         }
-        if (aggregates === 0) {
-            this.diag(argExpr, `fold must contain at least one aggregate (count, sum, ...)`);
-        }
-        return fun(queryOf(r.from), queryOf(rowOf(out, res.tail)));
-    }
-
-    /**
-     * `group_by (o => { user_id = group o.user_id })` — GROUP BY without an
-     * aggregate, for SQL deduplication. Every entry must be in group mode and
-     * the result row strips the mode so downstream steps see plain columns.
-     */
-    private inferGroupBy(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
-        const argExpr = e.arguments[0]!;
-        const argType = this.inferArg(argExpr, env);
-        const r = this.u.peel(argType);
-        if (r.kind !== 'fun') {
-            this.argError('group_by', 0, argExpr, argType, undefined, undefined);
-            return this.u.fresh();
-        }
-        const ret = this.u.peel(r.to);
-        if (ret.kind === 'var') {
-            const s = this.u.fresh('row');
-            try { this.u.bind(ret.id, rowOf([], s)); } catch { /* leave open */ }
-            return fun(queryOf(r.from), queryOf(rowOf([], s)));
-        }
-        if (ret.kind !== 'row') {
-            this.argError('group_by', 0, argExpr, argType, undefined, undefined);
-            return this.u.fresh();
-        }
-        const res = this.u.resolveRow(ret);
-        const entryNodes = this.entryNodesOf(argExpr);
-        const out: [string, Type][] = [];
-        let groups = 0;
-        for (const [key, ft] of res.fields) {
-            const raw = this.u.peel(ft);
-            if (raw.kind === 'group') {
-                groups++;
-                out.push([key, raw.of]);
-            } else {
-                this.diag(entryNodes?.get(key) ?? argExpr, `group_by entry '${key}' must be wrapped in group, e.g. group ${key}`);
-                out.push([key, ft]);
-            }
-        }
-        if (groups === 0) {
-            this.diag(argExpr, `group_by must contain at least one group entry, e.g. group_by (o => { id = group o.id })`);
+        if (modes === 0) {
+            this.diag(argExpr, `fold must contain at least one aggregate or group entry`);
         }
         return fun(queryOf(r.from), queryOf(rowOf(out, res.tail)));
     }
@@ -2231,12 +2188,6 @@ export class Inferencer {
                 const r = ret(argType);
                 if (r) this.diag(node, `projection must be a record like { key = expr, ... }, got an expression of type ${p(r)}`);
                 else this.diag(node, `map expects a one-parameter projection lambda or function, e.g. map (u => { id = u.id })`);
-                break;
-            }
-            case 'group_by': {
-                const r = ret(argType);
-                if (r) this.diag(node, `group_by expects a projection record, got an expression of type ${p(r)}`);
-                else this.diag(node, `group_by expects a one-parameter lambda, e.g. group_by (o => { id = group o.id })`);
                 break;
             }
             case 'fold': {

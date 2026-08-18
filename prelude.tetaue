@@ -15,7 +15,6 @@ export filter = @filter
 export select = @select
 export map = @map
 export fold = @fold
-export group_by = @group_by
 export sort = @sort
 export take = @take
 export drop = @drop

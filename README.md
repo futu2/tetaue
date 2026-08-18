@@ -371,7 +371,7 @@ u & filter ...        # pipeline: apply the step to the query
 - `filter` keeps the rows whose predicate is true. After a `fold` it becomes
   `HAVING`.
 - A `fold` ends the flat `FROM` scope: `map`, joins, and further `fold`s
-  after a `fold` run on the aggregated result, which is wrapped as a derived
+  after a `fold` run on the grouped/aggregated result, which is wrapped as a derived
   table (teta-style) — so you can project the aggregate
   (`fold ... & map (r => { t = r.total })`), aggregate it again
   (`map (r => { g = sum r.total })` or another `fold`), or join it:
@@ -499,11 +499,13 @@ are static errors, not runtime surprises:
 
 - **Aggregates** (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `list`) have aggregate
   mode (`sum o.total : agg float`) and `group` has group mode
-  (`group o.user_id : group int`). A `fold` entry that is neither is a type
-  error — no more "must be wrapped in an aggregate" surprises:
+  (`group o.user_id : group int`). Every `fold` entry must use one of those
+  modes, and the projection may contain groups, aggregates, or both. A plain
+  column is a type error — no more "must be wrapped in an aggregate" surprises:
   ```
   fold (o => { x = o.age })            # ✗ type error: plain column
   fold (o => { x = sum o.age })        # ✓ aggregate mode
+  fold (o => { x = group o.age })       # ✓ grouping without aggregates
   ```
   The modes are transparent in unification, so comparing or computing on
   aggregate results works, and a fold's result row is plain — downstream
@@ -524,8 +526,7 @@ are static errors, not runtime surprises:
 | `take n` | LIMIT | `LIMIT n` |
 | `drop n` | OFFSET | `LIMIT n OFFSET n` / dialect-specific |
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
-| `fold (o => { k = group o.k, s = sum o.v })` | aggregation | `SELECT ... GROUP BY ...` |
-| `group_by (o => { k = group o.k })` | grouping without aggregates | `SELECT ... GROUP BY ...` |
+| `fold (o => { k = group o.k, s = sum o.v })` | grouping and/or aggregation | `SELECT ... GROUP BY ...` |
 | `joinInner table ($1.id == $2.user_id) { uid = $1.id }` | inner join; `joinLeft`, `joinRight`, and `joinFull` select the outer variants | `... JOIN ... ON ...` |
 | `join_lateral (l => right) (l => r => on) (l => r => row)` | lateral join | `INNER JOIN LATERAL (...) ON ...` (PG/MySQL) |
 | `recursive (self => termQuery)` | fixed point | `WITH RECURSIVE ... UNION ALL ...` |

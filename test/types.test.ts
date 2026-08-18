@@ -675,9 +675,9 @@ describe('DSL modes are static types', () => {
         expect(messages.join('\n')).toContain("fold entry 'x' must be wrapped in an aggregate (count, sum, ...) or group");
     });
 
-    test('fold without any aggregate is a static error', () => {
-        const messages = typeErrors(`${USERS}\nq = users & fold (o => { x = group o.age })`);
-        expect(messages.join('\n')).toContain('fold must contain at least one aggregate (count, sum, ...)');
+    test('fold without any group or aggregate is a static error', () => {
+        const messages = typeErrors(`${USERS}\nq = users & fold (o => {})`);
+        expect(messages.join('\n')).toContain('fold must contain at least one aggregate or group entry');
     });
 
     test('map projections reject group keys and order items', () => {
@@ -819,9 +819,9 @@ q = a & ${name} b (l => r => l.id == r.id) (l => r => { x = l.x, y = r.y })`;
         }
     });
 
-    test('group_by allows grouping without aggregates', () => {
+    test('fold allows grouping without aggregates', () => {
         const src = `users: query { id: int, name: string } = table "users"
-q = users & group_by (u => { id = group u.id, name = group u.name })`;
+q = users & fold (u => { id = group u.id, name = group u.name })`;
         expect(allErrors(src)).toEqual([]);
         expect(render(src)).toContain('GROUP BY');
     });
