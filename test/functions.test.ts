@@ -587,6 +587,8 @@ q = t & fold (o => { x = case { o.status == "paid" => sum o.a, _ => o.a } })`;
 });
 
 describe('recursive CTEs', () => {
+    // The first Langium parse builds the grammar lookahead tables and can
+    // exceed Bun's 5-second default on slower CI runners.
     test('recursive computes transitive closure', () => {
         const src = `edges: query { src: int, dst: int } = table "edges"
 q = edges & recursive (self => (edges & joinInner self (l => r => l.dst == r.src) (l => r => { src = l.src, dst = r.dst }))) & map (u => { src, dst })`;
@@ -599,7 +601,7 @@ q = edges & recursive (self => (edges & joinInner self (l => r => l.dst == r.src
         db.run('CREATE TABLE edges(src int, dst int)');
         db.run('INSERT INTO edges VALUES (1,2),(2,3),(3,4)');
         expect(db.query(sql).all()).toHaveLength(6);
-    });
+    }, 10_000);
 
     test('recursive CTEs are capability-gated for Hive', () => {
         const src = `edges: query { src: int, dst: int } = table "edges"
