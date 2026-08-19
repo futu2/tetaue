@@ -56,7 +56,7 @@ ImportName:
 // exported bindings are visible to importers (flat or qualified). Within a
 // module, exported and private bindings see each other equally.
 Binding:
-    (export?='export')? name=(ID | ARG_ID | OP_SECTION) (':' type=Type)? '=' value=Expression;
+    (export?='export')? name=(ID | ARG_ID | OP_SECTION) (':' type=Type)? '=' value=Expression?;
 
 Expression:
     Ascription | LetExpression | BinaryExpression;

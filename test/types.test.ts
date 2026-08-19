@@ -860,7 +860,7 @@ describe('typed expression result recording', () => {
         const model = parseModel('x = 1 + 2\n');
         const project = [{ model, uri: undefined, imports: [] }];
         const result = checkProject(project, { requireQuery: false, importsByModule: new Map() });
-        const expr = model.bindings[0]!.value;
+        const expr = model.bindings[0]!.value!;
         expect(result.typeOf(expr)).toBe('int');
         expect(result.nodeValues.get(expr)?.kind).toBe('expr');
     });

@@ -34,7 +34,7 @@ import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
 import { moduleOf } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
-import { checkBinding, parseStringLiteral } from './interpreter.js';
+import { checkBinding, missingBindingExpressionMessage, parseStringLiteral } from './interpreter.js';
 import type { Diagnostic, Value } from './interpreter.js';
 import { labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
@@ -391,6 +391,10 @@ export class Inferencer {
             // every downstream error. A no-op for flat-import
             // collisions (the name is not in `modules`).
             this.modules.delete(b.name);
+        }
+        if (!b.value) {
+            this.diag(b, missingBindingExpressionMessage(b.name));
+            return;
         }
         const inferred = this.inferExpr(b.value, this.env);
         let t = inferred;

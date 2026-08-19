@@ -80,6 +80,11 @@ describe('semantic errors', () => {
         expect(errors(`${USERS}\nq = 42`).join('\n')).toContain("a module's last binding must be a query");
     });
 
+    test('an incomplete binding reports one missing-expression diagnostic', () => {
+        const messages = errors('q = ');
+        expect(messages.filter(message => message.includes("binding 'q' is missing an expression after '='"))).toHaveLength(1);
+    });
+
     test('fields cannot be accessed on tables', () => {
         expect(errors(`${USERS}\nq = users.id`).join('\n')).toContain('tables have no fields');
     });

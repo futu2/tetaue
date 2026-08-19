@@ -62,8 +62,16 @@ export is_not_null = is_just
 `.trimStart(),
 ].join('\n');
 
+// A service container owns the parser/value-converter configuration used to
+// construct AST nodes. Cache only within that container so callers can safely
+// create independent language instances in tests, embedded tools, or workers.
+const preludeCache = new WeakMap<object, ProjectModule>();
+
 /** Parse the embedded standard library using the caller's language services. */
 export function standardPrelude(services: TetaueServices): ProjectModule {
+    const cached = preludeCache.get(services);
+    if (cached) return cached;
+
     const result = services.parser.LangiumParser.parse(STANDARD_PRELUDE_SOURCE);
     const parseErrors = [
         ...result.lexerErrors.map(e => e.message),
@@ -72,11 +80,13 @@ export function standardPrelude(services: TetaueServices): ProjectModule {
     if (!result.value || parseErrors.length > 0) {
         throw new Error(`invalid embedded prelude: ${parseErrors.join('; ') || 'no parse result'}`);
     }
-    return {
+    const prelude = {
         model: result.value as Model,
         uri: 'tetaue:prelude',
         imports: [],
     };
+    preludeCache.set(services, prelude);
+    return prelude;
 }
 
 /** Public names supplied by the source prelude rather than the primitive core. */

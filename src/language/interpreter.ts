@@ -3486,6 +3486,11 @@ export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBi
         diagnostics.push({ node: binding, message: `duplicate binding name '${binding.name}'` });
     }
     nextSeen.add(binding.name);
+    if (!binding.value) {
+        const value = ERROR;
+        diagnostics.push({ node: binding, message: missingBindingExpressionMessage(binding.name) });
+        return { value, env: new Map(env).set(binding.name, value), seen: nextSeen, diagnostics };
+    }
     const ctx: Ctx = { env, diagnostics, moduleBindings: new Set(moduleBindings), ...ctxExtras };
     let v = evalExprWith(binding.value, ctx);
     v = stampQueryTypeAnnotation(v, binding.type, binding, ctx);
@@ -3501,6 +3506,11 @@ export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBi
     const nextEnv = new Map(env);
     nextEnv.set(binding.name, v);
     return { value: v, env: nextEnv, seen: nextSeen, diagnostics };
+}
+
+/** Diagnostic shared by the typed and runtime passes for an incomplete binding. */
+export function missingBindingExpressionMessage(name: string): string {
+    return `binding '${name}' is missing an expression after '='`;
 }
 
 // re-export for the validator

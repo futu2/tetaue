@@ -55,7 +55,7 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
             acceptor({ node, keyword: 'export', type: 'keyword' });
             acceptor({ node, keyword: ':', type: 'operator' });
             acceptor({ node, keyword: '=', type: 'operator' });
-            const type = isLambdaValue(node.value) ? 'function' : 'variable';
+            const type = node.value && isLambdaValue(node.value) ? 'function' : 'variable';
             acceptor({ node, property: 'name', type, modifier: 'declaration' });
             return;
         }
@@ -191,7 +191,7 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
             for (let i = root.bindings.length - 1; i >= 0; i--) {
                 const binding = root.bindings[i]!;
                 if (binding.name === name) {
-                    return isLambdaValue(binding.value) ? { type: 'function' } : { type: 'variable' };
+                    return binding.value && isLambdaValue(binding.value) ? { type: 'function' } : { type: 'variable' };
                 }
             }
             if (root.imports.some(imp => imp.alias === name)) {

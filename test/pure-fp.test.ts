@@ -14,12 +14,12 @@ describe('pure evaluation API', () => {
 
         const env = new Map<string, Value>(Object.entries(BUILTINS).map(([name, factory]) => [name, factory()]));
         env.set('users', analyzed.value);
-        const ok = evalExpr(valid.bindings[1]!.value, env, new Set(['users', 'q']));
+        const ok = evalExpr(valid.bindings[1]!.value!, env, new Set(['users', 'q']));
         expect(ok.ok).toBe(true);
         if (ok.ok) expect(ok.value.kind).toBe('query');
 
         const badModel = parseModel(`users: query { id: int } = table "users"\nq = filter (u => u.id == "x") users`);
-        const bad = evalExpr(badModel.bindings[1]!.value, env, new Set(['users', 'q']));
+        const bad = evalExpr(badModel.bindings[1]!.value!, env, new Set(['users', 'q']));
         expect(bad.ok).toBe(false);
         expect(bad.diagnostics.map(d => d.message).join('\n')).toContain('cannot compare int with string');
     });

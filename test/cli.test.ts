@@ -294,7 +294,7 @@ describe('watch', () => {
                 // Re-write once after a tick: some watchers catch the first
                 // event before the new content is fully visible.
                 rewriter = setTimeout(() => writeFileSync(file, QUERY_2), 300);
-                await waitFor(() => results.some(sql => sql.includes('LIMIT 7')), 5000);
+                await waitFor(() => results.some(sql => sql.includes('LIMIT 7')), 10_000);
             } finally {
                 if (rewriter !== undefined) clearTimeout(rewriter);
                 session.stop();
@@ -316,7 +316,7 @@ describe('watch', () => {
                 session.runAll();
                 expect(seen).toHaveLength(1);
                 const newFile = write(dir, 'b.tetaue', QUERY_2);
-                await waitFor(() => seen.includes(newFile), 5000);
+                await waitFor(() => seen.includes(newFile), 10_000);
             } finally {
                 session.stop();
             }

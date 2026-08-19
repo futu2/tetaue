@@ -152,7 +152,7 @@ export interface Binding extends langium.AstNode {
     export: boolean;
     name: string;
     type?: Type;
-    value: Expression;
+    value?: Expression;
 }
 
 export const Binding = {
@@ -868,7 +868,8 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                     optional: true
                 },
                 value: {
-                    name: Binding.value
+                    name: Binding.value,
+                    optional: true
                 }
             },
             superTypes: []

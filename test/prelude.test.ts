@@ -29,6 +29,13 @@ function parsedModule(source: string, uri: string | undefined = undefined) {
 }
 
 describe('standard prelude', () => {
+    test('is cached per service container', () => {
+        expect(standardPrelude(services)).toBe(standardPrelude(services));
+
+        const otherServices = createTetaueServices(NodeFileSystem).tetaue;
+        expect(standardPrelude(otherServices)).not.toBe(standardPrelude(services));
+    });
+
     test('the checked-in source matches the embedded distribution source', () => {
         const file = readFileSync(new URL('../prelude.tetaue', import.meta.url), 'utf8').trim();
         expect(file).toBe(STANDARD_PRELUDE_SOURCE.trim());
