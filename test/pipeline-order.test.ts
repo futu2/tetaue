@@ -106,7 +106,7 @@ describe('dialect capability fixes execute on SQLite', () => {
     });
 
     test('two-argument lpad/rpad lower to an explicit space pad', () => {
-        const sql = render(`t: query { a: string, n: int } = table "t"\nq = t & map (u => { l = lpad [u.a, 3], r = rpad [u.a, 3] })`, 'postgresql');
+        const sql = render(`t: query { a: string, n: int } = table "t"\nq = t & map (u => { l = lpad u.a 3 " ", r = rpad u.a 3 " " })`, 'postgresql');
         expect(sql).toContain(`LPAD(a, 3, ' ') AS l`);
         expect(sql).toContain(`RPAD(a, 3, ' ') AS r`);
     });
@@ -115,7 +115,7 @@ describe('dialect capability fixes execute on SQLite', () => {
         const db = new Database(':memory:');
         db.run('CREATE TABLE t (a text)');
         db.run("INSERT INTO t VALUES ('ab'), ('abcdef')");
-        const sql = render(`t: query { a: string } = table "t"\nq = t & map (u => { l = lpad [u.a, 4, "0"], r = rpad [u.a, 4, "0"] })`);
+        const sql = render(`t: query { a: string } = table "t"\nq = t & map (u => { l = lpad u.a 4 "0", r = rpad u.a 4 "0" })`);
         expect(db.query(sql).all()).toEqual([
             { l: '00ab', r: 'ab00' },
             { l: 'abcd', r: 'abcd' },

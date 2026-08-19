@@ -977,8 +977,9 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
     }
     if (isApplication(e)) {
         // All builtins are ordinary curried functions — including the
-        // list-argument ones (`concat [a, b]`, `substring [s, 1, 3]`, ...),
-        // which take a single list argument like any other value.
+        // list-argument ones (`concat [a, b]`), which take a single list
+        // argument, and the heterogeneous/optional ones (`substring u.name 1
+        // nothing`), which curry position by position with `maybe` optionals.
         let f = evalExprWith(e.func, ctx);
         for (const argExpr of e.arguments) {
             if (isError(f)) {
@@ -2321,19 +2322,26 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     // --- type conversion --------------------------------------------------
     cast: castBuiltin('cast'),
 
-    // --- list-argument builtins (take a single list argument) ------------
-    // concat [a, b], greatest [a, b], round [x, 2], substring [s, 1, 3],
-    // lpad [s, 8, "0"], lag [x, 1, 0], ...
-    // A single list argument keeps them ordinary curried functions — they
-    // compose, bind and partial-apply like everything else. LIST_BUILTINS
-    // owns the element-kind and arity validation.
+    // --- list-argument builtins (homogeneous variadic) -------------------
+    // concat [a, b], greatest [a, b], least [a, b] take a single list
+    // argument — the sound encoding for variadic functions with ONE element
+    // type. LIST_BUILTINS owns the element-kind and arity validation.
     concat: listBuiltin('concat'),
     greatest: listBuiltin('greatest'),
     least: listBuiltin('least'),
-    round: listBuiltin('round'),
-    substring: listBuiltin('substring'),
-    lpad: listBuiltin('lpad'),
-    rpad: listBuiltin('rpad'),
+
+    // --- heterogeneous-argument builtins (curried) ------------------------
+    // round, substring, lpad/rpad, lag/lead have arguments of DIFFERENT
+    // types (a list cannot type them soundly), so they are ordinary curried
+    // functions. An argument is `maybe`-typed only when omitting it changes
+    // the meaning (substring's length = to the end, lag's default = NULL);
+    // args SQL merely defaults are required: `round u.x 0`,
+    // `substring u.name 1 (just 3)`, `lpad u.code 8 "0"`,
+    // `lag u.salary 1 nothing`.
+    round: roundBuiltin(),
+    substring: substringBuiltin(),
+    lpad: padBuiltin('lpad'),
+    rpad: padBuiltin('rpad'),
 
     // --- window functions ------------------------------------------------
     // Window-only functions must be wrapped in `over (...)` — a bare
@@ -2345,11 +2353,11 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         // ranking/offset functions — never plain scalar calls like upper.
         const ok = fnNode !== null && (fnNode.kind === 'agg' || (fnNode.kind === 'call' && WINDOW_ONLY.has(fnNode.name)));
         if (!ok) {
-            // A bare `over lag [u.salary, 1, 0] {...}` — the application
+            // A bare `over lag u.salary 1 0 {...}` — the application
             // flattens, so the first argument arrives as a function — hint at
             // wrapping multi-argument window functions in parens.
             const hint = fnArg.kind === 'fn'
-                ? ` — wrap it in parens when it takes arguments, e.g. over (${fnArg.name} [u.x, 1, 0]) { partition = [u.dept], order = [desc u.salary] }`
+                ? ` — wrap it in parens when it takes arguments, e.g. over (${fnArg.name} u.x 1 nothing) { partition = [u.dept], order = [desc u.salary] }`
                 : '';
             ctx.diagnostics.push({ node: at ?? fnArg.ast, message: `over expects a window function (row_number, rank, sum, lag, ...), got ${fnNode ? `an expression of type ${typeName(fnNode.type)}` : describe(fnArg)}${hint}` });
             return ERROR;
@@ -2374,8 +2382,8 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         if (forbid(node, ['agg', 'group', 'order', 'window'], 'ntile', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'call', name: 'ntile', args: [node], type: 'int' }, at);
     }),
-    lag: listBuiltin('lag'),
-    lead: listBuiltin('lead'),
+    lag: lagLeadBuiltin('lag'),
+    lead: lagLeadBuiltin('lead'),
 };
 
 function filterBuiltin(name: string): () => Value {
@@ -2694,11 +2702,19 @@ function castBuiltin(name: 'cast'): () => Value {
 }
 
 // ---------------------------------------------------------------------------
-// List-argument builtins — concat, greatest, least, round, substring,
-// lpad/rpad and lag/lead take a SINGLE list argument
-// (`concat [a, b]`), so they are ordinary curried functions: composable,
-// bindable and partially applicable like everything else. LIST_BUILTINS owns
-// the element-kind and arity validation; render.ts lowers the call nodes.
+// Many-argument builtins.
+//
+// concat, greatest, least are HOMOGENEOUS variadic functions: their list
+// argument (`concat [a, b]`) types exactly what they consume, which is the
+// sound pure-functional encoding. LIST_BUILTINS owns their element-kind and
+// arity validation.
+//
+// round, substring, lpad/rpad, lag/lead have heterogeneous arguments — a
+// list cannot express `[string, int, ...]` — so they are ordinary curried
+// functions typed position by position. Only the positions whose OMISSION
+// changes the meaning are `maybe` (substring's length = to the end, lag's
+// default = NULL); args SQL merely defaults are required. render.ts lowers
+// the resulting call nodes.
 // ---------------------------------------------------------------------------
 
 /** A list-argument builtin's env value: apply the one list argument. */
@@ -2722,12 +2738,6 @@ function listExample(name: string): string {
         case 'concat': return 'concat [u.first, u.last]';
         case 'greatest': return 'greatest [u.a, u.b]';
         case 'least': return 'least [u.a, u.b]';
-        case 'round': return 'round [u.x, 2]';
-        case 'substring': return 'substring [u.name, 1, 3]';
-        case 'lpad': return 'lpad [u.code, 8, "0"]';
-        case 'rpad': return 'rpad [u.code, 8, "0"]';
-        case 'lag': return 'lag [u.salary, 1, 0]';
-        case 'lead': return 'lead [u.salary, 1]';
     }
     return `${name} [a, b]`;
 }
@@ -2778,43 +2788,6 @@ const LIST_BUILTINS: Readonly<Record<string, { min: number; max: number; apply: 
         min: LIST_ARITY.least![0], max: LIST_ARITY.least![1],
         apply: (args, at, ctx) => listExtremum('least', args, at, ctx),
     },
-    round: {
-        min: LIST_ARITY.round![0], max: LIST_ARITY.round![1],
-        apply: (args, at, ctx) => {
-            const nodes = exprArgs(args, 'round', 'numeric', at, ctx);
-            if (nodes === null) return ERROR;
-            return mkExpr({ kind: 'call', name: 'round', args: nodes, type: nodes[0]!.type as SqlType }, at);
-        },
-    },
-    substring: {
-        min: LIST_ARITY.substring![0], max: LIST_ARITY.substring![1],
-        apply: (args, at, ctx) => {
-            const value = exprArgs([args[0]!], 'substring', 'string', at, ctx);
-            if (value === null) return ERROR;
-            const start = exprArgs([args[1]!], 'substring', 'numeric', at, ctx);
-            if (start === null) return ERROR;
-            const hasLength = args[2] !== undefined;
-            const length = hasLength ? exprArgs([args[2]!], 'substring', 'numeric', at, ctx) : null;
-            if (hasLength && length === null) return ERROR;
-            return mkExpr({ kind: 'call', name: 'substring', args: hasLength ? [value[0]!, start[0]!, length![0]!] : [value[0]!, start[0]!], type: 'string' }, at);
-        },
-    },
-    lpad: {
-        min: LIST_ARITY.lpad![0], max: LIST_ARITY.lpad![1],
-        apply: (args, at, ctx) => listPad('lpad', args, at, ctx),
-    },
-    rpad: {
-        min: LIST_ARITY.rpad![0], max: LIST_ARITY.rpad![1],
-        apply: (args, at, ctx) => listPad('rpad', args, at, ctx),
-    },
-    lag: {
-        min: LIST_ARITY.lag![0], max: LIST_ARITY.lag![1],
-        apply: (args, at, ctx) => listLagLead('lag', args, at, ctx),
-    },
-    lead: {
-        min: LIST_ARITY.lead![0], max: LIST_ARITY.lead![1],
-        apply: (args, at, ctx) => listLagLead('lead', args, at, ctx),
-    },
 };
 
 /** greatest/least — all arguments must share a comparable type. */
@@ -2832,50 +2805,141 @@ function listExtremum(name: 'greatest' | 'least', args: Value[], at: AstNode | u
     return mkExpr({ kind: 'call', name, args: nodes, type: t }, at);
 }
 
-/** lpad/rpad — value, length, optional padding. */
-function listPad(name: 'lpad' | 'rpad', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
-    const value = exprArgs([args[0]!], name, 'string', at, ctx);
-    if (value === null) return ERROR;
-    const length = exprArgs([args[1]!], name, 'numeric', at, ctx);
-    if (length === null) return ERROR;
-    const hasPadding = args[2] !== undefined;
-    const padding = hasPadding ? exprArgs([args[2]!], name, 'string', at, ctx) : null;
-    if (hasPadding && padding === null) return ERROR;
-    const callArgs = padding
-        ? [value[0]!, length[0]!, padding[0]!]
-        : [value[0]!, length[0]!];
-    return mkExpr({ kind: 'call', name, args: callArgs, type: 'string' }, at);
+// ---------------------------------------------------------------------------
+// Curried builtins with heterogeneous arguments.
+// round, substring, lpad/rpad, lag/lead are curried position by position.
+// A trailing argument is `maybe`-typed ONLY when omitting it changes the
+// meaning (substring's length = to the end; lag's default = NULL); arguments
+// that SQL merely gives a default value are REQUIRED, so the caller writes
+// the default explicitly. Every message below mirrors the corresponding
+// static diagnostic in inference.ts (argError / postCheckArg) so the merged
+// checker diagnostics dedupe to one.
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a `maybe`-typed optional argument: `nothing` (a NULL literal)
+ * omits the argument; any other expression supplies it. Returns 'omit',
+ * the expression node, or null (a diagnostic was pushed).
+ */
+function maybeOpt(v: Value, what: string, at: AstNode | undefined, ctx: Ctx): SqlNode | 'omit' | null {
+    const node = exprNode(v);
+    if (!node) {
+        ctx.diagnostics.push({ node: at ?? v.ast, message: `${what} expects its optional argument as maybe (nothing to omit, just x to supply), got ${describe(v)}` });
+        return null;
+    }
+    return node.type === 'null' ? 'omit' : node;
 }
 
-/** lag/lead — value, optional offset (int), optional default (any type). */
-function listLagLead(name: 'lag' | 'lead', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
-    const value = exprNode(args[0]!);
-    if (!value) {
-        ctx.diagnostics.push({ node: at ?? args[0]!.ast, message: `${name} expects an expression to look up, e.g. ${name} u.salary 1 0` });
-        return ERROR;
-    }
-    if (forbid(value, ['agg', 'group', 'order', 'window'], name, at ?? args[0]!.ast, ctx)) return ERROR;
-    const nodes: SqlNode[] = [value];
-    if (args[1] !== undefined) {
-        const offset = exprNode(args[1]!);
-        if (!offset || (!isNumeric(offset.type) && offset.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? args[1]!.ast, message: `${name} expects a numeric offset, got ${offset ? `type ${typeName(offset.type)}` : describe(args[1]!)}` });
+/** round x scale — the scale is required (SQL's ROUND(x) means scale 0). */
+function roundBuiltin(): () => Value {
+    return () => fn('round', (x, at, ctx) => {
+        const value = exprNode(x);
+        if (!value || (!isNumeric(value.type) && value.type !== 'unknown')) {
+            ctx.diagnostics.push({ node: at ?? x.ast, message: `round expects a numeric expression, got ${value ? `type ${typeName(value.type)}` : describe(x)}` });
             return ERROR;
         }
-        if (forbid(offset, ['agg', 'group', 'order', 'window'], name, at ?? args[1]!.ast, ctx)) return ERROR;
-        nodes.push(offset);
-    }
-    if (args[2] !== undefined) {
-        const def = exprNode(args[2]!);
-        if (!def) {
-            ctx.diagnostics.push({ node: at ?? args[2]!.ast, message: `${name} expects an expression as its default value, e.g. ${name} u.salary 1 0` });
+        if (forbid(value, ['agg', 'group', 'order'], 'round', at ?? x.ast, ctx)) return ERROR;
+        return fn('round', (scale, at2, ctx2) => {
+            const scaleNode = exprNode(scale);
+            if (!scaleNode || (!isNumeric(scaleNode.type) && scaleNode.type !== 'unknown')) {
+                ctx2.diagnostics.push({ node: at2 ?? scale.ast, message: `round expects a numeric scale, got ${scaleNode ? `type ${typeName(scaleNode.type)}` : describe(scale)}` });
+                return ERROR;
+            }
+            if (forbid(scaleNode, ['agg', 'group', 'order'], 'round', at2 ?? scale.ast, ctx2)) return ERROR;
+            return mkExpr({ kind: 'call', name: 'round', args: [value, scaleNode], type: value.type as SqlType }, at2);
+        });
+    });
+}
+
+/** substring s (maybe length) — start required, length optional (to the end). */
+function substringBuiltin(): () => Value {
+    return () => fn('substring', (s, at, ctx) => {
+        const value = exprNode(s);
+        if (!value || (value.type !== 'string' && value.type !== 'unknown')) {
+            ctx.diagnostics.push({ node: at ?? s.ast, message: `substring expects a string expression, got ${value ? `type ${typeName(value.type)}` : describe(s)}` });
             return ERROR;
         }
-        if (forbid(def, ['agg', 'group', 'order', 'window'], name, at ?? args[2]!.ast, ctx)) return ERROR;
-        nodes.push(def);
-    }
-    const t: SqlType = value.type === 'null' ? 'string' : value.type;
-    return mkExpr({ kind: 'call', name, args: nodes, type: t }, at);
+        if (forbid(value, ['agg', 'group', 'order'], 'substring', at ?? s.ast, ctx)) return ERROR;
+        return fn('substring', (start, at2, ctx2) => {
+            const startNode = exprNode(start);
+            if (!startNode || (!isNumeric(startNode.type) && startNode.type !== 'unknown')) {
+                ctx2.diagnostics.push({ node: at2 ?? start.ast, message: `substring expects a numeric start position, got ${startNode ? `type ${typeName(startNode.type)}` : describe(start)}` });
+                return ERROR;
+            }
+            if (forbid(startNode, ['agg', 'group', 'order'], 'substring', at2 ?? start.ast, ctx2)) return ERROR;
+            return fn('substring', (len, at3, ctx3) => {
+                const lenNode = maybeOpt(len, 'substring', at3, ctx3);
+                if (lenNode === null) return ERROR;
+                if (lenNode !== 'omit') {
+                    if (!isNumeric(lenNode.type) && lenNode.type !== 'unknown') {
+                        ctx3.diagnostics.push({ node: at3 ?? len.ast, message: `substring expects its optional length as maybe int, e.g. substring u.name 1 nothing or substring u.name 1 (just 3)` });
+                        return ERROR;
+                    }
+                    if (forbid(lenNode, ['agg', 'group', 'order'], 'substring', at3 ?? len.ast, ctx3)) return ERROR;
+                }
+                const args = lenNode === 'omit' ? [value, startNode] : [value, startNode, lenNode];
+                return mkExpr({ kind: 'call', name: 'substring', args, type: 'string' }, at3);
+            });
+        });
+    });
+}
+
+/** lpad/rpad — value, length, padding (required; SQL's default pad is a space). */
+function padBuiltin(name: 'lpad' | 'rpad'): () => Value {
+    return () => fn(name, (s, at, ctx) => {
+        const value = exprNode(s);
+        if (!value || (value.type !== 'string' && value.type !== 'unknown')) {
+            ctx.diagnostics.push({ node: at ?? s.ast, message: `${name} expects a string expression, got ${value ? `type ${typeName(value.type)}` : describe(s)}` });
+            return ERROR;
+        }
+        if (forbid(value, ['agg', 'group', 'order'], name, at ?? s.ast, ctx)) return ERROR;
+        return fn(name, (n, at2, ctx2) => {
+            const length = exprNode(n);
+            if (!length || (!isNumeric(length.type) && length.type !== 'unknown')) {
+                ctx2.diagnostics.push({ node: at2 ?? n.ast, message: `${name} expects a numeric length, got ${length ? `type ${typeName(length.type)}` : describe(n)}` });
+                return ERROR;
+            }
+            if (forbid(length, ['agg', 'group', 'order'], name, at2 ?? n.ast, ctx2)) return ERROR;
+            return fn(name, (pad, at3, ctx3) => {
+                const padNode = exprNode(pad);
+                if (!padNode || (padNode.type !== 'string' && padNode.type !== 'unknown')) {
+                    ctx3.diagnostics.push({ node: at3 ?? pad.ast, message: `${name} expects a string padding, got ${padNode ? `type ${typeName(padNode.type)}` : describe(pad)}` });
+                    return ERROR;
+                }
+                if (forbid(padNode, ['agg', 'group', 'order'], name, at3 ?? pad.ast, ctx3)) return ERROR;
+                return mkExpr({ kind: 'call', name, args: [value, length, padNode], type: 'string' }, at3);
+            });
+        });
+    });
+}
+
+/** lag/lead — value, offset (required; SQL's default is 1), optional default (NULL). */
+function lagLeadBuiltin(name: 'lag' | 'lead'): () => Value {
+    return () => fn(name, (x, at, ctx) => {
+        const value = exprNode(x);
+        if (!value) {
+            ctx.diagnostics.push({ node: at ?? x.ast, message: `${name} expects an expression to look up, e.g. ${name} u.salary 1 nothing, got ${describe(x)}` });
+            return ERROR;
+        }
+        if (forbid(value, ['agg', 'group', 'order', 'window'], name, at ?? x.ast, ctx)) return ERROR;
+        return fn(name, (offset, at2, ctx2) => {
+            const offsetNode = exprNode(offset);
+            if (!offsetNode || (!isNumeric(offsetNode.type) && offsetNode.type !== 'unknown')) {
+                ctx2.diagnostics.push({ node: at2 ?? offset.ast, message: `${name} expects a numeric offset, got ${offsetNode ? `type ${typeName(offsetNode.type)}` : describe(offset)}` });
+                return ERROR;
+            }
+            if (forbid(offsetNode, ['agg', 'group', 'order', 'window'], name, at2 ?? offset.ast, ctx2)) return ERROR;
+            return fn(name, (def, at3, ctx3) => {
+                const defNode = maybeOpt(def, name, at3, ctx3);
+                if (defNode === null) return ERROR;
+                if (defNode !== 'omit' && forbid(defNode, ['agg', 'group', 'order', 'window'], name, at3 ?? def.ast, ctx3)) return ERROR;
+                const nodes: SqlNode[] = [value, offsetNode];
+                if (defNode !== 'omit') nodes.push(defNode);
+                const t: SqlType = value.type === 'null' ? 'string' : value.type;
+                return mkExpr({ kind: 'call', name, args: nodes, type: t }, at3);
+            });
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------

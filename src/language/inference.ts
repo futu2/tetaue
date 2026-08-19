@@ -50,7 +50,7 @@ export interface InferDiagnostic {
 }
 
 /** Builtins whose application takes ALL arguments at once (no currying). */
-const LIST_BUILTINS = new Set(['concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'lag', 'lead']);
+const LIST_BUILTINS = new Set(['concat', 'greatest', 'least']);
 
 const JOIN_BUILTINS = {
     joinInner: 'inner',
@@ -1905,10 +1905,12 @@ export class Inferencer {
     }
 
     /**
-     * List-argument builtins (`concat [a, b]`, `substring [s, 1, 3]`, ...):
-     * the scheme types the FIRST element; this checks every element's static
-     * kind and the arity, mirroring the interpreter's runtime checks with
-     * matching messages (so the merged diagnostics dedupe).
+     * List-argument builtins (`concat [a, b]`, `greatest [a, b]`, ...): the
+     * scheme types the FIRST element; this checks every element's static kind
+     * and the arity, mirroring the interpreter's runtime checks with matching
+     * messages (so the merged diagnostics dedupe). The heterogeneous/optional
+     * builtins (round, substring, lpad/rpad, lag/lead) are curried — a list
+     * cannot type `[string, int, ...]` — so they are never checked here.
      */
     private checkListBuiltin(name: string, e: import('./generated/ast.js').Application, env: Map<string, Scheme>): void {
         const listExpr = e.arguments[0];
@@ -1918,28 +1920,22 @@ export class Inferencer {
         if (elements.length < min || elements.length > max) {
             this.diag(listExpr, `${name} expects ${min}${max === Infinity ? ' or more' : ` to ${max}`} arguments, got ${elements.length}`);
         }
-        const expect = (i: number, kind: 'string' | 'int' | 'numeric'): void => {
-            if (i >= elements.length) return;
-            const t = this.inferExpr(elements[i]!, env);
-            if (kind === 'numeric') {
-                const r = this.u.peel(t);
-                if (r.kind === 'prim' && !isNumericPrim(r)) {
-                    this.diag(elements[i]!, `${name} expects numeric expressions, got type ${this.u.pretty(t)}`);
-                }
-                return;
-            }
-            try {
-                this.u.unify(kind === 'string' ? prim('string') : prim('int'), t);
-            } catch (err) {
-                if (err instanceof UnifyError) {
-                    this.diag(elements[i]!, `${name} expects ${kind === 'string' ? 'string' : 'numeric'} expressions, got type ${this.u.pretty(t)}`);
-                } else {
-                    throw err;
-                }
-            }
-        };
         switch (name) {
-            case 'concat': elements.forEach((_, i) => expect(i, 'string')); break;
+            case 'concat': {
+                for (let i = 0; i < elements.length; i++) {
+                    const t = this.inferExpr(elements[i]!, env);
+                    try {
+                        this.u.unify(prim('string'), t);
+                    } catch (err) {
+                        if (err instanceof UnifyError) {
+                            this.diag(elements[i]!, `concat expects string expressions, got type ${this.u.pretty(t)}`);
+                        } else {
+                            throw err;
+                        }
+                    }
+                }
+                break;
+            }
             case 'greatest': case 'least': {
                 let base: Type | null = null;
                 for (let i = 0; i < elements.length; i++) {
@@ -1951,18 +1947,6 @@ export class Inferencer {
                 }
                 break;
             }
-            case 'round': expect(0, 'numeric'); expect(1, 'int'); break;
-            case 'substring': expect(0, 'string'); expect(1, 'int'); expect(2, 'int'); break;
-            case 'lpad': case 'rpad': expect(0, 'string'); expect(1, 'int'); expect(2, 'string'); break;
-            case 'lag': case 'lead':
-                if (elements.length >= 2) {
-                    const offset = this.inferExpr(elements[1]!, env);
-                    const r = this.u.peel(offset);
-                    if (r.kind === 'prim' && !isNumericPrim(r)) {
-                        this.diag(elements[1]!, `${name} expects a numeric offset, got type ${this.u.pretty(offset)}`);
-                    }
-                }
-                break;
         }
     }
 
@@ -2233,6 +2217,33 @@ export class Inferencer {
             case 'coalesce':
                 this.diag(node, `coalesce requires matching types, got ${p(param ?? argType)} and ${p(argType)}`);
                 break;
+            // Curried heterogeneous/optional builtins — messages mirror the
+            // interpreter's (interpreter.ts `roundBuiltin` et al.) so the
+            // merged diagnostics dedupe. Optional positions carry their
+            // `maybe` contract with no type suffix: both passes say exactly
+            // the same words.
+            case 'round':
+                if (index === 0) this.diag(node, `round expects a numeric expression, got type ${p(argType)}`);
+                else if (index === 1) this.diag(node, `round expects a numeric scale, got type ${p(argType)}`);
+                else this.diag(node, `round takes exactly two arguments, e.g. round u.x 0`);
+                break;
+            case 'substring':
+                if (index === 0) this.diag(node, `substring expects a string expression, got type ${p(argType)}`);
+                else if (index === 1) this.diag(node, `substring expects a numeric start position, got type ${p(argType)}`);
+                else if (index === 2) this.diag(node, `substring expects its optional length as maybe int, e.g. substring u.name 1 nothing or substring u.name 1 (just 3)`);
+                else this.diag(node, `substring takes exactly three arguments, e.g. substring u.name 1 nothing`);
+                break;
+            case 'lpad': case 'rpad':
+                if (index === 0) this.diag(node, `${name} expects a string expression, got type ${p(argType)}`);
+                else if (index === 1) this.diag(node, `${name} expects a numeric length, got type ${p(argType)}`);
+                else if (index === 2) this.diag(node, `${name} expects a string padding, got type ${p(argType)}`);
+                else this.diag(node, `${name} takes exactly three arguments, e.g. ${name} u.code 8 "0"`);
+                break;
+            case 'lag': case 'lead':
+                if (index === 1) this.diag(node, `${name} expects a numeric offset, got type ${p(argType)}`);
+                else if (index === 2) this.diag(node, `${name} expects its default to match the value type, e.g. ${name} u.salary 1 (just 0)`);
+                else this.diag(node, `${name} takes exactly three arguments, e.g. ${name} u.salary 1 nothing`);
+                break;
             default: {
                 const applied = fType ? this.u.peel(fType) : null;
                 if (applied?.kind === 'fun') {
@@ -2267,7 +2278,8 @@ export class Inferencer {
             return;
         }
         if ((name === 'sum' || name === 'avg' || name === 'abs'
-            || name === 'ceil' || name === 'floor' || name === 'sqrt') && index === 0) {
+            || name === 'ceil' || name === 'floor' || name === 'sqrt'
+            || name === 'round') && index === 0) {
             if (r.kind === 'prim' && !isNumericPrim(r)) {
                 this.diag(node, `${name} expects a numeric expression, got type ${this.u.pretty(argType)}`);
             }

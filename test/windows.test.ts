@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { render, errors, typeErrors } from './helpers.ts';
+import { render, errors, typeErrors, allErrors } from './helpers.ts';
 
 const USERS = `users: query {
     id: int,
@@ -40,14 +40,14 @@ describe('window functions', () => {
         const sql = render(`
             ${USERS}
             q = users & map (u => {
-                l1 = over (lag [u.salary]) { order = [asc u.joined] },
-                l2 = over (lag [u.salary, 1]) { order = [asc u.joined] },
-                l3 = over (lag [u.salary, 1, 0]) { order = [asc u.joined] },
-                l4 = over (lead [u.salary, 2]) { order = [asc u.joined] },
+                l1 = over (lag u.salary 1 nothing) { order = [asc u.joined] },
+                l2 = over (lag u.salary 2 nothing) { order = [asc u.joined] },
+                l3 = over (lag u.salary 1 (just 0.0)) { order = [asc u.joined] },
+                l4 = over (lead u.salary 2 nothing) { order = [asc u.joined] },
             })
         `, 'trino');
-        expect(sql).toContain('LAG(salary) OVER (ORDER BY joined ASC) AS l1');
-        expect(sql).toContain('LAG(salary, 1) OVER (ORDER BY joined ASC) AS l2');
+        expect(sql).toContain('LAG(salary, 1) OVER (ORDER BY joined ASC) AS l1');
+        expect(sql).toContain('LAG(salary, 2) OVER (ORDER BY joined ASC) AS l2');
         expect(sql).toContain('LAG(salary, 1, 0) OVER (ORDER BY joined ASC) AS l3');
         expect(sql).toContain('LEAD(salary, 2) OVER (ORDER BY joined ASC) AS l4');
     });
@@ -106,7 +106,7 @@ describe('window functions', () => {
     });
 
     test('bare multi-argument window functions hint at parens', () => {
-        const messages = errors(`${USERS}\nq = users & map (u => { x = over lag [u.salary, 1, 0] { order = [asc u.joined] } })`);
+        const messages = errors(`${USERS}\nq = users & map (u => { x = over lag u.salary 1 (just 0.0) { order = [asc u.joined] } })`);
         expect(messages.join('\n')).toContain('over expects a window function');
         expect(messages.join('\n')).toContain('wrap it in parens');
     });
@@ -126,7 +126,7 @@ describe('window functions', () => {
 
 describe('window function validation', () => {
     test('window-only functions must be wrapped in over', () => {
-        for (const fn of ['row_number', 'rank', 'dense_rank', 'percent_rank', 'ntile 4', 'lag [u.salary]', 'lead [u.salary]']) {
+        for (const fn of ['row_number', 'rank', 'dense_rank', 'percent_rank', 'ntile 4', 'lag u.salary 1 nothing', 'lead u.salary 1 nothing']) {
             expect(errors(`${USERS}\nq = users & map (u => { x = ${fn} })`).join('\n')).toContain('must be wrapped in over');
         }
     });
@@ -150,8 +150,9 @@ describe('window function validation', () => {
     });
 
     test('lag/lead validate their arguments', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { x = over (lag [u.salary, "x"]) {} })`).join('\n')).toContain('lag expects a numeric offset');
-        expect(errors(`${USERS}\nq = users & map (u => { x = lag [u.salary, 1, 0, 9] })`).join('\n')).toContain('lag expects 1 to 3 arguments');
+        expect(errors(`${USERS}\nq = users & map (u => { x = over (lag u.salary "x") {} })`).join('\n')).toContain('lag expects a numeric offset');
+        // Four arguments is one too many; the static pass reports it.
+        expect(allErrors(`${USERS}\nq = users & map (u => { x = lag u.salary 1 (just 0.0) 9 })`).join('\n')).toContain('lag takes exactly three arguments');
     });
 
     test('window functions are rejected in filter predicates', () => {
@@ -165,7 +166,7 @@ describe('type inference', () => {
             ${USERS}
             q = users & map (u => {
                 rn = over (row_number) { partition = [u.dept], order = [desc u.salary] },
-                lg = over (lag [u.salary, 1, 0]) { partition = [u.dept] },
+                lg = over (lag u.salary 1 (just 0.0)) { partition = [u.dept] },
                 ws = over (sum u.salary) { partition = [u.dept] },
             })
         `;

@@ -50,8 +50,8 @@ describe('math functions', () => {
                 s = sqrt u.balance,
                 p = pow u.balance 2,
                 m = mod u.id 3,
-                r1 = round [u.balance],
-                r2 = round [u.balance, 2],
+                r1 = round u.balance 0,
+                r2 = round u.balance 2,
             })
         `, 'trino');
         expect(sql).toContain('CEIL(balance) AS c');
@@ -59,7 +59,7 @@ describe('math functions', () => {
         expect(sql).toContain('SQRT(balance) AS s');
         expect(sql).toContain('POW(balance, 2) AS p');
         expect(sql).toContain('MOD(id, 3) AS m');
-        expect(sql).toContain('ROUND(balance) AS r1');
+        expect(sql).toContain('ROUND(balance, 0) AS r1');
         expect(sql).toContain('ROUND(balance, 2) AS r2');
     });
 
@@ -87,9 +87,11 @@ describe('math functions', () => {
         expect(errors(`${USERS}\nq = users & map (u => { g = greatest [u.balance, u.name] })`).join('\n')).toContain('greatest requires matching types, got float and string');
     });
 
-    test('list-argument arity is validated', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { g = greatest [u.balance] })`).join('\n')).toContain('greatest expects 2 or more arguments, got 1');
-        expect(errors(`${USERS}\nq = users & map (u => { r = round [u.balance, 2, 3] })`).join('\n')).toContain('round expects 1 to 2 arguments, got 3');
+    test('round validates its scale and value', () => {
+        // The scale is required (SQL's ROUND(x) means scale 0), so the caller
+        // writes the default explicitly: `round u.balance 0`.
+        expect(errors(`${USERS}\nq = users & map (u => { r = round u.balance "2" })`).join('\n')).toContain('round expects a numeric scale');
+        expect(errors(`${USERS}\nq = users & map (u => { r = round u.name 0 })`).join('\n')).toContain('round expects a numeric expression');
     });
 });
 
@@ -101,7 +103,7 @@ describe('string functions', () => {
     });
 
     test('substring with optional length; sqlite uses SUBSTR', () => {
-        const src = `${USERS}\nq = users & map (u => { a = substring [u.name, 1], b = substring [u.name, 1, 3] })`;
+        const src = `${USERS}\nq = users & map (u => { a = substring u.name 1 nothing, b = substring u.name 1 (just 3) })`;
         expect(render(src, 'trino')).toContain('SUBSTRING(name, 1) AS a');
         expect(render(src, 'trino')).toContain('SUBSTRING(name, 1, 3) AS b');
         expect(render(src, 'sqlite')).toContain('SUBSTR(name, 1) AS a');
@@ -136,7 +138,7 @@ describe('string functions', () => {
     });
 
     test('lpad/rpad render directly in every dialect', () => {
-        const src = `${USERS}\nq = users & map (u => { l = lpad [u.name, 8, "0"], r = rpad [u.name, 8, "0"] })`;
+        const src = `${USERS}\nq = users & map (u => { l = lpad u.name 8 "0", r = rpad u.name 8 "0" })`;
         expect(render(src, 'trino')).toContain(`LPAD(name, 8, '0') AS l`);
         expect(render(src, 'trino')).toContain(`RPAD(name, 8, '0') AS r`);
         expect(render(src, 'sqlite')).toContain("ELSE SUBSTR(REPLACE(PRINTF('%*s', 8, ''), ' ', '0'), 1, 8 - LENGTH(name)) || name END AS l");
@@ -340,13 +342,13 @@ describe('validation', () => {
     });
 
     test('substring validates argument kinds', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { s = substring [u.id, 1, 3] })`).join('\n')).toContain('substring expects string expressions');
-        expect(errors(`${USERS}\nq = users & map (u => { s = substring [u.name, u.name] })`).join('\n')).toContain('substring expects numeric expressions');
+        expect(errors(`${USERS}\nq = users & map (u => { s = substring u.id 1 (just 3) })`).join('\n')).toContain('substring expects a string expression');
+        expect(errors(`${USERS}\nq = users & map (u => { s = substring u.name u.name nothing })`).join('\n')).toContain('substring expects a numeric start position');
     });
 
     test('lpad/rpad validate argument kinds', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { s = lpad [u.id, 8, "0"] })`).join('\n')).toContain('lpad expects string expressions');
-        expect(errors(`${USERS}\nq = users & map (u => { s = rpad [u.name, "8", "0"] })`).join('\n')).toContain('rpad expects numeric expressions');
+        expect(errors(`${USERS}\nq = users & map (u => { s = lpad u.id 8 "0" })`).join('\n')).toContain('lpad expects a string expression');
+        expect(errors(`${USERS}\nq = users & map (u => { s = rpad u.name "8" "0" })`).join('\n')).toContain('rpad expects a numeric length');
     });
 
     test('like requires string operands', () => {
@@ -639,10 +641,10 @@ describe('type inference', () => {
                 c = ceil u.balance,
                 p = pow u.balance 2,
                 m = mod u.id 3,
-                r = round [u.balance, 2],
+                r = round u.balance 2,
                 g = greatest [u.balance, 1.5],
                 full = concat [u.name, "-", u.name],
-                sub = substring [u.name, 1, 3],
+                sub = substring u.name 1 (just 3),
                 pos = position u.name "a",
                 li = like u.name "a%",
                 nf = null_if (just u.name) (just ""),

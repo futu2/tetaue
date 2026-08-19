@@ -12,20 +12,27 @@ and date entry has one of these lowerings in each built-in dialect; capability
 errors are reserved for query-shape features such as unsupported join forms
 or recursive CTEs.
 
-## Optional and many-argument functions: one list argument
+## Many-argument functions: one list or curried positions
 
-`concat` / `greatest` / `least` take any number of arguments; `round`
-(1–2), `substring` (2–3), `lpad`/`rpad` (2–3), and `lag`/`lead` (1–3) have
-optional arguments. These builtins take a **single
-list argument** — `concat [a, b]`, `round [u.x, 2]`, `lag [u.salary, 1, 0]` —
-so they are ordinary curried functions: they compose with `<<<`/`>>>`, bind
-as values (`f = greatest`), and partial-apply like everything else (there is
-no variadic special case in the evaluator). `LIST_BUILTINS` in the
-interpreter validates the element kinds and arity (min/max) at runtime; the
-inference pass checks every element's static kind and the arity
-(`checkListBuiltin` in `inference.ts`), with matching messages so the merged
-diagnostics dedupe. The element type is the list's first element; a
-heterogeneous list is tolerated at the list itself and checked per element.
+`concat` / `greatest` / `least` take any number of arguments of ONE type, so
+they take a **single list argument** — `concat [a, b]`, `greatest [u.a, u.b]`
+— which types exactly what they consume (a homogeneous list). `round`,
+`substring`, `lpad`/`rpad` and `lag`/`lead` have **heterogeneous arguments**
+(a list cannot type `[string, int, ...]` soundly), so they are ordinary
+**curried functions** typed position by position. An argument is `maybe`-typed
+only when omitting it changes the meaning (`substring u.name 1 nothing` means
+to the end; `lag u.salary 1 nothing`'s default is NULL); an argument that SQL
+merely gives a DEFAULT VALUE is required instead, with the default written
+explicitly: `round u.x 2` (scale 0 for no rounding), `lpad u.code 8 "0"` (pad
+defaults to ' '), `lag u.salary 2 nothing` (offset defaults to 1).
+
+All of these are ordinary curried functions: they compose with `<<<`/`>>>`,
+bind as values (`f = greatest`, `f = lpad u.code 8`), and partial-apply like
+everything else (there is no variadic special case in the evaluator). The
+interpreter validates the argument kinds at runtime; the inference pass types
+every position and checks the arity (`argError` / `postCheckArg` in
+`inference.ts`), with messages matching the interpreter's so the merged
+diagnostics dedupe.
 
 A bare reference (`f = greatest`) is the function value, not a call.
 
@@ -143,7 +150,7 @@ PostgreSQL, `yyyy-MM-dd` Hive).
 | `floor x` / `sqrt x` | Direct (`FLOOR`/`SQRT`) | Direct | Direct | Direct | Direct |
 | `pow x y` | `POW(x, y)` | Direct | Direct | Direct | Direct |
 | `mod x y` | `MOD(x, y)` | Direct | Direct | Direct | Direct |
-| `round [x]` / `round [x, n]` | `ROUND(x[, n])` | Direct | Direct | Direct | Direct |
+| `round x n` (scale required; 0 = no rounding) | `ROUND(x, n)` | Direct | Direct | Direct | Direct |
 | `greatest x y ...` / `least ...` | `GREATEST(...)` / `LEAST(...)` | Direct | Direct | Direct (MAX/MIN aliases) | Direct |
 
 `greatest`/`least` require all arguments to share a comparable type (strict
@@ -155,13 +162,13 @@ numerics: int and float do not mix, like everywhere else in the language).
 |---|---|---|---|---|---|
 | `concat [a, b, ...]` | `CONCAT(a, b, ...)` | Direct | Direct | **Fallback** `a \|\| b` | Direct |
 | `trim x` | `TRIM(x)` | Direct | Direct | Direct | Direct |
-| `substring [x, s, l?]` | `SUBSTRING(x, s[, l])` | Direct | Direct | **Mapped** `SUBSTR(x, s[, l])` | Direct |
+| `substring x s (just l)` (nothing = to the end) | `SUBSTRING(x, s[, l])` | Direct | Direct | **Mapped** `SUBSTR(x, s[, l])` | Direct |
 | `position x n` | `POSITION(n IN x)` | Direct | **Mapped** `LOCATE(n, x)` | **Mapped** `INSTR(x, n)` | `INSTR(x, n)` |
 | `replace x s r` | `REPLACE(x, s, r)` | Direct | Direct | Direct | Direct |
 | `reverse x` | `REVERSE(x)` | Direct | Direct | correlated recursive-CTE fallback | Direct |
 | `left_substring x n` | `LEFT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, 1, n)` | Direct |
 | `right_substring x n` | `RIGHT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, -n)` | Direct |
-| `lpad [x, n, p?]` / `rpad` | `LPAD(x, n[, p])` | Direct | Direct | `PRINTF`/`REPLACE`/`SUBSTR` composition | Direct |
+| `lpad x n p` / `rpad x n p` (pad required) | `LPAD(x, n, p)` | Direct | Direct | `PRINTF`/`REPLACE`/`SUBSTR` composition | Direct |
 
 Regex helpers are deliberately absent from the common prelude: stock SQLite
 has no regex engine, so exposing them would either require a deployment-specific
@@ -333,8 +340,8 @@ function with a spec record (fields optional; `{}` renders `OVER ()`).
 a list of column expressions (or one), `order` takes asc/desc items like
 `sort`. **Zero-argument functions (`row_number`, `rank`, `dense_rank`,
 `percent_rank`) can be written bare** — `over row_number {...}`; functions
-with arguments need parens (`over (ntile 4) {...}`, `over (lag [u.salary, 1, 0])
-{...}`, `over (sum u.salary) {...}`), because a bare `lag [u.salary, 1, 0]` would
+with arguments need parens (`over (ntile 4) {...}`, `over (lag u.salary 1 (just 0))
+{...}`, `over (sum u.salary) {...}`), because a bare `lag u.salary 1 (just 0)` would
 flatten into separate application arguments (an error message explains this).
 The syntax and rendering are identical across dialects (PostgreSQL, MySQL 8+,
 SQLite 3.25+, Trino, Hive all support the standard `FN(...) OVER (...)` form):
@@ -344,7 +351,7 @@ SQLite 3.25+, Trino, Hive all support the standard `FN(...) OVER (...)` form):
 | `over row_number { ... }` | `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` |
 | `rank`, `dense_rank`, `percent_rank` | `RANK()` / `DENSE_RANK()` / `PERCENT_RANK()` |
 | `over (ntile 4) { ... }` | `NTILE(4) OVER (...)`, `ntile` takes a numeric bucket count |
-| `over (lag [u.x, 1, 0]) { ... }` | `LAG(x, 1, 0) OVER (...)`, `lead` — value, optional offset, optional default |
+| `over (lag u.x 1 (just 0)) { ... }` | `LAG(x, 1, 0) OVER (...)`, `lead` — value, offset required, optional default |
 | `over (sum u.x) { ... }` | `SUM(x) OVER (...)`, windowed `avg`/`count`/`min`/`max`/`list` too |
 
 The wrapped expression must be an aggregate (`sum`/`avg`/`count`/`min`/`max`/`list`)
@@ -373,10 +380,11 @@ inlining the `OVER` expression would be invalid SQL.
 
 - `interpreter.ts` — `BUILTINS` entries with argument validation
   (`dateLikeError`, `exprArgs`, kind checks, aggregate forbidding);
-  list-argument builtins (`concat [a, b]`, `round [x, 2]`, `lag [x, 1, 0]`,
-  …) via `listBuiltin` + the `LIST_BUILTINS` table — ordinary curried
-  functions over one list argument (0-argument Applications are bare function
-  values).
+  list-argument builtins (`concat [a, b]`, `greatest [a, b]`, …) via
+  `listBuiltin` + the `LIST_BUILTINS` table; the heterogeneous builtins
+  (`round x n`, `substring x s (just l)`, `lpad x n p`, `lag x n (just d)`)
+  are ordinary curried entries with `maybe`-typed optional positions
+  (0-argument Applications are bare function values).
 - `render.ts` — `renderCall` dispatch (`SPECIAL_CALLS` + `DATE_FUNCTIONS`)
   returns the per-dialect SQL or `null` to fall through to plain `NAME(args)`;
   `sqlTypeName` maps cast targets per dialect; `dialect.functions` handles

@@ -595,16 +595,16 @@ date_format u.created_at "%Y-%m-%d"      # dialect-native format string
 date_parse u.note "%Y-%m-%d"             # dialect-native format string
 to_unixtime u.created_at  from_unixtime u.id
 ceil u.balance  floor u.balance  sqrt u.balance  pow u.balance 2  mod u.id 3
-round [u.balance, 2]                 # optional scale — one list argument
+round u.balance 0                     # scale is required (0 = no rounding)
 greatest [u.a, u.b]  least [u.a, u.b]  # any number of arguments, one list
 concat [u.first, u.last]             # sqlite renders || — joins
 merge u { active = true }              # record union — right record wins on overlap
 u <> { active = true }                 # infix form of merge (a monoid: {} is the identity)
 trim u.name  reverse u.name  replace u.name "x" "y"
-substring [u.name, 1, 3]             # optional length; sqlite renders SUBSTR
+substring u.name 1 (just 3)          # optional length (nothing omits); sqlite renders SUBSTR
 position u.name "a"                    # POSITION / LOCATE / INSTR, per dialect
 left_substring u.name 3  right_substring u.name 2
-lpad [u.code, 8, "0"]  rpad [u.code, 8, "0"]
+lpad u.code 8 "0"  rpad u.code 8 " "  # pad is required (SQL defaults to a space)
 like u.name "a%"                       # x LIKE pattern
 null_if u.name ""  is_null u.name  is_not_null u.name
 is_true u.flag  is_false u.flag  is_unknown u.flag
@@ -615,7 +615,7 @@ cast u.id "string"
 over row_number { partition = [u.dept], order = [desc u.salary] }   # window functions — parens optional for zero-arg fns
 over rank { partition = [u.dept] }          # rank / dense_rank / percent_rank
 over (ntile 4) { partition = [u.dept] }     # multi-arg fns keep parens
-over (lag [u.salary, 1, 0]) { order = [asc u.joined] }   # lag / lead (offset, default optional)
+over (lag u.salary 1 nothing) { order = [asc u.joined] }   # lag / lead — offset required; default optional (nothing omits)
 over (sum u.salary) { partition = [u.dept] }        # windowed aggregates
 ```
 

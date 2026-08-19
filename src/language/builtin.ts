@@ -18,12 +18,25 @@
  * computing on aggregate results works; the fold/map mode checks in
  * inference.ts inspect the raw field types.
  *
- * The list-argument builtins (concat, greatest, least, round, substring,
- * lpad, rpad, lag, lead) take a SINGLE list argument —
- * `concat [u.first, u.last]` — instead of the old variadic application, so
- * they are ordinary curried functions: composable, partially applicable and
- * typed uniformly. The interpreter validates element kinds/arity at runtime;
- * inference checks each element's static kind (checkListBuiltin).
+ * Argument-passing for many-argument builtins:
+ *   - The genuinely variadic, homogeneous builtins (concat, greatest, least)
+ *     take a SINGLE list argument — `concat [u.first, u.last]` — which is the
+ *     sound pure-functional encoding of variadic application: a homogeneous
+ *     `[string]` / `[t]` list types exactly what they consume. The
+ *     interpreter validates element kinds/arity at runtime; inference checks
+ *     each element's static kind (checkListBuiltin).
+ *   - Builtins with heterogeneous arguments (round, substring, lpad, rpad,
+ *     lag, lead) are ordinary curried functions whose types state every
+ *     position exactly. An argument is `maybe`-typed only when OMITTING it
+ *     changes the meaning (`substring`'s length: `substring u.name 1 nothing`
+ *     means to the end; `lag`'s default is NULL, i.e. `nothing`). An argument
+ *     that is optional merely because SQL has a DEFAULT VALUE for it is
+ *     required instead, so the caller writes the default explicitly:
+ *     `round u.balance 0` (scale defaults to 0 in SQL), `lpad u.code 8 "0"`
+ *     (pad defaults to ' '), `lag u.salary 1 nothing` (offset defaults to 1).
+ *     A list of heterogeneous arguments would be unsound — one element type
+ *     cannot express `[string, int, ...]` — so these builtins never take a
+ *     list.
  ******************************************************************************/
 import {
     type PrimName, type Scheme, type Type, type TypeUniverse, type VarKind,
@@ -228,13 +241,19 @@ export const BUILTIN_SPECS = [
     // --- casts -----------------------------------------------------------
     { name: 'cast', category: 'cast', doc: 'cast x "int"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))) },
 
-    // --- list-argument builtins (single list argument, curried) ----------
+    // --- list-argument builtins (homogeneous variadic: the list types exactly
+    // what they consume — a sound pure-functional encoding of variadic application)
     { name: 'concat', category: 'string', doc: 'concat [a, b, ...]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
     { name: 'greatest', category: 'scalar', doc: 'greatest [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(listOf(t), t)) },
-    { name: 'round', category: 'math', doc: 'round [x] or round [x, scale]', scheme: u => poly(u, [tVar], t => fun(listOf(t), t)) },
-    { name: 'substring', category: 'string', doc: 'substring [s, start, length?]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
-    { name: 'lpad', category: 'string', doc: 'lpad [s, n, pad?]', scheme: () => mono(fun(listOf(p('string')), p('string'))) },
-    { name: 'lag', category: 'window', doc: 'lag [x, offset?, default?] — window-only', scheme: u => poly(u, [tVar], t => fun(listOf(t), windowOf(t))) },
+
+    // --- curried builtins with heterogeneous arguments -------------------
+    // Every position is curried with its exact type. An argument is
+    // `maybe`-typed only when omitting it changes the meaning; arguments
+    // whose SQL default value makes them "optional" are required instead.
+    { name: 'round', category: 'math', doc: 'round x scale — scale is required (0 rounds to integer)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('int'), t))) },
+    { name: 'substring', category: 'string', doc: 'substring s start (just length) — length optional (omitted = to the end)', scheme: () => mono(fun(p('string'), fun(p('int'), fun(maybeOf(p('int')), p('string'))))) },
+    { name: 'lpad', category: 'string', doc: 'lpad s n pad — pad is required (SQL defaults to a space)', scheme: () => mono(fun(p('string'), fun(p('int'), fun(p('string'), p('string'))))) },
+    { name: 'lag', category: 'window', doc: 'lag x offset (just default) — offset required, default optional (NULL)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('int'), fun(maybeOf(t), windowOf(t))))) },
 
     // --- window functions ------------------------------------------------
     { name: 'over', category: 'window', doc: 'over (fn) { partition = [...], order = [...] }', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, a))) },
@@ -273,11 +292,9 @@ export const BUILTIN_NAMES = [
 // Shared argument-shape metadata (used by both interpreter and inference)
 // ---------------------------------------------------------------------------
 
-/** Min/max element counts of the list-argument builtins. */
+/** Min/max element counts of the list-argument builtins (homogeneous variadic only). */
 export const LIST_ARITY = {
     concat: [2, Infinity], greatest: [2, Infinity], least: [2, Infinity],
-    round: [1, 2], substring: [2, 3], lpad: [2, 3], rpad: [2, 3],
-    lag: [1, 3], lead: [1, 3],
 } as Readonly<Record<string, readonly [number, number]>>;
 
 /** Target type names accepted by cast. */
