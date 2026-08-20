@@ -265,7 +265,7 @@ describe('tetaue.toml through the CLI (end to end)', () => {
         try {
             write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
             write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int, active: bool } = table "users"\n`);
-            write(p.dir, 'main.tetaue', `import "acme/tables"\nq = users & filter (u => u.active) & take 3\n`);
+            write(p.dir, 'main.tetaue', `import "acme/tables"\nmain = users & filter (u => u.active) & take 3\n`);
             const out = execFileSync('bun', ['run', 'src/cli.ts', 'render', join(p.dir, 'main.tetaue')], {
                 cwd: ROOT,
                 encoding: 'utf8',

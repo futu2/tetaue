@@ -77,3 +77,6 @@ q = orders
         name_or_nothing = case { o.status == "shipped" => just "sent", _ => null },
     })
     & sort (o => [desc o.is_big])
+
+# q is this module's query.
+main = q

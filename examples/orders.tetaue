@@ -48,3 +48,6 @@ by_user = users
     })
     & sort (r => [desc r.total_spent])
     & take 20
+
+# by_user is this module's query.
+main = by_user

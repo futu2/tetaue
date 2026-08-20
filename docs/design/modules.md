@@ -181,8 +181,9 @@ legal (as today).
 
 ### 4.5 The query rule
 
-Unchanged: the **root** module's last binding is the project's query.
-Imported modules have no query requirement (their last binding may be
+Unchanged: the **root** module's query is its `main` binding (the strict
+entry enforced by the CLI `render`/`check`/`build`; `--binding` selects any
+named binding instead). Imported modules have no query requirement (their last binding may be
 anything). `export` on the root's bindings is legal and meaningless for a
 program root.
 

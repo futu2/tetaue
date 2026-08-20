@@ -59,6 +59,12 @@ export interface CompileOptions {
      * are reported as "no query" rather than as errors.
      */
     requireQuery?: boolean;
+    /**
+     * Strict `main` entry: a module without a `main` binding is a library and
+     * produces no SQL. Defaults to `requireQuery` (so `render`/`check` are
+     * strict); `--binding` selects a named binding instead.
+     */
+    requireMain?: boolean;
     /** Render this named root-module binding instead of the last one. */
     binding?: string;
 }
@@ -185,7 +191,7 @@ export function compileModuleText(
     services: TetaueServices,
     options?: CompileOptions,
 ): CompileOutcome {
-    const { dialect = 'sqlite', format = 'pretty', requireQuery = true, cte = false, binding } = options ?? {};
+    const { dialect = 'sqlite', format = 'pretty', requireQuery = true, requireMain, cte = false, binding } = options ?? {};
     if (!isDialect(dialect)) {
         return {
             ok: false,
@@ -211,6 +217,9 @@ export function compileModuleText(
     const { modules, importsByModule, diagnostics: treeDiagnostics, warnings: treeWarnings } = projectTreeFor(main, services);
     const { value, diagnostics: merged } = checkProject(modules, {
         requireQuery,
+        // Strict main by default for render/check; `build` opts in via
+        // requireMain while keeping requireQuery off (library detection).
+        requireMain: requireMain ?? requireQuery,
         importsByModule,
         entryBinding: binding,
         prelude: standardPrelude(services),

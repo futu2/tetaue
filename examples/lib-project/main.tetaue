@@ -32,3 +32,6 @@ spending = users
     })
     & sort (r => [desc r.spent])
     & take 5
+
+# adult_users is this module's query.
+main = adult_users

@@ -17,11 +17,11 @@ import { parseManifest } from '../src/language/resolve.ts';
 const services: TetaueServices = createTetaueServices(NodeFileSystem).tetaue;
 
 const QUERY_1 = `users: query { id: int, age: int } = table "users"
-adults = users & filter (u => u.age >= 18) & take 5
+main = users & filter (u => u.age >= 18) & take 5
 `;
 
 const QUERY_2 = `users: query { id: int, age: int, name: string } = table "users"
-adults = users & filter (u => u.age >= 18) & take 7
+main = users & filter (u => u.age >= 18) & take 7
 `;
 
 function tempDir(prefix: string): string {
@@ -415,7 +415,7 @@ describe('render entrypoint and parameter metadata', () => {
     test('render --json exposes sql and named parameters', async () => {
         const dir = tempDir('tetaue-json-');
         try {
-            const file = write(dir, 'param.tetaue', `a: query { id: int } = table "a"\nq = a & filter (u => u.id == param "user_id")\n`);
+            const file = write(dir, 'param.tetaue', `a: query { id: int } = table "a"\nmain = a & filter (u => u.id == param "user_id")\n`);
             const cap = captureConsole();
             try {
                 expect(await main(['render', file, '--json'])).toBe(0);

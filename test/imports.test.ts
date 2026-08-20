@@ -509,7 +509,7 @@ describe('imports through the CLI (end to end)', () => {    test('render resolve
         const dir = mkdtempSync(join(tmpdir(), 'tetaue-'));
         try {
             writeFileSync(join(dir, 'tables.tetaue'), 'export users: query { id: int, active: bool } = table "users"\n');
-            writeFileSync(join(dir, 'main.tetaue'), 'import "tables.tetaue"\nq = users & filter (u => u.active) & take 3\n');
+            writeFileSync(join(dir, 'main.tetaue'), 'import "tables.tetaue"\nmain = users & filter (u => u.active) & take 3\n');
             const out = execFileSync('bun', ['run', 'src/cli.ts', 'render', join(dir, 'main.tetaue')], {
                 cwd: resolve(import.meta.dir, '..'),
                 encoding: 'utf8',

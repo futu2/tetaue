@@ -34,3 +34,6 @@ adults = users
     & map (u => { id = u.id, name = upper u.name, age = u.age, active = u.active })
     & sort (u => [asc u.name])
     & take 10
+
+# adults is this module's query.
+main = adults

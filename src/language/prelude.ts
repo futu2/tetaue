@@ -38,6 +38,7 @@ export _>_ = @op_greater_than
 export _>=_ = @op_greater_than_or_equal
 export _&&_ = @op_and
 export _||_ = @op_or
+export _?_ = x => d => from_maybe d x
 export _&_ = x => f => f x
 export _$_ = f => x => f x
 export _<$>_ = fmap

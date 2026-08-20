@@ -3,7 +3,7 @@ export const BINARY_OPERATORS = [
     '>>>', '<<<', '<$>', '<$', '<*', '*>', '<*>', '<|>', '>>=', '>>',
     '*', '/', '+', '-', '<>',
     '==', '!=', '<', '<=', '>', '>=',
-    '&&', '||', '&', '$',
+    '&&', '||', '?', '&', '$',
 ] as const;
 
 export type BinaryOperator = (typeof BINARY_OPERATORS)[number];

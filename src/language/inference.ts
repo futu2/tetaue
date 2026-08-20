@@ -29,6 +29,7 @@ import type { Type as LangiumType } from './generated/ast.js';
 import {
     ConstraintError, TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
     builtinOf, fun, isTypeClassInstance, listOf, maybeOf, nullExtendedMaybeOf, prim, queryOf, rowOf, truthType,
+    type ScalarTypeClass,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
@@ -100,6 +101,20 @@ function primitiveName(name: string): PrimName | null {
 /** A literal is `float` iff its source text contains '.', so `100.0` is float. */
 function numberLiteralType(e: NumberLiteral): 'int' | 'float' {
     return e.$cstNode?.text.includes('.') ? 'float' : 'int';
+}
+
+/**
+ * A numeric literal is polymorphic, like Haskell's `fromIntegral`: an integer
+ * literal (`1`) is `Num t => t` (int | float | decimal), and a decimal-point
+ * literal (`1.5`) is `Frac t => t` (float | decimal). The literal adapts to
+ * whatever numeric type the surrounding expression forces, so `sum ($ 1 +
+ * r.total)` works whether `total` is int, float, or decimal — while `int` and
+ * `float` still never mix on values. Unconstrained literals default at
+ * generalization (`x = 1 : int`, `x = 1.5 : float`); annotate to pin them.
+ */
+function numericLiteralScheme(u: TypeUniverse, e: NumberLiteral): Type {
+    const cls: ScalarTypeClass = e.$cstNode?.text.includes('.') ? 'Frac' : 'Num';
+    return u.fresh('type', null, [cls]);
 }
 
 function isNumericPrim(t: Type): boolean {
@@ -560,7 +575,7 @@ export class Inferencer {
         if (isBinaryExpression(e) || isLambdaBinaryExpression(e)) return this.inferBinary(e as unknown as import('./generated/ast.js').BinaryExpression, env);
         if (isAccessExpression(e)) return this.inferAccess(e, env);
         if (isApplication(e)) return this.inferApplication(e, env);
-        if (isNumberLiteral(e)) return prim(numberLiteralType(e));
+        if (isNumberLiteral(e)) return numericLiteralScheme(this.u, e);
         if (isStringLiteral(e)) return prim('string');
         if (isBooleanLiteral(e)) return prim('bool');
         if (isNullLiteral(e)) return maybeOf(this.u.fresh()); // ∀a. maybe a
@@ -810,6 +825,30 @@ export class Inferencer {
         return this.applyInferredFunction(partial, rt, e.right, null);
     }
 
+    /**
+     * Reject arithmetic on nullable (`maybe`) operands. With polymorphic
+     * literals an integer literal now unifies as a variable with a `maybe`
+     * column, which would otherwise silently allow `r.id + 1` on a nullable
+     * LEFT-JOIN side and render `b.id + 1` (NULL arithmetic). Explicitly
+     * guard so nullable columns must be unwrapped (from_maybe / coalesce).
+     */
+    private rejectModeOperand(node: AstNode, op: string, lt: Type, rt: Type): boolean {
+        const kind = (t: Type): string => this.u.peel(t).kind;
+        const ka = kind(lt);
+        const kb = kind(rt);
+        if (ka === 'maybe' || kb === 'maybe') {
+            this.diag(node, `'${op}' requires non-null numeric operands — use from_maybe or coalesce to unwrap, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+            return true;
+        }
+        // Aggregate/group/window modes are not plain scalars and must not be
+        // silently absorbed by a numeric literal variable (`row_number + 1`).
+        if (ka === 'agg' || ka === 'group' || ka === 'window'
+            || kb === 'agg' || kb === 'group' || kb === 'window') {
+            this.diag(node, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+            return true;
+        }
+        return false;
+    }
     /** Static semantics shared by infix expressions and `_op_ a b`. */
     private inferBinaryTypes(
         op: BinaryOperator,
@@ -820,6 +859,15 @@ export class Inferencer {
         rightNode: AstNode,
     ): Type {
         if (op === '==' || op === '!=' || op === '<' || op === '<=' || op === '>' || op === '>=') {
+            // Aggregates/window values cannot be compared as plain scalars; a
+            // polymorphic literal would otherwise absorb the mode (`row_number
+            // == 1`, `sum t == 1`). Nullable `maybe` is handled below (== null).
+            const cmpKind = (t: Type): string => this.u.peel(t).kind;
+            const cmpMode = ['agg', 'group', 'window'];
+            if (cmpMode.includes(cmpKind(lt)) || cmpMode.includes(cmpKind(rt))) {
+                this.diag(node, `cannot compare an aggregate or window value with ${this.u.pretty(lt)} and ${this.u.pretty(rt)} — project it through fold/over first`);
+                return prim('bool');
+            }
             const leftNull = this.isNullLiteralNode(leftNode);
             const rightNull = this.isNullLiteralNode(rightNode);
             try {
@@ -908,6 +956,7 @@ export class Inferencer {
         // Haskell-base numerics: + - * require the same numeric type; / is
         // fractional division and requires float; use div/mod for integrals.
         if (op === '/') {
+            if (this.rejectModeOperand(node, op, lt, rt)) return this.u.fresh();
             try {
                 this.u.unify(lt, prim('float'));
                 this.u.unify(rt, prim('float'));
@@ -922,6 +971,7 @@ export class Inferencer {
             return prim('float');
         }
         // + - *: constrained polymorphism, `Num t => t -> t -> t`.
+        if (this.rejectModeOperand(node, op, lt, rt)) return this.u.fresh();
         try {
             return this.u.unifyConstrained(lt, rt, 'Num');
         } catch (err) {
@@ -1008,7 +1058,9 @@ export class Inferencer {
             if (err instanceof ConstraintError) {
                 this.diag(node, err.constraint === 'Num'
                     ? `${err.constraint} requires a numeric type, got ${this.u.pretty(arg)}`
-                    : `${err.constraint} requires a supported instance, got ${this.u.pretty(arg)}`);
+                    : err.constraint === 'Frac'
+                        ? `a float/decimal literal cannot fit the type required here — write a literal of the matching type (e.g. 18 for an int)`
+                        : `${err.constraint} requires a supported instance, got ${this.u.pretty(arg)}`);
                 return this.u.fresh();
             }
             if (err instanceof UnifyError) {
@@ -1149,7 +1201,9 @@ export class Inferencer {
                 if (err instanceof ConstraintError) {
                     this.diag(argExpr, err.constraint === 'Num'
                         ? `${err.constraint} requires a numeric type, got ${this.u.pretty(argType)}`
-                        : `${err.constraint} requires a supported instance, got ${this.u.pretty(argType)}`);
+                        : err.constraint === 'Frac'
+                            ? `a float/decimal literal cannot fit the type required here — write a literal of the matching type (e.g. 18 for an int)`
+                            : `${err.constraint} requires a supported instance, got ${this.u.pretty(argType)}`);
                     return this.u.fresh();
                 } else if (err instanceof UnifyError) {
                     if (!this.reportNumericMix(argExpr, err)) {
@@ -2263,8 +2317,13 @@ export class Inferencer {
     /** Post-unification checks the scheme types don't capture (numeric, date, order, literals). */
     private postCheckArg(name: string, index: number, argExpr: Expr, argType: Type, node: AstNode): void {
         const r = this.u.peel(argType);
+        // A numeric literal now types as a `Num`/`Frac` variable; it is still
+        // definitively not a date (and not a plain numeric elided by the
+        // prim-only check), so treat such literal variables as concrete values.
+        const isNumericLiteralVar = (rs: Type): boolean => rs.kind === 'var'
+            && (this.u.varInfo(rs.id).classes.has('Num') || this.u.varInfo(rs.id).classes.has('Frac'));
         if (DATE_VALUE_ARGUMENTS.has(name) && index === 0) {
-            if (r.kind === 'prim' && r.name !== 'date' && r.name !== 'timestamp') {
+            if ((r.kind === 'prim' && r.name !== 'date' && r.name !== 'timestamp') || isNumericLiteralVar(r)) {
                 this.diag(node, `${name} expects a date or timestamp expression, got type ${this.u.pretty(argType)}`);
             }
             return;
@@ -2276,7 +2335,7 @@ export class Inferencer {
             return;
         }
         if (name === 'date_diff' && index === 2) {
-            if (r.kind === 'prim' && r.name !== 'date' && r.name !== 'timestamp') {
+            if ((r.kind === 'prim' && r.name !== 'date' && r.name !== 'timestamp') || isNumericLiteralVar(r)) {
                 this.diag(node, `date_diff expects a date or timestamp expression, got type ${this.u.pretty(argType)}`);
             }
             return;

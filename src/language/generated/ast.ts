@@ -9,7 +9,7 @@ import * as langium from 'langium';
 export const TetaueTerminals = {
     WS: /\s+/,
     COMMENT: /#[^\r\n]*/,
-    OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/,
+    OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\?|\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/,
     CORE_ID: /@[a-zA-Z][\w_]*/,
     ARG_ID: /(?=([_a-zA-Z][\w_]*))\1(?![ \t\r\n]*[:=])/,
     ID: /[_a-zA-Z][\w_]*/,
@@ -54,6 +54,7 @@ export type TetaueKeywordNames =
     | ">>"
     | ">>="
     | ">>>"
+    | "?"
     | "["
     | "]"
     | "_"
@@ -131,7 +132,7 @@ export interface BinaryExpression extends langium.AstNode {
     readonly $container: AccessExpression | Application | Ascription | BinaryExpression | Binding | CaseBranch | CaseExpression | LambdaBinaryExpression | LetExpression | ListLiteral | MapEntry | MapLiteral | UnaryMinus;
     readonly $type: 'BinaryExpression';
     left: UnaryExpression;
-    operator: '!=' | '$' | '&&' | '&' | '*' | '*>' | '+' | '-' | '/' | '<$' | '<$>' | '<' | '<*' | '<*>' | '<<<' | '<=' | '<>' | '<|>' | '==' | '>' | '>=' | '>>' | '>>=' | '>>>' | '||';
+    operator: '!=' | '$' | '&&' | '&' | '*' | '*>' | '+' | '-' | '/' | '<$' | '<$>' | '<' | '<*' | '<*>' | '<<<' | '<=' | '<>' | '<|>' | '==' | '>' | '>=' | '>>' | '>>=' | '>>>' | '?' | '||';
     right: UnaryExpression;
 }
 
@@ -342,7 +343,7 @@ export interface LambdaBinaryExpression extends langium.AstNode {
     readonly $container: Lambda | LambdaLetExpression;
     readonly $type: 'LambdaBinaryExpression';
     left: UnaryExpression;
-    operator: '!=' | '&&' | '*' | '*>' | '+' | '-' | '/' | '<$' | '<$>' | '<' | '<*' | '<*>' | '<<<' | '<=' | '<>' | '<|>' | '==' | '>' | '>=' | '>>' | '>>=' | '>>>' | '||';
+    operator: '!=' | '&&' | '*' | '*>' | '+' | '-' | '/' | '<$' | '<$>' | '<' | '<*' | '<*>' | '<<<' | '<=' | '<>' | '<|>' | '==' | '>' | '>=' | '>>' | '>>=' | '>>>' | '?' | '||';
     right: UnaryExpression;
 }
 

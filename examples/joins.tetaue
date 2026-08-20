@@ -65,3 +65,6 @@ pairs = users
         younger = r.sname,
     })
     & take 5
+
+# pairs is this module's query.
+main = pairs

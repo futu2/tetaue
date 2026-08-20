@@ -18,12 +18,13 @@
  ******************************************************************************/
 
 export type PrimName = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' | 'timestamp';
-export type ScalarTypeClass = 'Num' | 'Eq' | 'Ord' | 'Semigroup' | 'Monoid';
+export type ScalarTypeClass = 'Num' | 'Frac' | 'Eq' | 'Ord' | 'Semigroup' | 'Monoid';
 export type ContainerTypeClass = 'Functor' | 'Applicative' | 'Alternative' | 'Monad';
 export type TypeClass = ScalarTypeClass | ContainerTypeClass;
 
 const TYPE_CLASS_INSTANCES: Readonly<Record<ScalarTypeClass, ReadonlySet<PrimName>>> = {
     Num: new Set(['int', 'float', 'decimal']),
+    Frac: new Set(['float', 'decimal']),
     Eq: new Set(['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']),
     Ord: new Set(['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']),
     Semigroup: new Set(['string']),
@@ -354,7 +355,7 @@ export class TypeUniverse {
     bind(varId: number, t: Type): void {
         if (this.bindings.has(varId)) throw new Error(`type variable ${varId} already bound`);
         const info = this.infos.get(varId)!;
-        if (info.rigid) {
+        if (info.rigid && !this.canSpecializeRigidNumeric(info, t)) {
             throw new UnifyError({ kind: 'var', id: varId }, t);
         }
         const r = this.resolve(t);
@@ -405,6 +406,29 @@ export class TypeUniverse {
             this.infos = new Map(this.infos).set(varId, { ...info, kind: thisKind });
         }
         this.bindings = new Map(this.bindings).set(varId, t);
+    }
+
+    /**
+     * A rigid (skolemized) variable may be pinned to a concrete type when it
+     * is a numeric *literal* (carries a `Num`/`Frac` class) and every one of
+     * its classes is satisfied by the target. This lets an annotation
+     * specialize a polymorphic numeric literal — `adult: { age: int | r } ->
+     * bool = u => u.age >= 18` — where inference proposes `age : Num t, Ord t`.
+     * All other rigid bindings remain forbidden.
+     */
+    private canSpecializeRigidNumeric(info: VarInfo, t: Type): boolean {
+        const r = this.resolve(t);
+        if (r.kind !== 'prim') return false;
+        let numeric = false;
+        for (const c of info.classes) {
+            // Container classes cannot be satisfied by a concrete scalar.
+            if (c === 'Functor' || c === 'Applicative' || c === 'Alternative' || c === 'Monad') {
+                return false;
+            }
+            if (c === 'Num' || c === 'Frac') numeric = true;
+            if (!isTypeClassInstance(c as ScalarTypeClass, r.name)) return false;
+        }
+        return numeric;
     }
 
     /**
@@ -719,18 +743,35 @@ export class TypeUniverse {
             const info = this.infos.get(v);
             return info !== undefined && !info.hole;
         });
-        return {
-            vars: free.map(id => {
-                const info = this.infos.get(id)!;
-                return {
-                    id,
-                    kind: info.kind === 'row' ? 'row' : 'type',
-                    name: info.name,
-                    classes: [...info.classes],
-                };
-            }),
-            type: t,
-        };
+        const whole = this.resolve(t);
+        const vars: Scheme['vars'] = [];
+        for (const id of free) {
+            const info = this.infos.get(id)!;
+            // Haskell-style defaulting for ambiguous numeric *literals*: when
+            // the whole type IS a single numeric literal variable (e.g.
+            // `x = 1`, `x = 1.5`, `x = 1 + 2.5`) it is pinned to its default
+            // (`int` for Num, `float` for Frac) rather than left polymorphic,
+            // so a constant reads as a concrete number. Variables that occur
+            // inside a row/function/list (`add = x => y => x + y`,
+            // `xs = [1]`) are unaffected and stay quantified.
+            if (whole.kind === 'var' && whole.id === id) {
+                if (info.classes.has('Frac')) {
+                    this.bindings.set(id, prim('float'));
+                    continue;
+                }
+                if (info.classes.has('Num')) {
+                    this.bindings.set(id, prim('int'));
+                    continue;
+                }
+            }
+            vars.push({
+                id,
+                kind: info.kind === 'row' ? 'row' : 'type',
+                name: info.name,
+                classes: [...info.classes],
+            });
+        }
+        return { vars, type: t };
     }
 
     /** Instantiate a scheme: fresh flexible variables for quantified ones. */

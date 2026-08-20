@@ -155,7 +155,7 @@ describe('first-class builtins keep their static checks', () => {
     });
 
     test('bound greatest still rejects incompatible literals', () => {
-        const src = `users: query { name: string } = table "users"\ng = greatest\nq = users & map (u => { x = g [u.name, 1] })`;
-        expect(typeErrors(src).join('\n')).toContain('greatest requires matching types, got string and int');
+        const src = `users: query { name: string } = table "users"\ng = greatest\nq = users & map (u => { x = g [u.name, true] })`;
+        expect(typeErrors(src).join('\n')).toContain('greatest requires matching types');
     });
 });

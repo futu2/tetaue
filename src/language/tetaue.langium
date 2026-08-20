@@ -138,6 +138,7 @@ infix BinaryExpression on UnaryExpression:
     > '&&'
     > '||'
     > '&'
+    > '?'
     > '>>=' | '>>'
     > right assoc '$';
 
@@ -160,6 +161,7 @@ infix LambdaBinaryExpression on UnaryExpression:
     > '==' | '!=' | '<' | '<=' | '>' | '>='
     > '&&'
     > '||'
+    > '?'
     > '>>=' | '>>';
 
 UnaryExpression:
@@ -247,7 +249,7 @@ hidden terminal COMMENT: /#[^\r\n]*/;
 // lexical bindings and first-class curried functions, so `_+_ 1 2` is exactly
 // `1 + 2`. This must precede ID: named sections such as `_div_` are otherwise
 // valid identifiers.
-terminal OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/;
+terminal OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\?|\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/;
 
 // Core SQL primitives are inaccessible through ordinary names. The standard
 // prelude aliases `filter = @filter`, etc. before user modules are checked.

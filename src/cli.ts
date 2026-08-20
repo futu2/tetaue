@@ -434,6 +434,9 @@ export function buildProject(root: string, options: BuildOptions, services: Teta
             dialect: options.dialect,
             format: options.format,
             requireQuery: false,
+            // A module writes SQL only when it declares a `main` query; a
+            // clean module without one is a library (reported, not written).
+            requireMain: true,
         });
         if (outcome.ok) {
             printWarnings(outcome.warnings ?? []);

@@ -46,6 +46,13 @@ export interface CheckProjectResult {
 export interface CheckProjectOptions {
     /** Require the root module's last binding to be a query (default true). */
     requireQuery?: boolean;
+    /**
+     * Strict `main` entry: the module's query is its `main` binding. When set,
+     * a module without `main` is a library (no SQL); `entryBinding` (--binding)
+     * overrides it to render a specific named binding. Default false keeps the
+     * last-binding fallback for tooling/tests.
+     */
+    requireMain?: boolean;
     /** Resolved import edges from `collectModuleTree` (pure tree). */
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
     /** Render this root-module binding instead of the last one. */
@@ -67,7 +74,7 @@ export function checkProject(
     modules: readonly ProjectModule[],
     options: CheckProjectOptions = {},
 ): CheckProjectResult {
-    const { requireQuery = true, importsByModule = new Map(), entryBinding, prelude } = options;
+    const { requireQuery = true, requireMain = false, importsByModule = new Map(), entryBinding, prelude } = options;
 
     const inferencer = new Inferencer();
     inferencer.prelude();
@@ -173,29 +180,56 @@ export function checkProject(
     inferencer.flushDeferred();
     interpreterDiagnostics.push(...inferencer.takeDiagnostics());
 
-    // Query requirement. Default: the last binding, as before. With
-    // `entryBinding`, render/check target any named root-module binding.
+    // The module's query is its `main` binding. With `entryBinding`
+    // (--binding) render/check target any named root-module binding instead.
+    // By default (`requireMain: false`) a module without `main` falls back to
+    // its last binding, which keeps the interpreter/tooling and tests working;
+    // `requireMain` makes a missing `main` a library (no SQL) with an error.
+    const mainBinding = root?.model.bindings.find(b => b.name === 'main');
     const selectedBinding = entryBinding
         ? root?.model.bindings.find(b => b.name === entryBinding)
-        : root?.model.bindings[root.model.bindings.length - 1];
+        : mainBinding ?? root?.model.bindings[root.model.bindings.length - 1];
+    let mainValue: Value | undefined;
+    if (root && !entryBinding && mainBinding && rootEnv) {
+        mainValue = rootEnv.get('main') ?? ERROR;
+    }
     if (entryBinding && rootEnv) {
         value = rootEnv.get(entryBinding) ?? ERROR;
+    } else if (mainValue !== undefined) {
+        value = mainValue;
     }
-    if (requireQuery && root) {
+    if (requireMain && !entryBinding && root) {
+        if (!mainBinding) {
+            value = ERROR;
+            if (requireQuery) {
+                interpreterDiagnostics.push({
+                    node: root.model,
+                    message: "a module's query is its `main` binding — this module has none (it is a library and does not compile to SQL; add a `main` binding or pass --binding to render a specific one)",
+                });
+            }
+        } else if (requireQuery && !(value.kind === 'error') && value.kind !== 'query') {
+            interpreterDiagnostics.push({
+                node: mainBinding,
+                message: `binding 'main' must be a query (a table or a pipeline), got ${describe(value)}`,
+            });
+        }
+    } else if (requireQuery && root) {
         if (!selectedBinding) {
             value = ERROR;
             interpreterDiagnostics.push({
                 node: root.model,
                 message: entryBinding
                     ? `module has no binding named '${entryBinding}'`
-                    : `a module must have at least one binding — its last binding is the module's query`,
+                    : `a module must have at least one binding — ${mainBinding ? 'its `main` binding is the query' : "its last binding is the module's query"}`,
             });
         } else if (!(value.kind === 'error') && value.kind !== 'query') {
             interpreterDiagnostics.push({
                 node: selectedBinding,
                 message: entryBinding
                     ? `binding '${entryBinding}' must be a query (a table or a pipeline), got ${describe(value)}`
-                    : `a module's last binding must be a query (a table or a pipeline), got ${describe(value)}`,
+                    : mainBinding
+                        ? `binding 'main' must be a query (a table or a pipeline), got ${describe(value)}`
+                        : `a module's last binding must be a query (a table or a pipeline), got ${describe(value)}`,
             });
         }
     }

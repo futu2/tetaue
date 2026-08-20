@@ -21,3 +21,6 @@ adults = active_users
     & filter (p.adult)          # p.adult is a row-polymorphic predicate
     & map (u => { id = u.id, name = u.name })
     & take 10
+
+# adults is this module's query.
+main = adults

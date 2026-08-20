@@ -34,3 +34,6 @@ active = (users
         email_upper: string,
         email_len: int,
     }
+
+# active is this module's query.
+main = active

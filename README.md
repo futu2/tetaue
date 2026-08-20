@@ -84,7 +84,7 @@ tetaue lsp [--stdio | --node-ipc | --socket=<port> | --pipe=<name>]
 - `build` checks every `.tetaue` file under `dir` (default `.`; `node_modules`,
   `.git`, `out`, `dist` are skipped) and writes the rendered SQL of every module
   whose query compiles, mirroring the tree under `--out` (default `dist/sql`).
-  Library modules — clean modules whose last binding is not a query — are
+  Library modules — clean modules with no `main` query — are
   checked but not written, and a module with diagnostics fails the build
   (exit 1). `--pre-hook`/`--post-hook` run shell commands around the build.
 - `watch` re-renders a file — or every `.tetaue` file under a directory — on
@@ -191,8 +191,10 @@ extend a row without repeating every column.
 
 ## Modules
 
-A module is a list of bindings; **the last binding is the module's query**. Bindings
-need **no terminator** — `users: query { id: int } = table "users"` is a
+A module is a list of bindings; **the module's query is its `main` binding**. A
+module without a `main` binding is a *library* — it is type-checked but does
+not compile to SQL (`build` writes nothing for it). Bindings need **no
+terminator** — `users: query { id: int } = table "users"` is a
 binding with a type annotation, and the next binding starts right after it.
 `table` is an ordinary function — `table : string -> query r` — and the query
 type annotation IS the table's schema.
@@ -213,12 +215,22 @@ resolves the scoped `_+_` function defined by the prelude. See
 [`docs/design/core.md`](docs/design/core.md) for the boundary and extension
 rules.
 
+Numeric literals are polymorphic, Haskell-`fromIntegral`-style: `1 : Num t => t`
+(int | float | decimal) and `1.5 : Frac t => t` (float | decimal), so a plain
+`1` adapts to its context — `o.total + 1` works when `total: decimal`, and
+`u.balance / 2` works when `balance: float`. An unconstrained literal defaults
+to a concrete type (`x = 1 : int`, `x = 1.5 : float`). Nullable and
+aggregate/window values must still be unwrapped before arithmetic.
+
+The `?` operator is relude-style unwrap-with-default: `u.email ? "n/a"` is
+`from_maybe "n/a" u.email` and lowers to `COALESCE(email, 'n/a')`.
+
 ```
 users: query { id: int, name: string, active: bool } = table "users"
-adults = users & filter (u => u.active) & take 5
+main = users & filter (u => u.active) & take 5
 ```
 
-(That module's query is `adults`.) Application arguments may be literals,
+(That module's query is `main`.) Application arguments may be literals,
 maps, lists, lambdas, parenthesized expressions, `u.field` access chains, or
 **bare identifiers** — `filter adult`, `joinInner orders (l => r => ...)`. Bindings
 still need no terminator because an identifier lexes as an *argument* only when

@@ -128,3 +128,27 @@ q = table "t"`;
             .toContain("unknown operator section '_missing_'");
     });
 });
+
+describe('`?` unwrap-with-default operator', () => {
+    test('lowers to COALESCE and types as the default type', () => {
+        const src = `users: query { id: int, email: (maybe string), nick: (maybe string) } = table "users"
+main = users & map (u => { email = u.email ? "n/a", id = u.id })`;
+        expect(typeErrors(src)).toEqual([]);
+        const sql = render(src, 'postgresql', 'compact');
+        expect(sql).toContain("COALESCE(email, 'n/a') AS email");
+    });
+
+    test('is a first-class curried operator section', () => {
+        // `_?_` is ordinary prelude curried function; `x ? d` = `from_maybe d x`.
+        const src = `users: query { id: int, nick: (maybe string) } = table "users"
+unwrapped = users & map (u => { nick = _?_ u.nick "anon" })`;
+        expect(typeErrors(src)).toEqual([]);
+    });
+
+    test('rejects a non-maybe left operand', () => {
+        // `?` requires the left side to be nullable.
+        const src = `users: query { id: int } = table "users"
+main = users & map (u => { id = u.id ? 0 })`;
+        expect(typeErrors(src)).not.toEqual([]);
+    });
+});

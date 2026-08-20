@@ -16,3 +16,6 @@ adults = users
     & filter (p.adult)          # p.adult is row-polymorphic through the namespace
     & map (u => { id = u.id, name = u.name })
     & take 10
+
+# adults is this module's query.
+main = adults

@@ -57,3 +57,6 @@ table "ecs.dcm_ecs_p_ecis_m_tb1010_sf_f"
 corpBirthday = custRelation
   & joinLeft customerBirthday (u => v => u.p_cino == v.customer_number) merge # ($1 <> $2)
   & filter (is_in (from_maybe "" $1.c_cino) ["11114343"])
+
+# corpBirthday is this module's query.
+main = corpBirthday

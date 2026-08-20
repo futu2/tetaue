@@ -217,6 +217,16 @@ export function isNumeric(t: TypeOrNull): boolean {
     return t === 'int' || t === 'float' || t === 'decimal';
 }
 
+/**
+ * A numeric literal (`2`, `2.0`) is polymorphic — see inference. For `/`
+ * (fractional division) an integer literal adapts to float, so it is an
+ * acceptable operand even though its runtime SqlType is `int`; genuine int
+ * columns still require `div`.
+ */
+function isLiteralNum(node: SqlNode): boolean {
+    return node.kind === 'lit' && isNumeric(node.type);
+}
+
 export function comparable(a: TypeOrNull, b: TypeOrNull): boolean {
     // 'unknown' (columns of un-annotated tables) is comparable to anything:
     // the schema is inferred from use, so the interpreter stays silent and
@@ -833,7 +843,8 @@ function evalBinary(op: string, l: Value, r: Value, at: AstNode, ctx: Ctx): Valu
             ctx.diagnostics.push({ node: at, message: `'${op}' requires numeric operands, got ${typeName(ln.type)} and ${typeName(rn.type)}` });
             return ERROR;
         }
-        if (op === '/' && ((ln.type !== 'float' && ln.type !== 'unknown') || (rn.type !== 'float' && rn.type !== 'unknown'))) {
+        if (op === '/' && ((ln.type !== 'float' && ln.type !== 'unknown' && !isLiteralNum(ln))
+            || (rn.type !== 'float' && rn.type !== 'unknown' && !isLiteralNum(rn)))) {
             ctx.diagnostics.push({ node: at, message: `'/' requires float operands — use div for integral division, got ${typeName(ln.type)} and ${typeName(rn.type)}` });
             return ERROR;
         }
