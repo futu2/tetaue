@@ -54,6 +54,18 @@ describe('pipeline steps', () => {
         expect(sql).toContain('LIMIT 5');
     });
 
+    test('a bound (partially-applied) outer-join step is reusable and renders', () => {
+        const sql = render(`
+            ${USERS}
+            orders: query { id: int, user_id: int, total: float } = table "orders"
+            J = joinLeft orders
+            q = users & J (u => o => u.id == o.user_id) (u => o => { uid = u.id, total = o.total })
+        `);
+        expect(sql).toContain('LEFT JOIN orders ON users.id = orders.user_id');
+        expect(sql).toContain('users.id AS uid');
+        expect(sql).toContain('orders.total');
+    });
+
     test('bare lambda argument without parens', () => {
         const sql = render(`${USERS}\nq = users & filter u => u.age >= 21`);
         expect(sql).toContain('WHERE age >= 21');

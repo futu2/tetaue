@@ -681,12 +681,17 @@ export class Inferencer {
     }
 
     /**
-     * Infer the common inline two-argument join merger against its actual
-     * input types. This lets field access through a null-extended `(maybe r)`
-     * row retain Maybe in the projected result instead of first inferring an
-     * ordinary row lambda and trying to retrofit nullability afterwards.
+     * Infer a curried two-argument function against known left/right parameter
+     * types (join merger, `on`, and any higher-order step argument reached
+     * through a bound/partially-applied value). Checking the argument against
+     * the expected parameters — instead of inferring it as a fresh row and
+     * unifying afterwards — lets field access through a null-extended
+     * `(maybe r)` row retain Maybe in the projected result. This is what keeps
+     * first-class outer-join steps (e.g. `step = joinLeft orders`) well-typed:
+     * their type is a plain function value, so the generic application path
+     * checks it here rather than losing the `maybe` the scheme bakes in.
      */
-    private inferJoinMergerArg(e: Expr, env: Map<string, Scheme>, left: Type, right: Type): Type {
+    private inferCheckedTwoArg(e: Expr, env: Map<string, Scheme>, left: Type, right: Type): Type {
         const outer = this.unwrapApplicationExpr(e);
         if (outer && isLambda(outer)) {
             const inner = this.unwrapApplicationExpr(outer.body as unknown as AstNode);
@@ -730,6 +735,34 @@ export class Inferencer {
         }
 
         return this.inferArg(e, env);
+    }
+
+    /**
+     * Fallback for the generic application loop: when blindly unifying a
+     * higher-order argument fails (transactional `unify` has already rolled
+     * back), if the expected parameter is a curried function `f => g => rest`,
+     * re-check the argument against the two expected parameter types. This is
+     * what lets bound/partially-applied outer-join steps (`step = joinLeft r`,
+     * `step = joinRight r`) type-check: the null-extended side of the scheme is
+     * `maybe row`, which a freshly-inferred lambda's open-row parameters cannot
+     * unify with. Returns null when there is nothing useful to check (the
+     * argument is not a function argument we can re-check).
+     */
+    private tryFetchCheckedArgType(param: Type, e: Expr, env: Map<string, Scheme>): Type | null {
+        const p = this.u.peel(param);
+        if (p.kind !== 'fun') return null;
+        const pr = this.u.peel(p.to);
+        if (pr.kind !== 'fun') return null;
+        const checked = this.inferCheckedTwoArg(e, env, p.from, pr.from);
+        // A `merge` merger keeps the union-row semantics: compute the merged
+        // row directly (right side wins on overlap, and outer-join nullability
+        // flows through), so a bound outer-join step used with `merge` still
+        // yields a precise output type instead of an unconstrained row.
+        if (checked.kind === 'builtin' && checked.name === 'merge') {
+            const row = this.inferMerge(p.from, pr.from, e);
+            return fun(p.from, fun(pr.from, row));
+        }
+        return checked;
     }
 
     /**
@@ -1181,7 +1214,7 @@ export class Inferencer {
         const argTypes: Type[] = [];
         for (let i = 0; i < e.arguments.length; i++) {
             const argExpr = e.arguments[i]!;
-            const argType = this.inferArg(argExpr, env);
+            let argType = this.inferArg(argExpr, env);
             argTypes.push(argType);
             const param = this.u.fresh();
             const result = this.u.fresh();
@@ -1195,6 +1228,28 @@ export class Inferencer {
                 }
                 throw err;
             }
+            // A `merge` merger passed to a curried higher-order step (reached
+            // through a bound/partially-applied value) under-specifies the
+            // result row under blind inference (the union row stays open).
+            // Compute the merged row directly — the same special case the
+            // direct join path applies — so the output type stays precise.
+            if (argType.kind === 'builtin' && argType.name === 'merge') {
+                const mp = this.u.peel(param);
+                if (mp.kind === 'fun') {
+                    const mpr = this.u.peel(mp.to);
+                    if (mpr.kind === 'fun') {
+                        const mrow = this.inferMerge(mp.from, mpr.from, argExpr);
+                        const checkedArg = fun(mp.from, fun(mpr.from, mrow));
+                        try {
+                            this.u.unify(param, checkedArg);
+                            argType = checkedArg;
+                            argTypes[i] = checkedArg;
+                        } catch {
+                            // leave argType as the blind result; the unify below reports.
+                        }
+                    }
+                }
+            }
             try {
                 this.u.unify(param, argType);
             } catch (err) {
@@ -1206,10 +1261,30 @@ export class Inferencer {
                             : `${err.constraint} requires a supported instance, got ${this.u.pretty(argType)}`);
                     return this.u.fresh();
                 } else if (err instanceof UnifyError) {
-                    if (!this.reportNumericMix(argExpr, err)) {
-                        this.argError(funcName, i, argExpr, argType, param, f);
+                    // Blindly unifying failed (the transactional unify already
+                    // rolled back). If the expected parameter is a curried
+                    // function, re-check the argument against its two expected
+                    // parameter types — this lets first-class outer-join steps
+                    // (bound/partially-applied `joinLeft`/`joinRight`/`joinFull`)
+                    // match the `maybe`-wrapped side of the scheme.
+                    const checked = this.tryFetchCheckedArgType(param, argExpr, env);
+                    let recovered = false;
+                    if (checked !== null) {
+                        try {
+                            this.u.unify(param, checked);
+                            argType = checked;
+                            argTypes[i] = checked;
+                            recovered = true;
+                        } catch {
+                            // Even checked re-inference fails — keep the original error.
+                        }
                     }
-                    failed = true;
+                    if (!recovered) {
+                        if (!this.reportNumericMix(argExpr, err)) {
+                            this.argError(funcName, i, argExpr, argType, param, f);
+                        }
+                        failed = true;
+                    }
                 } else {
                     throw err;
                 }
@@ -1631,7 +1706,7 @@ export class Inferencer {
         }
         const mergerLeft = kindName === 'right' || kindName === 'full' ? maybeOf(r) : r;
         const mergerRight = kindName === 'left' || kindName === 'full' ? maybeOf(s) : s;
-        const mergerT = this.inferJoinMergerArg(e.arguments[2]!, env, mergerLeft, mergerRight);
+        const mergerT = this.inferCheckedTwoArg(e.arguments[2]!, env, mergerLeft, mergerRight);
         const expectedMerger = fun(mergerLeft, fun(mergerRight, t));
         // A plain `merge` is the advertised full-row-union shorthand. The
         // generic merge scheme returns an unconstrained fresh row, which would

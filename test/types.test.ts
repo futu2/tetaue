@@ -824,6 +824,46 @@ q = a & ${name} b (l => r => l.id == r.id) (l => r => { x = l.x, y = r.y })`;
         }
     });
 
+    test('bound (partially-applied) outer-join steps type-check and are reusable', () => {
+        // A join with its right side fixed is a first-class VALUE: `J = joinLeft orders`.
+        // Its type is a plain function, so the generic application path must keep the
+        // outer-join nullability of the scheme alive when the step is reused.
+        const step = (name: string) => `a: query { id: int, x: string } = table "a"
+b: query { id: int, y: string } = table "b"
+J = ${name} b
+q1 = a & J (l => r => l.id == r.id) (l => r => { lid = l.id, rid = r.id })
+q2 = a & J (l => r => l.id == r.id) (l => r => { lid2 = l.id, rid2 = r.id })`;
+        const expected = new Map<string, [string, string]>([
+            ['joinInner', ['query { lid: int, rid: int }', 'query { lid2: int, rid2: int }']],
+            ['joinLeft', ['query { lid: int, rid: (maybe int) }', 'query { lid2: int, rid2: (maybe int) }']],
+            ['joinRight', ['query { lid: (maybe int), rid: int }', 'query { lid2: (maybe int), rid2: int }']],
+            ['joinFull', ['query { lid: (maybe int), rid: (maybe int) }', 'query { lid2: (maybe int), rid2: (maybe int) }']],
+        ]);
+        for (const [name, [q1, q2]] of expected) {
+            const src = step(name);
+            expect(typeErrors(src)).toEqual([]);
+            expect(typeOf(src, 'q1')).toBe(q1);
+            expect(typeOf(src, 'q2')).toBe(q2);
+        }
+    });
+
+    test('a bound outer-join step used with `merge` keeps a precise union type', () => {
+        const src = `a: query { id: int, x: string } = table "a"
+b: query { id: int, y: string } = table "b"
+J = joinLeft b
+q = a & J (l => r => l.id == r.id) merge`;
+        expect(typeErrors(src)).toEqual([]);
+        expect(typeOf(src, 'q')).toBe('query { id: (maybe int), x: string, y: (maybe string) }');
+    });
+
+    test('a reused outer-join step still rejects null-side misuse', () => {
+        const src = `a: query { id: int } = table "a"
+b: query { id: int } = table "b"
+J = joinLeft b
+q = a & J (l => r => l.id == r.id) (l => r => { id = r.id + 1 })`;
+        expect(typeErrors(src).join('\n')).toContain('non-null numeric operands');
+    });
+
     test('fold allows grouping without aggregates', () => {
         const src = `users: query { id: int, name: string } = table "users"
 q = users & fold (u => { id = group u.id, name = group u.name })`;
