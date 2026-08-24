@@ -331,7 +331,10 @@ describe('tetaue language server (LSP over stdio)', () => {
             }));
 
             // Hover over `age` in `u.age` (line 2, char 28 is inside `age`):
-            // show the field's type.
+            // show the field's type. With polymorphic numeric literals the
+            // comparison against `18` leaves `u.age` a class-constrained
+            // variable at the definition site (it pins to `int` where the
+            // binding is applied to `users`).
             const hover = await request(server, 2, 'textDocument/hover', {
                 textDocument: { uri },
                 position: { line: 2, character: 28 },
@@ -339,7 +342,7 @@ describe('tetaue language server (LSP over stdio)', () => {
             const hoverContents = (hover.result as { contents: { value: string } }).contents;
             expect(hover.error).toBeUndefined();
             expect(hoverContents.value).toContain('u.age');
-            expect(hoverContents.value).toContain('int');
+            expect(hoverContents.value).toContain('Num t, Ord t => t');
 
             // Hover over the `u` lambda parameter (line 2, char 8): the lambda
             // type's input row must be flat — open rows render as one `{ ... }`
@@ -350,7 +353,7 @@ describe('tetaue language server (LSP over stdio)', () => {
             });
             const hoverRowContents = (hoverRow.result as { contents: { value: string } }).contents;
             expect(hoverRow.error).toBeUndefined();
-            expect(hoverRowContents.value).toContain('{ active: bool, age: int | r } -> bool');
+            expect(hoverRowContents.value).toContain('Num t, Ord t => { active: bool, age: t | r } -> bool');
             expect(hoverRowContents.value).not.toContain('| {');
 
             // Hover over the `adult` reference in `filter (adult)` (line 3):
