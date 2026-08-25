@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { posix } from 'node:path';
 import { collectModuleTree } from '../src/language/imports.ts';
 import { analyzeProject } from '../src/language/interpreter.ts';
 import { inferProject } from '../src/language/inference.ts';
@@ -12,7 +13,13 @@ function analyzeFiles(files: Record<string, string>, main: string) {
         if (importer === undefined) return { uri: spec, searched: [] };
         const slash = importer.lastIndexOf('/');
         const base = slash >= 0 ? importer.slice(0, slash + 1) : '';
-        return { uri: base + spec, searched: [base] };
+        // Mirror the real resolver's candidate search (bare, .tetaue, index).
+        const bare = posix.normalize(base + spec);
+        const uri = files[bare] ? bare
+            : files[bare + '.tetaue'] ? bare + '.tetaue'
+            : files[bare + '/index.tetaue'] ? bare + '/index.tetaue'
+            : bare;
+        return { uri, searched: [base] };
     };
     const tree = collectModuleTree({ model: parseModel(files[main]!), uri: main, imports: [] }, {
         resolve,
@@ -21,6 +28,7 @@ function analyzeFiles(files: Record<string, string>, main: string) {
     });
     const result = analyzeProject(tree.modules, {
         requireQuery: true,
+        reexportsByModule: tree.exportsByModule,
         prelude: standardPrelude(services),
     });
     return { tree, result };
@@ -148,8 +156,11 @@ describe('multi-file modules', () => {
         expect(result.value.kind).toBe('query');
     });
 
-    test('imports must come before bindings (parse error otherwise)', () => {
-        expect(() => parseModel(`q = 1\nimport "x.tetaue"`)).toThrow();
+    test('imports, re-exports, types and bindings may interleave in one module', () => {
+        // The Model is a single flat loop: an `import` after a binding parses
+        // (the interpreter separates them regardless of source order).
+        expect(() => parseModel(`q = 1\nimport "x.tetaue"`)).not.toThrow();
+        expect(() => parseModel(`export * from "lib.tetaue"\nb = 1\nexport { b } from "other.tetaue"`)).not.toThrow();
     });
 });
 
@@ -415,6 +426,114 @@ describe('selective imports', () => {
     });
 });
 
+describe('re-exports (export ... from)', () => {
+    test('export * from aggregates a target module', () => {
+        const sql = renderFiles({
+            'tables/users.tetaue': `export users: query { id: int, name: string } = table "users"`,
+            'tables/orders.tetaue': `export orders: query { id: int, user_id: int } = table "orders"`,
+            'tables/index.tetaue': `
+                export * from "./users"
+                export * from "./orders"
+            `,
+            'main.tetaue': `
+                import "tables/index.tetaue"
+                q = users & joinInner orders (l => r => l.id == r.user_id) (l => r => {
+                    id = l.id,
+                    name = l.name,
+                })
+            `,
+        }, 'main.tetaue');
+        expect(sql).toContain('FROM users');
+        expect(sql).toContain('JOIN');
+    });
+
+    test('export * from chains through a second index module', () => {
+        const sql = renderFiles({
+            'a.tetaue': `export users: query { id: int } = table "users"`,
+            'mid.tetaue': `export * from "./a"`,
+            'index.tetaue': `export * from "./mid"`,
+            'main.tetaue': `import "index.tetaue"\nq = users & take 1`,
+        }, 'main.tetaue');
+        expect(sql).toContain('FROM users');
+    });
+
+    test('export { a as b } from renames while re-exporting', () => {
+        const sql = renderFiles({
+            'a.tetaue': `export users: query { id: int } = table "users"`,
+            'index.tetaue': `export { users as people } from "./a"`,
+            'main.tetaue': `import "index.tetaue"\nq = people & take 1`,
+        }, 'main.tetaue');
+        expect(sql).toContain('FROM users');
+    });
+
+    test('a named re-export of a non-exported name is an error', () => {
+        const { result } = analyzeFiles({
+            'a.tetaue': `export users: query { id: int } = table "users"\nprivate_helper = 1`,
+            'index.tetaue': `export { private_helper } from "./a"`,
+            'main.tetaue': `import "index.tetaue"\nq = users & take 1`,
+        }, 'main.tetaue');
+        const messages = result.diagnostics.map(d => d.message);
+        expect(messages.join('\n')).toContain("'private_helper' is not exported by");
+    });
+
+    test('a re-export name conflicting with a local export is an error', () => {
+        const { result } = analyzeFiles({
+            'a.tetaue': `export users: query { id: int } = table "a_users"`,
+            'index.tetaue': `
+                export users: query { id: int } = table "index_users"
+                export * from "./a"
+            `,
+            'main.tetaue': `import "index.tetaue"\nq = users & take 1`,
+        }, 'main.tetaue');
+        const messages = result.diagnostics.map(d => d.message);
+        expect(messages.join('\n')).toContain("re-exported name 'users' (from './a') conflicts with an already exported name");
+    });
+
+    test('re-exports do not bind local names', () => {
+        // `export * from` must NOT put `users` in scope here — only the
+        // module's public surface. Referencing it locally is an error.
+        const { result } = analyzeFiles({
+            'a.tetaue': `export users: query { id: int } = table "users"`,
+            'index.tetaue': `export * from "./a"`,
+            'main.tetaue': `import "index.tetaue"\nq = 1`,
+        }, 'index.tetaue');
+        // `index.tetaue` itself does not bind `users` — the diagnostic
+        // "unknown identifier" appears if we tried to use it there.
+        expect(result.diagnostics.some(d => d.message.includes("unknown identifier 'users'"))).toBe(false);
+    });
+
+    test('re-exports through the interpreter and the inferencer agree', () => {
+        const files: Record<string, string> = {
+            'a.tetaue': `export users: query { id: int, name: string } = table "users"`,
+            'index.tetaue': `export * from "./a"`,
+            'main.tetaue': `import "index.tetaue"\nq = users & take 1`,
+        };
+        const tree = collectModuleTree({ model: parseModel(files['main.tetaue']!), uri: 'main.tetaue', imports: [] }, {
+            resolve: (importer, spec) => {
+                if (importer === undefined) return { uri: spec, searched: [] };
+                const slash = importer.lastIndexOf('/');
+                const base = slash >= 0 ? importer.slice(0, slash + 1) : '';
+                const bare = posix.normalize(base + spec);
+                const uri = files[bare] ? bare
+                    : files[bare + '.tetaue'] ? bare + '.tetaue'
+                    : files[bare + '/index.tetaue'] ? bare + '/index.tetaue'
+                    : bare;
+                return { uri, searched: [base] };
+            },
+            read: uri => files[uri],
+            parse: (text) => parseModel(text),
+        });
+        const interp = analyzeProject(tree.modules, {
+            requireQuery: true,
+            reexportsByModule: tree.exportsByModule,
+            prelude: standardPrelude(services),
+        });
+        expect(interp.diagnostics).toEqual([]);
+        const inferred = inferProject(tree.modules, tree.importsByModule, standardPrelude(services), tree.exportsByModule);
+        expect(inferred.diagnostics).toEqual([]);
+    });
+});
+
 describe('imports through the Langium validation pipeline', () => {
     test('validator folds imported-module errors onto the import statement', async () => {
         const { mkdtempSync, writeFileSync, rmSync, readFileSync } = require('node:fs') as typeof import('node:fs');
@@ -457,7 +576,7 @@ describe('imports through the Langium validation pipeline', () => {
         }
     });
 
-    test('validator resolves imports through a tetaue.toml dependency', async () => {
+    test('validator resolves imports through a relative path (index module)', async () => {
         const { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } = require('node:fs') as typeof import('node:fs');
         const { tmpdir } = require('node:os') as typeof import('node:os');
         const { join } = require('node:path') as typeof import('node:path');
@@ -465,9 +584,8 @@ describe('imports through the Langium validation pipeline', () => {
         const dir = mkdtempSync(join(tmpdir(), 'tetaue-'));
         try {
             mkdirSync(join(dir, 'vendor', 'acme'), { recursive: true });
-            writeFileSync(join(dir, 'tetaue.toml'), '[dependencies]\nacme = { path = "vendor/acme" }\n');
             writeFileSync(join(dir, 'vendor/acme/tables.tetaue'), 'export users: query { id: int } = table "users"\n');
-            writeFileSync(join(dir, 'main.tetaue'), 'import "acme/tables"\nq = users & take 1\n');
+            writeFileSync(join(dir, 'main.tetaue'), 'import "./vendor/acme/tables"\nq = users & take 1\n');
             const uri = URI.file(join(dir, 'main.tetaue'));
             const doc = await services.shared.workspace.LangiumDocumentFactory.fromString(
                 readFileSync(join(dir, 'main.tetaue'), 'utf8'), uri,
@@ -479,14 +597,13 @@ describe('imports through the Langium validation pipeline', () => {
         }
     });
 
-    test('validator folds an undeclared dependency onto the import statement', async () => {
+    test('validator folds an unresolved import onto the import statement', async () => {
         const { mkdtempSync, writeFileSync, rmSync, readFileSync } = require('node:fs') as typeof import('node:fs');
         const { tmpdir } = require('node:os') as typeof import('node:os');
         const { join } = require('node:path') as typeof import('node:path');
         const { URI } = await import('langium');
         const dir = mkdtempSync(join(tmpdir(), 'tetaue-'));
         try {
-            writeFileSync(join(dir, 'tetaue.toml'), '[dependencies]\nacme = { path = "vendor/acme" }\n');
             writeFileSync(join(dir, 'main.tetaue'), 'import "nope/tables"\nq = 1\n');
             const uri = URI.file(join(dir, 'main.tetaue'));
             const doc = await services.shared.workspace.LangiumDocumentFactory.fromString(
@@ -494,7 +611,7 @@ describe('imports through the Langium validation pipeline', () => {
             );
             await services.shared.workspace.DocumentBuilder.build([doc], { validation: true });
             const messages = (doc.diagnostics ?? []).map(d => d.message);
-            expect(messages.join('\n')).toContain("dependency 'nope' is not declared in tetaue.toml");
+            expect(messages.join('\n')).toContain("cannot resolve import 'nope/tables'");
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

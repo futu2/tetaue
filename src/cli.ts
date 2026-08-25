@@ -12,9 +12,8 @@
  *   tetaue lsp [--stdio | --node-ipc | --socket=<port> | --pipe=<name>]
  *
  * Modules may import other files (`import "path.tetaue"`); the whole import
- * tree is loaded, analyzed, and reported. `build` reads defaults from the
- * nearest tetaue.toml's `[build]` table (out, dialect, format, pre, post);
- * command-line flags override them.
+ * tree is loaded, analyzed, and reported. `build`/`watch` take all options
+ * from command-line flags — there is no config file.
  ******************************************************************************/
 import {
     existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch, writeFileSync,
@@ -32,8 +31,7 @@ import { checkProject } from './language/checker.js';
 import type { CompileDiagnostic, CompileOutcome } from './language/compile.js';
 import { collectModuleTree, moduleOf } from './language/imports.js';
 import type { ProjectModule } from './language/imports.js';
-import { findManifestDir, MANIFEST_NAME, parseManifest, resolveImport } from './language/resolve.js';
-import type { BuildConfig } from './language/resolve.js';
+import { resolveImport } from './language/resolve.js';
 import { formatTetaue } from './language/lsp/formatter.js';
 import type { Model } from './language/generated/ast.js';
 import { standardPrelude } from './language/prelude.js';
@@ -59,11 +57,10 @@ Usage:
       Check every .tetaue file under dir (default: .) and write rendered SQL
       for each module whose query compiles, mirroring the tree under <out>
       (default: dist/sql). Library modules (no query) are checked, not
-      written. --pre-hook/--post-hook run shell commands around the build;
-      defaults come from tetaue.toml's [build] table unless overridden.
+      written. --pre-hook/--post-hook run shell commands around the build.
   tetaue watch <file.tetaue|dir> [--dialect <name>] [--format pretty|compact]
       Watch a file (or every .tetaue file under a directory) and re-render on
-      change. Editing tetaue.toml re-checks everything. Ctrl+C quits.
+      change. Ctrl+C quits.
   tetaue lsp [--stdio | --node-ipc | --socket=<port> | --pipe=<name>]
       Start the language server (default transport: stdio).
   tetaue --help
@@ -84,12 +81,6 @@ function msg(err: unknown): string {
 function printCompileDiagnostics(diagnostics: CompileDiagnostic[]): void {
     for (const d of diagnostics) {
         console.error(`${d.uri}:${d.line + 1}:${d.character + 1}: error: ${d.message}`);
-    }
-}
-
-function printWarnings(warnings: CompileDiagnostic[]): void {
-    for (const w of warnings) {
-        console.error(`${w.uri}:${w.line + 1}:${w.character + 1}: warning: ${w.message}`);
     }
 }
 
@@ -150,7 +141,6 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
         printCompileDiagnostics(outcome.diagnostics);
         return 1;
     }
-    printWarnings(outcome.warnings ?? []);
     if (command === 'render') {
         console.log(json
             ? JSON.stringify({ sql: outcome.sql, parameters: outcome.parameters }, null, 2)
@@ -167,7 +157,7 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
 // parse
 // ---------------------------------------------------------------------------
 
-function loadProject(file: string, services: TetaueServices): { modules: readonly ProjectModule[]; main: ProjectModule; importsByModule: ReadonlyMap<ProjectModule, readonly import('./language/imports.js').ResolvedImportEdge[]> } {
+function loadProject(file: string, services: TetaueServices): { modules: readonly ProjectModule[]; main: ProjectModule; importsByModule: ReadonlyMap<ProjectModule, readonly import('./language/imports.js').ResolvedImportEdge[]>; exportsByModule: ReadonlyMap<ProjectModule, readonly import('./language/imports.js').ResolvedExportEdge[]> } {
     const rootUri = URI.file(path.resolve(file)).toString();
     const rootText = readFileSync(URI.parse(rootUri).fsPath, 'utf8');
 
@@ -203,7 +193,7 @@ function loadProject(file: string, services: TetaueServices): { modules: readonl
     });
 
     // Prepend import-resolution errors onto the main module's analysis.
-    const { modules, importsByModule, diagnostics: treeDiagnostics } = tree;
+    const { modules, importsByModule, exportsByModule, diagnostics: treeDiagnostics } = tree;
     if (treeDiagnostics.length > 0) {
         console.error(`error: failed to resolve imports in ${file}`);
         for (const d of treeDiagnostics) {
@@ -214,7 +204,7 @@ function loadProject(file: string, services: TetaueServices): { modules: readonl
         }
         process.exit(1);
     }
-    return { modules, main, importsByModule };
+    return { modules, main, importsByModule, exportsByModule };
 }
 
 async function cmdParse(args: string[]): Promise<number> {
@@ -248,6 +238,7 @@ async function cmdTypes(args: string[]): Promise<number> {
     const result = checkProject(project.modules, {
         requireQuery: false,
         importsByModule: project.importsByModule,
+        reexportsByModule: project.exportsByModule,
         prelude: standardPrelude(services),
     });
     for (const d of result.diagnostics) {
@@ -406,8 +397,6 @@ export interface BuildResult {
     library: number;
     /** Modules with diagnostics. */
     errors: number;
-    /** Non-fatal warnings (e.g. import shadowing) surfaced during builds. */
-    warnings: number;
     files: string[];
     sqlFiles: string[];
 }
@@ -418,7 +407,7 @@ export interface BuildResult {
  */
 export function buildProject(root: string, options: BuildOptions, services: TetaueServices): BuildResult {
     const files = findTetaueFiles(root);
-    const result: BuildResult = { built: 0, library: 0, errors: 0, warnings: 0, files, sqlFiles: [] };
+    const result: BuildResult = { built: 0, library: 0, errors: 0, files, sqlFiles: [] };
     for (const file of files) {
         const uri = URI.file(file).toString();
         let text: string;
@@ -439,8 +428,6 @@ export function buildProject(root: string, options: BuildOptions, services: Teta
             requireMain: true,
         });
         if (outcome.ok) {
-            printWarnings(outcome.warnings ?? []);
-            if (outcome.warnings) result.warnings += outcome.warnings.length;
             const outFile = path.join(options.out, path.relative(root, file).replace(/\.tetaue$/, '') + '.sql');
             mkdirSync(path.dirname(outFile), { recursive: true });
             writeFileSync(outFile, outcome.sql);
@@ -512,31 +499,16 @@ async function cmdBuild(args: string[]): Promise<number> {
         return 1;
     }
 
-    // Defaults from the nearest tetaue.toml's [build] table; CLI flags win.
-    const manifestDir = findManifestDir(root);
-    let cfg: BuildConfig | undefined;
-    if (manifestDir) {
-        try {
-            cfg = parseManifest(readFileSync(path.join(manifestDir, MANIFEST_NAME), 'utf8')).build;
-        } catch {
-            // malformed manifest — dependency resolution reports it; ignore [build]
-        }
-    }
-
-    const finalDialect = dialect ?? cfg?.dialect ?? 'sqlite';
+    // All build options come from command-line flags (no config file).
+    const finalDialect = dialect ?? 'sqlite';
     if (!isDialect(finalDialect)) {
         console.error(`error: unknown dialect '${finalDialect}' — available: ${Object.keys(DIALECTS).join(', ')}`);
         return 2;
     }
-    const finalFormat = format
-        ?? (cfg?.format === 'pretty' || cfg?.format === 'compact' ? cfg.format : undefined)
-        ?? 'pretty';
-    let outDir: string;
-    if (out !== undefined) outDir = path.resolve(out);
-    else if (cfg?.out !== undefined && manifestDir !== undefined) outDir = path.resolve(manifestDir, cfg.out);
-    else outDir = path.resolve(root, 'dist/sql');
-    const preHook = noHooks ? undefined : (pre ?? cfg?.pre);
-    const postHook = noHooks ? undefined : (post ?? cfg?.post);
+    const finalFormat = format ?? 'pretty';
+    const outDir = out !== undefined ? path.resolve(root, out) : path.resolve(root, 'dist/sql');
+    const preHook = noHooks ? undefined : pre;
+    const postHook = noHooks ? undefined : post;
 
     const services = createTetaueServices(NodeFileSystem).tetaue;
     console.error(`[build] ${root} (dialect: ${finalDialect})`);
@@ -545,7 +517,7 @@ async function cmdBuild(args: string[]): Promise<number> {
     const result = buildProject(root, { dialect: finalDialect, format: finalFormat, out: outDir }, services);
     const ms = Math.round(performance.now() - start);
     for (const f of result.sqlFiles) console.error(`  wrote ${path.relative(process.cwd(), f) || f}`);
-    console.error(`[build] ${result.built} query module(s) rendered, ${result.library} library module(s), ${result.errors} error(s), ${result.warnings} warning(s) in ${ms} ms → ${path.relative(process.cwd(), outDir) || outDir}`);
+    console.error(`[build] ${result.built} query module(s) rendered, ${result.library} library module(s), ${result.errors} error(s) in ${ms} ms → ${path.relative(process.cwd(), outDir) || outDir}`);
     if (postHook !== undefined && !runHook(postHook, 'post')) return 1;
     return result.errors > 0 ? 1 : 0;
 }
@@ -624,8 +596,7 @@ function makeWatcher(targetAbs: string, isDir: boolean, onChange: (p: string) =>
 
 /**
  * Watch `targetAbs` (a file or directory) and compile on change. Results are
- * delivered to `onResult(file, outcome)`. Editing tetaue.toml re-runs every
- * file (import resolution may have changed). Returns a session you can stop.
+ * delivered to `onResult(file, outcome)`. Returns a session you can stop.
  */
 export function startWatch(
     targetAbs: string,
@@ -667,8 +638,7 @@ export function startWatch(
     };
 
     const stop = makeWatcher(targetAbs, isDir, (p) => {
-        if (path.basename(p) === MANIFEST_NAME) runAll();
-        else if (p.endsWith('.tetaue')) schedule(p);
+        if (p.endsWith('.tetaue')) schedule(p);
     });
 
     return { stop, runNow, schedule, runAll };

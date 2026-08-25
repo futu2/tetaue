@@ -1,6 +1,6 @@
 /******************************************************************************
- * CLI tests — format / build / watch / lsp, the [build] manifest config, and
- * the requireQuery:false compile mode that build relies on.
+ * CLI tests — format / build / watch / lsp and the requireQuery:false
+ * compile mode that build relies on.
  ******************************************************************************/
 import { describe, expect, test } from 'bun:test';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -12,7 +12,6 @@ import { createTetaueServices } from '../src/language/tetaue-module.ts';
 import type { TetaueServices } from '../src/language/tetaue-module.ts';
 import { compileModuleText } from '../src/language/compile.ts';
 import { buildProject, findTetaueFiles, main, startWatch } from '../src/cli.ts';
-import { parseManifest } from '../src/language/resolve.ts';
 
 const services: TetaueServices = createTetaueServices(NodeFileSystem).tetaue;
 
@@ -180,49 +179,22 @@ describe('format', () => {
     });
 });
 
-describe('tetaue.toml [build]', () => {
-    test('parses build defaults', () => {
-        const manifest = parseManifest([
-            '[build]',
-            'out = "sql"',
-            'dialect = "postgresql"',
-            'format = "compact"',
-            'pre = "echo pre"',
-            'post = "echo post"',
-            '',
-        ].join('\n'));
-        expect(manifest.build).toEqual({
-            out: 'sql',
-            dialect: 'postgresql',
-            format: 'compact',
-            pre: 'echo pre',
-            post: 'echo post',
-        });
-    });
-
-    test('malformed [build] entries are dropped', () => {
-        expect(parseManifest('[build]\nout = 42\npre = ""\n').build).toBeUndefined();
-    });
-});
-
 describe('build command', () => {
-    test('uses tetaue.toml [build] defaults and runs hooks in order', async () => {
+    test('runs hooks in order and honors --out/--dialect/--pre-hook/--post-hook', async () => {
         const dir = tempDir('tetaue-build-cfg-');
         try {
             write(dir, 'q.tetaue', QUERY_1);
             const markers = join(dir, 'markers.txt');
-            write(dir, 'tetaue.toml', [
-                '[build]',
-                'out = "generated"',
-                'dialect = "postgresql"',
-                `pre = "echo pre >> ${markers}"`,
-                `post = "echo post >> ${markers}"`,
-                '',
-            ].join('\n'));
             const captured = captureConsole();
             let code: number;
             try {
-                code = await main(['build', dir]);
+                code = await main([
+                    'build', dir,
+                    '--out', 'generated',
+                    '--dialect', 'postgresql',
+                    '--pre-hook', `echo pre >> ${markers}`,
+                    '--post-hook', `echo post >> ${markers}`,
+                ]);
             } finally {
                 captured.restore();
             }
@@ -236,22 +208,20 @@ describe('build command', () => {
         }
     });
 
-    test('--no-hooks skips hooks and --out overrides the manifest', async () => {
+    test('--no-hooks skips hooks and --out chooses the output directory', async () => {
         const dir = tempDir('tetaue-build-nohook-');
         try {
             write(dir, 'q.tetaue', QUERY_1);
             const markers = join(dir, 'markers.txt');
-            write(dir, 'tetaue.toml', `[build]\nout = "generated"\npre = "echo pre >> ${markers}"\n`);
             const captured = captureConsole();
             let code: number;
             try {
-                code = await main(['build', dir, '--no-hooks', '--out', join(dir, 'cli-out')]);
+                code = await main(['build', dir, '--no-hooks', '--pre-hook', `echo pre >> ${markers}`, '--out', join(dir, 'cli-out')]);
             } finally {
                 captured.restore();
             }
             expect(code).toBe(0);
             expect(existsSync(join(dir, 'cli-out', 'q.sql'))).toBe(true);
-            expect(existsSync(join(dir, 'generated'))).toBe(false);
             expect(existsSync(markers)).toBe(false);
         } finally {
             rmSync(dir, { recursive: true, force: true });

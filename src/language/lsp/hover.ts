@@ -32,10 +32,11 @@ export class TetaueHoverProvider implements HoverProvider {
         const node = leaf?.astNode;
         if (!node) return undefined;
 
-        const { modules, importsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
+        const { modules, importsByModule, exportsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
         const result = checkProject(modules, {
             requireQuery: false,
             importsByModule,
+            reexportsByModule: exportsByModule,
             prelude: standardPrelude(this.services),
         });
 
@@ -48,7 +49,7 @@ export class TetaueHoverProvider implements HoverProvider {
         if (typeText === undefined) return undefined;
 
         const parts: string[] = [];
-        const doc = this.documentation(document, modules, node, typed);
+        const doc = this.documentation(document, modules, importsByModule, exportsByModule, node, typed);
         if (doc) parts.push(doc);
         parts.push(this.codeBlock(labelFor(document, typed, typeText)));
         return { contents: { kind: MarkupKind.Markdown, value: parts.join('\n\n') } };
@@ -58,6 +59,8 @@ export class TetaueHoverProvider implements HoverProvider {
     private documentation(
         document: LangiumDocument,
         modules: readonly ProjectModule[],
+        importsByModule: ReadonlyMap<ProjectModule, readonly import('../imports.js').ResolvedImportEdge[]>,
+        exportsByModule: ReadonlyMap<ProjectModule, readonly import('../imports.js').ResolvedExportEdge[]>,
         node: AstNode,
         typed: AstNode,
     ): string | undefined {
@@ -76,9 +79,8 @@ export class TetaueHoverProvider implements HoverProvider {
             }
         } else if (isAccessExpression(node)) {
             // `t.binding` — the doc comment lives in the lib file.
-            binding = moduleQualifiedBinding(node, modules);
-        }
-        if (!binding?.$cstNode) return undefined;
+            binding = moduleQualifiedBinding(node, modules, importsByModule, { exportsByModule });
+        }        if (!binding?.$cstNode) return undefined;
         // The offset indexes the binding's OWN source text. For the hovered
         // document that IS that text; for an imported binding, read the
         // module's file (the offset indexes it) instead of the hovered file.

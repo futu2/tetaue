@@ -62,6 +62,7 @@ export type TetaueKeywordNames =
     | "case"
     | "export"
     | "false"
+    | "from"
     | "import"
     | "in"
     | "let"
@@ -234,6 +235,23 @@ export function isDollarParam(item: unknown): item is DollarParam {
     return reflection.isInstance(item, DollarParam.$type);
 }
 
+export interface Export extends langium.AstNode {
+    readonly $container: Model;
+    readonly $type: 'Export';
+    names: Array<ImportName>;
+    path: string;
+}
+
+export const Export = {
+    $type: 'Export',
+    names: 'names',
+    path: 'path'
+} as const;
+
+export function isExport(item: unknown): item is Export {
+    return reflection.isInstance(item, Export.$type);
+}
+
 export type Expr = AccessExpression | Application | BooleanLiteral | CaseExpression | DollarParam | Expression | Identifier | Lambda | ListLiteral | MapLiteral | NullLiteral | NumberLiteral | OperatorSection | StringLiteral;
 
 export const Expr = {
@@ -306,7 +324,7 @@ export function isImport(item: unknown): item is Import {
 }
 
 export interface ImportName extends langium.AstNode {
-    readonly $container: Import;
+    readonly $container: Export | Import;
     readonly $type: 'ImportName';
     name: string;
     renamed?: string;
@@ -494,6 +512,7 @@ export function isMapLiteral(item: unknown): item is MapLiteral {
 export interface Model extends langium.AstNode {
     readonly $type: 'Model';
     bindings: Array<Binding>;
+    exports: Array<Export>;
     imports: Array<Import>;
     types: Array<TypeAlias>;
 }
@@ -501,6 +520,7 @@ export interface Model extends langium.AstNode {
 export const Model = {
     $type: 'Model',
     bindings: 'bindings',
+    exports: 'exports',
     imports: 'imports',
     types: 'types'
 } as const;
@@ -761,6 +781,7 @@ export type TetaueAstType = {
     CaseBranch: CaseBranch
     CaseExpression: CaseExpression
     DollarParam: DollarParam
+    Export: Export
     Expr: Expr
     Expression: Expression
     FunType: FunType
@@ -926,6 +947,20 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                 }
             },
             superTypes: [Expr.$type]
+        },
+        Export: {
+            name: Export.$type,
+            properties: {
+                names: {
+                    name: Export.names,
+                    defaultValue: [],
+                    optional: true
+                },
+                path: {
+                    name: Export.path
+                }
+            },
+            superTypes: []
         },
         Expr: {
             name: Expr.$type,
@@ -1134,6 +1169,11 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
             properties: {
                 bindings: {
                     name: Model.bindings,
+                    defaultValue: [],
+                    optional: true
+                },
+                exports: {
+                    name: Model.exports,
                     defaultValue: [],
                     optional: true
                 },

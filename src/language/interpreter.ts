@@ -18,7 +18,7 @@ import {
     isTypeAtom, isTypeHole, isTypeParen, isTypeVar, isUnaryMinus,
     type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
 } from './generated/ast.js';
-import type { ProjectModule, ResolvedImportEdge } from './imports.js';
+import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
 import { labelName, parseStringLiteral } from './strings.js';
 export { parseStringLiteral };
@@ -3311,6 +3311,8 @@ export interface ProjectAnalysisOptions {
     requireQuery?: boolean;
     /** Resolved import edges from `collectModuleTree` (pure tree). */
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    /** Resolved re-export (`export ... from`) edges from `collectModuleTree`. */
+    reexportsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]>;
     /** Optional source standard library, evaluated before the user modules. */
     prelude?: ProjectModule;
 }
@@ -3336,7 +3338,7 @@ export function createPreludeEnv(): Map<string, Value> {
  * The ROOT module's last binding is the project's query.
  */
 export function analyzeProject(modules: readonly ProjectModule[], options: ProjectAnalysisOptions = {}): AnalysisResult {
-    const { requireQuery = true, importsByModule = new Map(), prelude } = options;
+    const { requireQuery = true, importsByModule = new Map(), reexportsByModule = new Map(), prelude } = options;
     const diagnostics: Diagnostic[] = [];
 
     // Exported bindings per module, keyed by module identity (diamond dedup
@@ -3405,6 +3407,39 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
             seen = result.seen;
             value = result.value;
             if (binding.export) exports.set(binding.name, value);
+        }
+        // --- re-exports: `export * from "x"` / `export { a as b } from "x"` ---
+        // Re-exports add names to THIS module's public surface without binding
+        // them locally. The target was evaluated earlier (DFS order), so its
+        // export map is ready. Conflicts are errors, never silent.
+        for (const { target, exportNode } of reexportsByModule.get(module) ?? []) {
+            const targetExports = exportsByModule.get(target);
+            if (!targetExports) continue; // cyclic/missing target — already diagnosed
+            const spec = parseStringLiteral(exportNode.path);
+            if (exportNode.names.length === 0) {
+                for (const [name, reexported] of targetExports) {
+                    if (exports.has(name)) {
+                        moduleDiagnostics.push({ node: exportNode, message: `re-exported name '${name}' (from '${spec}') conflicts with an already exported name` });
+                        continue;
+                    }
+                    exports.set(name, reexported);
+                }
+            } else {
+                for (const item of exportNode.names) {
+                    const reexported = targetExports.get(item.name);
+                    if (reexported === undefined) {
+                        const keys = [...targetExports.keys()];
+                        moduleDiagnostics.push({ node: exportNode, message: `'${item.name}' is not exported by '${spec}' — exported: ${keys.length > 0 ? keys.join(', ') : '(none)'}` });
+                        continue;
+                    }
+                    const name = item.renamed ?? item.name;
+                    if (exports.has(name)) {
+                        moduleDiagnostics.push({ node: exportNode, message: `re-exported name '${name}' (from '${spec}') conflicts with an already exported name` });
+                        continue;
+                    }
+                    exports.set(name, reexported);
+                }
+            }
         }
         exportsByModule.set(module, exports);
         typeExportsByModule.set(module, new Map(

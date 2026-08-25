@@ -21,12 +21,12 @@
  ******************************************************************************/
 import type { AstNode } from 'langium';
 import {
-    ERROR, createPreludeEnv, describe, type Diagnostic, type Value,
+    ERROR, createPreludeEnv, describe, parseStringLiteral, type Diagnostic, type Value,
 } from './interpreter.js';
 import { Inferencer, mergeDiagnostics } from './inference.js';
 import type { Scheme, Type } from './types.js';
 import { resolveImportScope } from './project-scope.js';
-import type { ProjectModule, ResolvedImportEdge } from './imports.js';
+import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
 
 export interface CheckProjectResult {
     /** The root module's final evaluated value; its `query` is the SQL IR. */
@@ -55,6 +55,8 @@ export interface CheckProjectOptions {
     requireMain?: boolean;
     /** Resolved import edges from `collectModuleTree` (pure tree). */
     importsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    /** Resolved re-export (`export ... from`) edges from `collectModuleTree`. */
+    reexportsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]>;
     /** Render this root-module binding instead of the last one. */
     entryBinding?: string;
     /**
@@ -75,6 +77,7 @@ export function checkProject(
     options: CheckProjectOptions = {},
 ): CheckProjectResult {
     const { requireQuery = true, requireMain = false, importsByModule = new Map(), entryBinding, prelude } = options;
+    const reexportsByModule = options.reexportsByModule ?? new Map<ProjectModule, readonly ResolvedExportEdge[]>();
 
     const inferencer = new Inferencer();
     inferencer.prelude();
@@ -155,6 +158,36 @@ export function checkProject(
             value = result.value;
             if (binding.export) {
                 exports.set(binding.name, value);
+            }
+        }
+
+        // --- re-exports: `export * from "x"` / `export { a as b } from "x"` ---
+        // Re-exports add names to THIS module's public surface without binding
+        // them locally, mirroring the interpreter's merge exactly (same
+        // wording, so the merged diagnostics dedupe).
+        for (const { target, exportNode } of reexportsByModule.get(module) ?? []) {
+            const targetValues = valueExportsByModule.get(target);
+            const targetSchemes = schemeExportsByModule.get(target);
+            if (!targetValues || !targetSchemes) continue; // cyclic/missing target — already diagnosed
+            const spec = parseStringLiteral(exportNode.path);
+            const names: { name: string; renamed: string | undefined }[] = exportNode.names.length === 0
+                ? [...targetValues.keys()].map(name => ({ name, renamed: undefined }))
+                : exportNode.names.map(item => ({ name: item.name, renamed: item.renamed ?? undefined }));
+            for (const { name, renamed } of names) {
+                const v = targetValues.get(name);
+                const s = targetSchemes.get(name);
+                if (v === undefined || s === undefined) {
+                    const keys = [...targetValues.keys()];
+                    moduleDiagnostics.push({ node: exportNode, message: `'${name}' is not exported by '${spec}' — exported: ${keys.length > 0 ? keys.join(', ') : '(none)'}` });
+                    continue;
+                }
+                const localName = renamed ?? name;
+                if (exports.has(localName)) {
+                    moduleDiagnostics.push({ node: exportNode, message: `re-exported name '${localName}' (from '${spec}') conflicts with an already exported name` });
+                    continue;
+                }
+                exports.set(localName, v);
+                exportedSchemes.set(localName, s);
             }
         }
 

@@ -32,7 +32,7 @@ import {
     type ScalarTypeClass,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
-import type { ProjectModule, ResolvedImportEdge } from './imports.js';
+import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
 import { moduleOf } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
 import { checkBinding, missingBindingExpressionMessage, parseStringLiteral } from './interpreter.js';
@@ -310,6 +310,7 @@ export class Inferencer {
         modules: readonly ProjectModule[],
         importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map(),
         prelude?: ProjectModule,
+        reexportsByModule: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]> = new Map(),
     ): void {
         this.prelude();
         const exportsByModule = new Map<ProjectModule, Map<string, Scheme>>();
@@ -323,6 +324,7 @@ export class Inferencer {
                 exportsByModule,
                 typeExportsByModule,
                 standardTypes,
+                reexportsByModule.get(module) ?? module.exports ?? [],
             );
             exportsByModule.set(module, exported);
             typeExportsByModule.set(module, new Map(
@@ -386,11 +388,36 @@ export class Inferencer {
         exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, Scheme>>,
         typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, LangiumType>>,
         standardTypes: ReadonlyMap<string, LangiumType> = new Map(),
+        reexports: readonly ResolvedExportEdge[] = [],
     ): Map<string, Scheme> {
         const { scope } = this.beginModule(module, imports, exportsByModule, typeExportsByModule, standardTypes);
         const exported = new Map<string, Scheme>();
         for (const binding of module.model.bindings) {
             this.inferBinding(binding, exported, scope);
+        }
+        // --- re-exports: `export * from "x"` / `export { a as b } from "x"` ---
+        // Mirror the interpreter's merge (same wording) so diagnostics dedupe.
+        for (const { target, exportNode } of reexports) {
+            const targetExports = exportsByModule.get(target);
+            if (!targetExports) continue; // cyclic/missing target — already diagnosed
+            const spec = parseStringLiteral(exportNode.path);
+            const names = exportNode.names.length === 0
+                ? [...targetExports.keys()].map(name => ({ name, renamed: undefined as string | undefined }))
+                : exportNode.names.map(item => ({ name: item.name, renamed: item.renamed }));
+            for (const { name, renamed } of names) {
+                const scheme = targetExports.get(name);
+                if (scheme === undefined) {
+                    const keys = [...targetExports.keys()];
+                    this.diag(exportNode, `'${name}' is not exported by '${spec}' — exported: ${keys.length > 0 ? keys.join(', ') : '(none)'}`);
+                    continue;
+                }
+                const localName = renamed ?? name;
+                if (exported.has(localName)) {
+                    this.diag(exportNode, `re-exported name '${localName}' (from '${spec}') conflicts with an already exported name`);
+                    continue;
+                }
+                exported.set(localName, scheme);
+            }
         }
         return exported;
     }
@@ -2705,9 +2732,10 @@ export function inferProject(
     modules: readonly ProjectModule[],
     importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map(),
     prelude?: ProjectModule,
+    reexportsByModule: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]> = new Map(),
 ): InferProjectResult {
     const inferencer = new Inferencer();
-    inferencer.inferProject(modules, importsByModule, prelude);
+    inferencer.inferProject(modules, importsByModule, prelude, reexportsByModule);
     return {
         diagnostics: inferencer.diagnostics,
         nodeTypes: inferencer.nodeTypes,

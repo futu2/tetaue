@@ -28,10 +28,13 @@
 
 grammar Tetaue
 
+// One flat prefix loop: `import`/`export ... from` statements, `type` aliases,
+// and bindings may interleave (they all share the optional `export` keyword).
+// A single loop — not separate `*` groups — lets the parser backtrack:
+// `export * from` / `export { a } from` are re-exports, `export type` is an
+// alias, and `export name = ...` is a binding.
 entry Model:
-    (imports+=Import)*
-    (types+=TypeAlias)*
-    (bindings+=Binding)*;
+    (imports+=Import | exports+=Export | types+=TypeAlias | bindings+=Binding)*;
 
 // `type Name = T` — a module-local type alias. Aliases are expanded during
 // type inference and schema decoding; declaration order matters and aliases
@@ -51,6 +54,14 @@ Import:
 // name `b` (for flat imports) or as `t.b` (for namespaced imports).
 ImportName:
     name=(ID | ARG_ID | OP_SECTION) ('as' renamed=(ID | ARG_ID | OP_SECTION))?;
+
+// `export * from "path"` re-exports every binding the target module exports;
+// `export { a as b } from "path"` re-exports exactly the listed names (under
+// the local name `b` for `a as b`). Re-exports add to THIS module's public
+// surface — they do not bind local names — so an index module can aggregate
+// per-table modules: `export * from "./tables/users"`.
+Export:
+    'export' ('*' | '{' names+=ImportName (',' names+=ImportName)* '}') 'from' path=STRING;
 
 // `export` marks a binding as part of the module's public surface: only
 // exported bindings are visible to importers (flat or qualified). Within a

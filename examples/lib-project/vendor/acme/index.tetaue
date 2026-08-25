@@ -1,0 +1,8 @@
+# acme — the package entry. This index module aggregates the library's
+# per-concern modules with re-exports: importers `import "../vendor/acme"`
+# (resolved to this file) and see every export of `tables` and `predicates`
+# as if acme exported them itself. Re-exports add to the public surface
+# without binding any names here.
+
+export * from "./tables"
+export * from "./predicates"

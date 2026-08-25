@@ -45,9 +45,9 @@ export function activate(context: vscode.ExtensionContext): void {
     client.start();
 
     // Forward file changes to the server so it revalidates open importers
-    // when a lib module or tetaue.toml changes (imports are resolved from
-    // disk, not via LSP references).
-    const watcher = vscode.workspace.createFileSystemWatcher('**/{*.tetaue,tetaue.toml}');
+    // when a lib module changes (imports are resolved from disk, not via
+    // LSP references).
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*.tetaue');
     const forward = (uri: vscode.Uri, type: 1 | 2 | 3): void => {
         if (client?.state !== 2 /* State.Running */) return;
         void client.sendNotification('workspace/didChangeWatchedFiles', {

@@ -1,10 +1,10 @@
 # acme — a library of schema definitions.
 #
-# This module imports `shared/columns` from ITS OWN manifest (../shared),
-# so the dependency is pinned to this vendored copy. Importers of acme see
-# only what is exported here.
+# This module imports `../shared/columns` relative to itself, so the
+# dependency travels with the vendored copy. Importers of acme see only what
+# is exported here (and, through index.tetaue, re-exported downstream).
 
-import "shared/columns"
+import "../shared/columns"
 
 # users: the core customer table.
 export users: query {

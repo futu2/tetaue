@@ -54,9 +54,9 @@ export function startTetaueServer(): void {
 
     const { shared, tetaue } = createTetaueServices({ connection, ...NodeFileSystem });
 
-    // Imports and tetaue.toml are read from disk on every validation, so edits
-    // to a lib file or the manifest only reach open importers when we
-    // revalidate them. Langium's DocumentUpdateHandler owns the
+    // Imports are read from disk on every validation, so edits to a lib file
+    // only reach open importers when we revalidate them. Langium's
+    // DocumentUpdateHandler owns the
     // workspace/didChangeWatchedFiles registration (registering our own would
     // overwrite it); subscribe to its change event instead and re-run
     // validation on every open document. build({validation:true}) forces

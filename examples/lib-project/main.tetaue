@@ -1,16 +1,19 @@
-# A project using libraries declared in tetaue.toml.
+# A project using libraries as ordinary relative-path modules.
 #
-#   import "acme/tables"                flat: users, orders, user_summaries
-#   import "acme/predicates" as p       namespaced: p.adult
-#   import "shared/columns" (compact)   selective: just compact
+# There is no manifest and no package layer: `import` resolves relative to
+# THIS file. `./vendor/acme` resolves to `./vendor/acme/index.tetaue`, an
+# index module that aggregates the library with re-exports:
 #
-# Resolution: relative to THIS file first (none of these exist here), then
-# each dependency from tetaue.toml. Hover `p.adult`, `compact`, or `users`
-# to see the doc comments from the lib files; Ctrl+click jumps to them.
+#   import "./vendor/acme"                    flat: users, orders, user_summaries, adult
+#   import "./vendor/acme/predicates" as p    namespaced: p.adult
+#   import "./vendor/shared/columns" (compact)  selective: just compact
+#
+# Hover `p.adult`, `compact`, or `users` to see the doc comments from the
+# lib files; Ctrl+click jumps to them.
 
-import "acme/tables"
-import "acme/predicates" as p
-import "shared/columns" (compact)
+import "./vendor/acme"
+import "./vendor/acme/predicates" as p
+import "./vendor/shared/columns" (compact)
 
 # adult_users: adults, compacted with the shared projection.
 adult_users = users

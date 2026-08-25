@@ -1,8 +1,8 @@
 /******************************************************************************
- * tetaue.toml library resolution tests.
+ * Import resolution tests — relative-path only.
  *
  * Unit tests drive resolveImport directly against temp directories; the CLI
- * end-to-end tests spawn `tetaue render/check` on a real manifest project.
+ * end-to-end tests spawn `tetaue render/check` on a real module tree.
  ******************************************************************************/
 import { describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
@@ -13,7 +13,7 @@ import { URI } from 'langium';
 import { resolveImport } from '../src/language/resolve.ts';
 
 function project(): { dir: string; cleanup: () => void; uri: (rel: string) => string } {
-    const dir = mkdtempSync(join(tmpdir(), 'tetaue-manifest-'));
+    const dir = mkdtempSync(join(tmpdir(), 'tetaue-resolve-'));
     const uri = (rel: string) => URI.file(join(dir, rel)).toString();
     const cleanup = () => rmSync(dir, { recursive: true, force: true });
     return { dir, cleanup, uri };
@@ -25,13 +25,11 @@ function write(dir: string, rel: string, content: string): void {
     writeFileSync(file, content);
 }
 
-describe('tetaue.toml dependency resolution', () => {
-    test('relative imports win over dependencies', () => {
+describe('relative-path import resolution', () => {
+    test('a bare spec resolves next to the importing file', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            write(p.dir, 'tables.tetaue', `export users: query { id: int } = table "local"\n`);
+            write(p.dir, 'tables.tetaue', `export users: query { id: int } = table "users"\n`);
             const r = resolveImport(p.uri('main.tetaue'), 'tables.tetaue');
             expect(r.uri).toBe(p.uri('tables.tetaue'));
         } finally {
@@ -39,233 +37,112 @@ describe('tetaue.toml dependency resolution', () => {
         }
     });
 
-    test('import "acme/tables" resolves inside the declared dependency (extension inferred)', () => {
+    test('the .tetaue extension is inferred', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            const r = resolveImport(p.uri('main.tetaue'), 'acme/tables');
-            expect(r.uri).toBe(p.uri('vendor/acme/tables.tetaue'));
+            write(p.dir, 'tables.tetaue', `export users: query { id: int } = table "users"\n`);
+            const r = resolveImport(p.uri('main.tetaue'), 'tables');
+            expect(r.uri).toBe(p.uri('tables.tetaue'));
         } finally {
             p.cleanup();
         }
     });
 
-    test('import "acme" (bare name) finds the dependency index.tetaue', () => {
+    test('a folder import finds the index.tetaue (package folders work)', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
             write(p.dir, 'vendor/acme/index.tetaue', `export users: query { id: int } = table "users"\n`);
-            const r = resolveImport(p.uri('main.tetaue'), 'acme');
+            const r = resolveImport(p.uri('main.tetaue'), 'vendor/acme');
             expect(r.uri).toBe(p.uri('vendor/acme/index.tetaue'));
         } finally {
             p.cleanup();
         }
     });
 
-    test('dependency paths resolve relative to the manifest directory', () => {
+    test('a path into a subfolder resolves relative to the importer', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
             write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            const r = resolveImport(p.uri('queries/main.tetaue'), 'acme/tables');
+            const r = resolveImport(p.uri('main.tetaue'), 'vendor/acme/tables');
             expect(r.uri).toBe(p.uri('vendor/acme/tables.tetaue'));
         } finally {
             p.cleanup();
         }
     });
 
-    test('a lib with its own tetaue.toml resolves ITS imports against its own dependencies', () => {
+    test('relative specs resolve from the importing file, not the cwd', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
-            write(p.dir, 'vendor/acme/tetaue.toml', `[dependencies]\nshared = { path = "../shared" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
+            write(p.dir, 'queries/helpers.tetaue', `export h = 1\n`);
+            const r = resolveImport(p.uri('queries/main.tetaue'), './helpers');
+            expect(r.uri).toBe(p.uri('queries/helpers.tetaue'));
+        } finally {
+            p.cleanup();
+        }
+    });
+
+    test('../ walks up from the importing file', () => {
+        const p = project();
+        try {
+            // `vendor/acme/../shared/columns` == `vendor/shared/columns`.
             write(p.dir, 'vendor/shared/columns.tetaue', `export columns: query { id: int } = table "columns"\n`);
-            // Imported from INSIDE the lib: nearest manifest is acme's own.
-            const r = resolveImport(p.uri('vendor/acme/tables.tetaue'), 'shared/columns');
+            const r = resolveImport(p.uri('vendor/acme/tables.tetaue'), '../shared/columns');
             expect(r.uri).toBe(p.uri('vendor/shared/columns.tetaue'));
         } finally {
             p.cleanup();
         }
     });
 
-    test('a lib without its own manifest uses the project manifest', () => {
+    test('resolution is a pure function of the file path (nested import)', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\nshared = { path = "vendor/shared" }\n`);
             write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            write(p.dir, 'vendor/shared/columns.tetaue', `export columns: query { id: int } = table "columns"\n`);
-            const r = resolveImport(p.uri('vendor/acme/tables.tetaue'), 'shared/columns');
-            expect(r.uri).toBe(p.uri('vendor/shared/columns.tetaue'));
-        } finally {
-            p.cleanup();
-        }
-    });
-
-    test('path-ish specs never consult dependencies', () => {
-        const p = project();
-        try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            // A relative-looking spec resolves next to the file ONLY — even
-            // though `acme` is a declared dependency.
-            const r = resolveImport(p.uri('main.tetaue'), './acme/tables');
+            // An import INSIDE vendor/acme sees files relative to vendor/acme.
+            const r = resolveImport(p.uri('vendor/acme/tables.tetaue'), './predicates');
             expect(r.uri).toBeUndefined();
-            expect(r.error).toBeUndefined();
+            expect(r.searched).toEqual([join(p.dir, 'vendor/acme')]);
         } finally {
             p.cleanup();
         }
     });
 });
 
-describe('tetaue.toml resolution errors', () => {
-    test('undeclared dependency', () => {
+describe('resolution errors', () => {
+    test('a missing module reports the searched directory', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
             const r = resolveImport(p.uri('main.tetaue'), 'nope/tables');
             expect(r.uri).toBeUndefined();
-            expect(r.error).toContain("dependency 'nope' is not declared");
-            expect(r.error).toContain('declared: acme');
+            expect(r.searched).toEqual([join(p.dir)]);
         } finally {
             p.cleanup();
         }
     });
 
-    test('broken dependency path', () => {
+    test('candidate forms (bare, .tetaue, index.tetaue) are all tried', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "missing" }\n`);
+            write(p.dir, 'acme/index.tetaue', `export users: query { id: int } = table "users"\n`);
+            // `acme/tables` matches neither `acme/tables`, `acme/tables.tetaue`
+            // nor `acme/tables/index.tetaue` — only the bare `acme` folder does.
             const r = resolveImport(p.uri('main.tetaue'), 'acme/tables');
             expect(r.uri).toBeUndefined();
-            expect(r.error).toContain("cannot read dependency 'acme'");
-            expect(r.error).toContain('does not exist');
-        } finally {
-            p.cleanup();
-        }
-    });
-
-    test('missing file inside a dependency', () => {
-        const p = project();
-        try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            const r = resolveImport(p.uri('main.tetaue'), 'acme/nope');
-            expect(r.uri).toBeUndefined();
-            expect(r.error).toContain("no file 'nope' in dependency 'acme'");
-        } finally {
-            p.cleanup();
-        }
-    });
-
-    test('malformed tetaue.toml', () => {
-        const p = project();
-        try {
-            write(p.dir, 'tetaue.toml', '[dependencies\nbroken');
-            const r = resolveImport(p.uri('main.tetaue'), 'acme/tables');
-            expect(r.uri).toBeUndefined();
-            expect(r.error).toContain('error in tetaue.toml');
-        } finally {
-            p.cleanup();
-        }
-    });
-
-    test('no manifest anywhere above the file', () => {
-        const p = project();
-        try {
-            const r = resolveImport(p.uri('main.tetaue'), 'nope.tetaue');
-            expect(r.uri).toBeUndefined();
-            expect(r.error).toContain('no tetaue.toml found');
-        } finally {
-            p.cleanup();
-        }
-    });
-
-    test('a rest path that escapes the dependency is rejected', () => {
-        const p = project();
-        try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            // vendor/tables.tetaue sits OUTSIDE the acme dependency; a `..`
-            // rest must not reach it through the dependency mechanism.
-            write(p.dir, 'vendor/tables.tetaue', `export users: query { id: int } = table "outside"\n`);
-            const r = resolveImport(p.uri('main.tetaue'), 'acme/../tables');
-            expect(r.uri).toBeUndefined();
-            expect(r.error).toContain("escapes dependency 'acme'");
-        } finally {
-            p.cleanup();
-        }
-    });
-
-    test('a malformed manifest entry is reported, not treated as undeclared', () => {
-        const p = project();
-        try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = "vendor/acme"\n`);
-            const r = resolveImport(p.uri('main.tetaue'), 'acme/tables');
-            expect(r.uri).toBeUndefined();
-            expect(r.error).toContain("dependency 'acme' in tetaue.toml must be { path = \"…\" }");
+            expect(r.searched).toEqual([join(p.dir)]);
+            expect(resolveImport(p.uri('main.tetaue'), 'acme').uri).toBe(p.uri('acme/index.tetaue'));
         } finally {
             p.cleanup();
         }
     });
 });
 
-describe('tetaue.toml resolution warnings', () => {
-    test('a local file shadowing a declared dependency warns', () => {
-        const p = project();
-        try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            write(p.dir, 'acme/index.tetaue', `export users: query { id: int } = table "local"\n`);
-            const r = resolveImport(p.uri('main.tetaue'), 'acme');
-            expect(r.uri).toBe(p.uri('acme/index.tetaue')); // local wins
-            expect(r.warning).toContain("local 'acme' shadows the declared dependency 'acme'");
-        } finally {
-            p.cleanup();
-        }
-    });
-
-    test('a lib without its own manifest warns when its import falls through to the outer manifest', () => {
-        const p = project();
-        try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\nshared = { path = "vendor/shared" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            write(p.dir, 'vendor/shared/columns.tetaue', `export columns: query { id: int } = table "columns"\n`);
-            const r = resolveImport(p.uri('vendor/acme/tables.tetaue'), 'shared/columns');
-            expect(r.uri).toBe(p.uri('vendor/shared/columns.tetaue'));
-            expect(r.warning).toContain("inside dependency 'acme'");
-            expect(r.warning).toContain('has no tetaue.toml');
-        } finally {
-            p.cleanup();
-        }
-    });
-
-    test('a self-contained lib (own manifest) produces no warning', () => {
-        const p = project();
-        try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
-            write(p.dir, 'vendor/acme/tetaue.toml', `[dependencies]\nshared = { path = "../shared" }\n`);
-            write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int } = table "users"\n`);
-            write(p.dir, 'vendor/shared/columns.tetaue', `export columns: query { id: int } = table "columns"\n`);
-            const r = resolveImport(p.uri('vendor/acme/tables.tetaue'), 'shared/columns');
-            expect(r.uri).toBe(p.uri('vendor/shared/columns.tetaue'));
-            expect(r.warning).toBeUndefined();
-        } finally {
-            p.cleanup();
-        }
-    });
-});
-
-describe('tetaue.toml through the CLI (end to end)', () => {
+describe('relative resolution through the CLI (end to end)', () => {
     const ROOT = resolve(import.meta.dir, '..');
 
-    test('render resolves a declared dependency', () => {
+    test('render resolves a relative import', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
             write(p.dir, 'vendor/acme/tables.tetaue', `export users: query { id: int, active: bool } = table "users"\n`);
-            write(p.dir, 'main.tetaue', `import "acme/tables"\nmain = users & filter (u => u.active) & take 3\n`);
+            write(p.dir, 'main.tetaue', `import "./vendor/acme/tables"\nmain = users & filter (u => u.active) & take 3\n`);
             const out = execFileSync('bun', ['run', 'src/cli.ts', 'render', join(p.dir, 'main.tetaue')], {
                 cwd: ROOT,
                 encoding: 'utf8',
@@ -279,10 +156,9 @@ describe('tetaue.toml through the CLI (end to end)', () => {
         }
     });
 
-    test('check reports an undeclared dependency', () => {
+    test('check reports an unresolvable import', () => {
         const p = project();
         try {
-            write(p.dir, 'tetaue.toml', `[dependencies]\nacme = { path = "vendor/acme" }\n`);
             write(p.dir, 'main.tetaue', `import "nope/tables"\nq = 1\n`);
             let failed = false;
             let out = '';
@@ -297,8 +173,25 @@ describe('tetaue.toml through the CLI (end to end)', () => {
                 out = String((err as { stderr?: Buffer }).stderr ?? err);
             }
             expect(failed).toBe(true);
-            expect(out).toContain("dependency 'nope' is not declared");
-            expect(out).toContain('declared: acme');
+            expect(out).toContain("cannot resolve import 'nope/tables'");
+        } finally {
+            p.cleanup();
+        }
+    });
+
+    test('render through an index module that re-exports', () => {
+        const p = project();
+        try {
+            write(p.dir, 'lib/tables.tetaue', `export users: query { id: int, active: bool } = table "users"\n`);
+            write(p.dir, 'lib/index.tetaue', `export * from "./tables"\n`);
+            write(p.dir, 'main.tetaue', `import "./lib"\nmain = users & filter (u => u.active) & take 2\n`);
+            const out = execFileSync('bun', ['run', 'src/cli.ts', 'render', join(p.dir, 'main.tetaue')], {
+                cwd: ROOT,
+                encoding: 'utf8',
+                env: { ...process.env, BUN_TMPDIR: '/tmp/buntmp', BUN_INSTALL: '/tmp/buninstall' },
+            });
+            expect(out).toContain('FROM users');
+            expect(out).toContain('LIMIT 2');
         } finally {
             p.cleanup();
         }

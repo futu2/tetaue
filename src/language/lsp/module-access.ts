@@ -4,11 +4,14 @@
  * `t.users` parses as an AccessExpression whose receiver is an Application of
  * a bare identifier with no arguments (`t` alone). These helpers unwrap that
  * shape and resolve the access against the project tree's import edges, so
- * the LSP features all agree on what `t.users` refers to.
+ * the LSP features all agree on what `t.users` refers to. Exported names
+ * reached through an index module's re-exports (`export * from` /
+ * `export { a } from`) resolve to the underlying binding.
  ******************************************************************************/
 import { isApplication, isIdentifier } from '../generated/ast.js';
 import type { AccessExpression, Binding } from '../generated/ast.js';
-import type { ProjectModule, ResolvedImportEdge } from '../imports.js';
+import type { ProjectModule, ResolvedImportEdge, ExportEdgeView } from '../imports.js';
+import { findExportBinding } from '../imports.js';
 import { labelName } from '../strings.js';
 
 /** The namespace alias the access receiver names, or undefined. */
@@ -21,7 +24,12 @@ export function moduleQualifiedReceiver(e: AccessExpression): string | undefined
 }
 
 /** The exported binding `e.property` resolves to in the root module's tree, or undefined. */
-export function moduleQualifiedBinding(e: AccessExpression, modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map()): Binding | undefined {
+export function moduleQualifiedBinding(
+    e: AccessExpression,
+    modules: readonly ProjectModule[],
+    importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> = new Map(),
+    exportsByModule: ExportEdgeView = { exportsByModule: new Map() },
+): Binding | undefined {
     const alias = moduleQualifiedReceiver(e);
     if (!alias) return undefined;
     const root = modules[modules.length - 1];
@@ -31,5 +39,6 @@ export function moduleQualifiedBinding(e: AccessExpression, modules: readonly Pr
     // `t.u` for exported binding `users`.
     const property = labelName(e.property);
     const selected = edge.importNode.names.find(item => (item.renamed ?? item.name) === property);
-    return edge.target.model.bindings.find(b => b.name === (selected?.name ?? property));
+    const name = selected?.name ?? property;
+    return findExportBinding(edge.target, name, exportsByModule);
 }

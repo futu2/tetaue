@@ -88,24 +88,20 @@ tetaue lsp [--stdio | --node-ipc | --socket=<port> | --pipe=<name>]
   checked but not written, and a module with diagnostics fails the build
   (exit 1). `--pre-hook`/`--post-hook` run shell commands around the build.
 - `watch` re-renders a file — or every `.tetaue` file under a directory — on
-  change (debounced); editing `tetaue.toml` re-checks everything. Ctrl+C quits.
+  change (debounced). Ctrl+C quits.
 - `lsp` starts the language server on stdio (or `--socket`/`--pipe`/`--node-ipc`).
 
-All commands resolve `import` statements relative to the importing file, and
-`build`/`watch` honor `[dependencies]` from the nearest `tetaue.toml`.
+All commands resolve `import` statements relative to the importing file; there
+is **no config file and no package layer** — everything a module needs is a
+file on disk reachable from it.
 
-### Build configuration and hooks
+### Build options
 
-`tetaue build` reads defaults from the nearest `tetaue.toml`'s `[build]` table;
-command-line flags override them:
+`tetaue build` takes every option from the command line:
 
-```toml
-[build]
-out     = "sql"          # output directory for rendered SQL (default dist/sql)
-dialect = "postgresql"   # default render dialect (default sqlite)
-format  = "compact"      # pretty | compact (default pretty)
-pre     = "bun run gen-schema"  # shell command run before the build
-post    = "echo done"           # shell command run after the build
+```sh
+tetaue build . --out sql --dialect postgresql --format compact \
+               --pre-hook "bun run gen-schema" --post-hook "echo done"
 ```
 
 `--no-hooks` disables both hooks; `--pre-hook`/`--post-hook` replace them for
@@ -263,11 +259,11 @@ report: query {
 ```
 
 - `import "path.tetaue"` brings the module's **exported** bindings into the
-  current module's scope (imports must come before the first binding).
-  Nothing else is visible: a binding is public only when marked `export`.
+  current module's scope. Nothing else is visible: a binding is public only
+  when marked `export`.
 - `import "path.tetaue" as t` binds one name — the namespace `t` — and
   bindings are reached qualified: `t.users`, `t.orders`. Nothing leaks into
-  the flat scope. Re-exporting is explicit (`export adult = p.adult`).
+  the flat scope.
 - **Selective imports**: `import "tables.tetaue" (users, orders)` (or
   `import "tables.tetaue" as t (users)`) brings exactly those exports —
   unlisted names stay invisible, and a listed name that is not exported is
@@ -275,55 +271,54 @@ report: query {
   `import "tables.tetaue" (users as people)` /
   `import "tables.tetaue" as t (users as people)` expose `people` /
   `t.people`.
+- **Re-exports**: `export * from "tables.tetaue"` re-exports every binding
+  the target module exports; `export { users as people } from "tables.tetaue"`
+  re-exports exactly the listed names (renamed as shown). Re-exports add to
+  the module's public surface without binding local names, so an **index
+  module** can aggregate a package: `export * from "./users"` +
+  `export * from "./orders"` in an `index.tetaue` makes
+  `import "package"` (resolved to `package/index.tetaue`) expose both.
 - Each module is its own scope: the prelude, its own imports, its own
   bindings — no module can see a sibling module's bindings or imports.
-- Paths resolve relative to the importing file; nested imports work; cycles,
-  missing files, and name collisions are reported as errors. Collisions are
-  never silent: two flat imports exporting the same name, an alias clashing
-  with an import, or a local binding shadowing an imported name are all
-  errors.
+  Imports, re-exports, `type` aliases and bindings may appear in any order
+  in a module.
+- Paths resolve **relative to the importing file**; nested imports work;
+  cycles, missing files, and name collisions are reported as errors.
+  Collisions are never silent: two flat imports exporting the same name, an
+  alias clashing with an import, a local binding shadowing an imported name,
+  or two re-exports colliding are all errors.
 
-### Libraries and tetaue.toml
+### Libraries and packages
 
-Shared modules are **libraries**. A project declares its libraries in a
-`tetaue.toml` manifest at the project root — a path dependency each:
-
-```toml
-# tetaue.toml
-[dependencies]
-acme = { path = "vendor/acme" }
-```
+There is no manifest and no package layer: a library is just a module (or a
+folder of modules) you reach with a relative path.
 
 ```tetaue
 # main.tetaue
-import "acme/tables"          # → vendor/acme/tables.tetaue (extension inferred)
-import "acme"                 # → vendor/acme/index.tetaue (a package folder)
+import "./vendor/acme/tables"     # → ./vendor/acme/tables.tetaue (extension inferred)
+import "./vendor/acme"            # → ./vendor/acme/index.tetaue (a package folder)
 ```
 
-- `import "spec"` resolves **relative to the importing file first** (as
-  always), then against the file's dependencies — found in the **nearest
-  ancestor `tetaue.toml`**. A library may carry its own `tetaue.toml`, so
-  its dependencies travel with the folder (a lib can pin its own versions).
+- `import "spec"` resolves relative to the importing file. For every
+  location three forms are tried: `spec`, `spec.tetaue`, and
+  `spec/index.tetaue` — so a folder of modules works as a package with an
+  `index.tetaue` entry that aggregates its modules with re-exports.
 - Everything is **local and per project**: no global lib directory, no
   environment variables, no install command. Getting a library is an
-  ordinary file operation — copy, symlink, or
-  `git clone <url> vendor/acme` — and deleting it removes every
-  dependency.
-- Clear errors on miss: `dependency 'acme' is not declared in tetaue.toml —
-  declared: …`, `no file 'tables' in dependency 'acme'`, broken paths and
-  malformed manifests are reported on the `import` statement.
-- **Warnings** (non-fatal, shown by `check` and the editor): a local file
-  shadowing a declared dependency, and a lib without its own `tetaue.toml`
-  whose imports fall through to the outer project's manifest (make the lib
-  self-contained).
-- **Editor integration**: `t.` completes the lib's exported bindings,
-  Ctrl+click jumps from `import "…"`/`t.users` to the lib file, hover shows
-  the lib's doc comments, and editing a lib file or `tetaue.toml`
-  revalidates the open query files that import it.
+  ordinary file operation — copy, symlink, or `git clone <url> vendor/lib` —
+  and deleting it removes every dependency. Nested imports resolve relative
+  to the importing file, so a vendored lib travels with its own sub-imports.
+- Clear errors on miss: `cannot resolve import 'acme/tables' — searched: …`
+  is reported on the `import` statement.
+- **Editor integration**: `t.` completes the namespace's exports (through
+  index re-exports too), Ctrl+click jumps from `import "…"`/`t.users` to the
+  lib file and through re-export chains to the underlying binding, hover
+  shows the lib's doc comments, and editing a lib file revalidates the open
+  query files that import it.
 
-A complete runnable project is in `examples/lib-project/` — a `tetaue.toml`,
-a vendored `acme` library that depends on `shared` through its own manifest,
-and a `main.tetaue` using flat, namespaced, and selective imports
+A complete runnable project is in `examples/lib-project/` — a vendored
+`acme` library with an `index.tetaue` aggregating its per-concern modules and
+a `main.tetaue` using flat, namespaced, and selective imports
 (`examples/selective.tetaue` shows selective imports against the flat
 examples folder).
 
@@ -709,6 +704,12 @@ LSP and compiles modules to SQL in real time.
 
 - **Live diagnostics** — the validator (interpreter + type inference) runs on
 every keystroke: errors underline in the editor and land in the Problems panel.
+- **Lazy workspace** — the server never indexes the whole opened folder. Only
+  open documents are parsed (on didOpen); imported modules are loaded on
+  demand from disk through a memoized, budgeted loader (text cached by mtime,
+  AST by content hash, per-module size budget, byte-bounded cache), so a huge
+  vendored schema library cannot OOM the process and its closure is not
+  re-parsed on every keystroke.
 - **Hover** — shows the static type of the expression under the cursor
 (`u.age : int`, `adult : { active: bool, age: int | r } -> bool`), plus the
 `#` doc-comment block of the binding it refers to.
@@ -789,9 +790,11 @@ src/language/
   types.ts              # type engine: HM unification, rows, `(maybe T)`, `?hole`s
   inference.ts          # type inference engine: prelude schemes, annotations, diagnostics
   imports.ts            # multi-file module resolution (cycles, missing files)
+  resolve.ts            # relative-path import resolution (no package layer)
+  module-cache.ts       # memoized, budgeted loader for imported modules (size limits, CST dropping)
   render.ts             # SQL renderer + dialect specs
   compile.ts            # shared compile pipeline (CLI + language server)
-  tetaue-module.ts      # Langium dependency injection (core + LSP services)
+  tetaue-module.ts      # Langium dependency injection (core + LSP services, lazy workspace manager)
   tetaue-validator.ts   # maps checker + tree diagnostics to Langium validation
   index.ts              # public API
 src/language-server.ts  # LSP entry: startTetaueServer() + tetaue/render request

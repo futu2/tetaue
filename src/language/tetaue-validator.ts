@@ -6,18 +6,29 @@
  * statement that leads to them, so a single open file shows its imports'
  * problems too.
  ******************************************************************************/
-import { readFileSync } from 'node:fs';
-import * as path from 'node:path';
 import { URI, type AstNode, type ValidationAcceptor, type ValidationChecks } from 'langium';
+import * as path from 'node:path';
 import type { Import, TetaueAstType, Model } from './generated/ast.js';
 import { parseStringLiteral, type Diagnostic } from './interpreter.js';
 import { mergeDiagnostics } from './inference.js';
 import { checkProject } from './checker.js';
 import { createImportResolver } from './resolve.js';
+import { createModuleLoader, CST_DROP_BYTES } from './module-cache.js';
 import type { TetaueServices } from './tetaue-module.js';
 import { collectModuleTree, moduleOf } from './imports.js';
 import type { ProjectModule } from './imports.js';
 import { standardPrelude } from './prelude.js';
+
+/**
+ * The LSP validator is the hot path: it runs on every keystroke for every
+ * open document. Imported modules are read/parsed through a shared loader
+ * (mtime-keyed text, hash-keyed AST, per-module size budget, byte-bounded
+ * cache) so the whole import closure is NOT re-parsed per keystroke, and
+ * modules above the CST threshold lose their CST after parsing — the only
+ * CST that must survive is the open document's, and imported diagnostics
+ * are folded onto its `import` statement anyway.
+ */
+const moduleLoader = createModuleLoader({ cstDropBytes: CST_DROP_BYTES });
 
 export function registerValidationChecks(services: TetaueServices): void {
     const registry = services.validation.ValidationRegistry;
@@ -30,26 +41,10 @@ export function registerValidationChecks(services: TetaueServices): void {
 
 export function checkModel(model: Model, accept: ValidationAcceptor, services: TetaueServices): void {
     const rootUri = model.$document?.uri.toString();
-    const { modules, importsByModule, diagnostics, warnings } = collectModuleTree({ model, uri: rootUri, imports: [] }, {
+    const { modules, importsByModule, exportsByModule, diagnostics } = collectModuleTree({ model, uri: rootUri, imports: [] }, {
         resolve: createImportResolver(),
-        read: (uri) => {
-            try {
-                return readFileSync(URI.parse(uri).fsPath, 'utf8');
-            } catch {
-                return undefined;
-            }
-        },
-        parse: (text, uri) => {
-            const result = services.parser.LangiumParser.parse(text);
-            const parseErrors = [
-                ...result.lexerErrors.map(e => e.message),
-                ...result.parserErrors.map(e => e.message),
-            ];
-            if (!result.value || parseErrors.length > 0) {
-                throw new Error(parseErrors.join('; ') || 'no parse result');
-            }
-            return result.value as Model;
-        },
+        read: moduleLoader.read,
+        parse: (text, uri) => moduleLoader.parse(text, uri, services),
     });
 
     // The root document is analyzed without the query requirement (imported
@@ -59,6 +54,7 @@ export function checkModel(model: Model, accept: ValidationAcceptor, services: T
     const { diagnostics: checked } = checkProject(modules, {
         requireQuery: false,
         importsByModule,
+        reexportsByModule: exportsByModule,
         prelude: standardPrelude(services),
     });
     // Tree diagnostics (unresolved imports, cycles, parse errors) are not
@@ -66,7 +62,6 @@ export function checkModel(model: Model, accept: ValidationAcceptor, services: T
     const merged = mergeDiagnostics(modules, diagnostics, checked);
 
     for (const diagnostic of merged) acceptFolded(diagnostic, 'error', model, modules, accept);
-    for (const warning of warnings) acceptFolded(warning, 'warning', model, modules, accept);
 }
 
 /**

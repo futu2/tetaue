@@ -26,6 +26,7 @@ import { projectTreeFor } from '../compile.js';
 import { isAccessExpression, isApplication, isIdentifier } from '../generated/ast.js';
 import type { Model } from '../generated/ast.js';
 import type { ProjectModule } from '../imports.js';
+import { effectiveExportNames } from '../imports.js';
 import { standardPrelude, standardPreludeNames } from '../prelude.js';
 
 /** Synthetic property inserted after the dot so the access parses. */
@@ -138,11 +139,11 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
         const receiver = accessNode.receiver;
         if (!receiver) return undefined;
 
-        const { modules, importsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
+        const { modules, importsByModule, exportsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
 
         // Module-qualified access `t.` — the receiver is a bare identifier
         // naming an imported namespace; suggest its EXPORTED bindings.
-        const moduleExports = moduleAliasExports(receiver, modules, importsByModule);
+        const moduleExports = moduleAliasExports(receiver, modules, importsByModule, { exportsByModule });
         if (moduleExports) {
             const replaceStart = document.textDocument.positionAt(dotPos + 1);
             const items = moduleExports
@@ -158,6 +159,7 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
         const inferred = checkProject(modules, {
             requireQuery: false,
             importsByModule,
+            reexportsByModule: exportsByModule,
             prelude: standardPrelude(this.services),
         });
         let typed: AstNode | undefined = receiver;
@@ -184,7 +186,12 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
  * of `t.` parses as an Application of a bare identifier. Undefined when the
  * receiver is not a module alias (then normal field completion applies).
  */
-function moduleAliasExports(receiver: AstNode | undefined, modules: readonly ProjectModule[], importsByModule: ReadonlyMap<ProjectModule, readonly import('../imports.js').ResolvedImportEdge[]> = new Map()): string[] | undefined {
+function moduleAliasExports(
+    receiver: AstNode | undefined,
+    modules: readonly ProjectModule[],
+    importsByModule: ReadonlyMap<ProjectModule, readonly import('../imports.js').ResolvedImportEdge[]> = new Map(),
+    exportsByModule: import('../imports.js').ExportEdgeView = { exportsByModule: new Map() },
+): string[] | undefined {
     if (!isApplication(receiver) || receiver.arguments.length > 0 || !isIdentifier(receiver.func)) return undefined;
     const alias = receiver.func.name;
     const root = modules[modules.length - 1];
@@ -193,7 +200,9 @@ function moduleAliasExports(receiver: AstNode | undefined, modules: readonly Pro
     if (edge.importNode.names.length > 0) {
         return edge.importNode.names.map(item => item.renamed ?? item.name);
     }
-    return edge.target.model.bindings.filter(b => b.export).map(b => b.name);
+    // The namespace's effective exports — including names aggregated by an
+    // index module's re-exports.
+    return effectiveExportNames(edge.target, exportsByModule);
 }
 
 /**

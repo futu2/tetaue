@@ -11,7 +11,9 @@ export type {
     Query, QueryStep, JoinKind, SetOp, SqlType, TypeOrNull,
 } from './interpreter.js';
 export { collectModuleTree, moduleOf } from './imports.js';
-export type { ProjectModule, ModuleTree, ModuleTreeOptions, ResolvedImportEdge } from './imports.js';
+export type { ProjectModule, ModuleTree, ModuleTreeOptions, ResolvedImportEdge, ResolvedExportEdge } from './imports.js';
+export { createImportResolver, resolveImport } from './resolve.js';
+export type { ResolvedImport } from './resolve.js';
 export { checkProject } from './checker.js';
 export type { CheckProjectOptions, CheckProjectResult } from './checker.js';
 export { standardPrelude, standardPreludeNames, STANDARD_PRELUDE_SOURCE } from './prelude.js';

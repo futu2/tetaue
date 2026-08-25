@@ -13,19 +13,17 @@
  * builds the typed SQL IR and emits exact-deduped diagnostics, exactly like
  * the CLI's `render`/`check`.
  ******************************************************************************/
-import { readFileSync, statSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import * as path from 'node:path';
-import { URI, type AstNode } from 'langium';
+import { type AstNode } from 'langium';
 import type { TetaueServices } from './tetaue-module.js';
 import type { Diagnostic } from './interpreter.js';
 import { checkProject } from './checker.js';
 import { renderQuery, renderQueryWithCtes, DIALECTS, isDialect } from './render.js';
 import type { RenderDiagnostic, RenderFormat } from './render.js';
 import { collectModuleTree, moduleOf } from './imports.js';
-import type { ResolvedImportEdge } from './imports.js';
+import type { ResolvedImportEdge, ResolvedExportEdge } from './imports.js';
 import type { ProjectModule } from './imports.js';
 import { createImportResolver } from './resolve.js';
+import { createModuleLoader, parseModel } from './module-cache.js';
 import type { Model } from './generated/ast.js';
 import { standardPrelude } from './prelude.js';
 
@@ -44,7 +42,6 @@ export type CompileOutcome =
         sql: string;
         /** Named query parameters in the order they were encountered. */
         parameters: string[];
-        warnings?: CompileDiagnostic[];
     }
     | { ok: false; diagnostics: CompileDiagnostic[] };
 
@@ -70,83 +67,51 @@ export interface CompileOptions {
 }
 
 /** Parse text into a Model, throwing with a message on lexer/parser errors. */
-export function parseModel(text: string, uri: string, services: TetaueServices): Model {
-    const result = services.parser.LangiumParser.parse(text);
-    const parseErrors = [
-        ...result.lexerErrors.map(e => e.message),
-        ...result.parserErrors.map(e => e.message),
-    ];
-    if (!result.value || parseErrors.length > 0) {
-        throw new Error(parseErrors.join('; ') || 'no parse result');
-    }
-    return result.value as Model;
-}
+export { parseModel } from './module-cache.js';
 
 // ---------------------------------------------------------------------------
-// Small project-tree caches.
+// Imported-module loading.
 //
-// Hover/completion/validation all call projectTreeFor on every keystroke.
+// Hover/completion/validation all build the import tree on every keystroke.
 // The root document is the caller's live parse, but imported modules are
-// plain files: cache their text by mtime and their AST by text hash so a
-// large dependency tree is not re-read and re-parsed on each request.
+// plain files: `moduleLoader` caches their text by mtime and their AST by
+// content hash (bounded by bytes, budgeted per module), so a large
+// dependency tree is not re-read and re-parsed on each request. The loader
+// intentionally does NOT drop CSTs here (positions matter for CLI
+// diagnostics); the LSP validator uses its own loader that does.
 // ---------------------------------------------------------------------------
 
-const moduleTextCache = new Map<string, { mtimeMs: number; text: string }>();
-const moduleAstCache = new Map<string, { hash: string; model: Model }>();
-const CACHE_LIMIT = 256;
+const moduleLoader = createModuleLoader();
 
-function hashText(text: string): string {
-    return createHash('sha1').update(text).digest('hex');
-}
-
-function trimCache<K, V>(cache: Map<K, V>): void {
-    if (cache.size <= CACHE_LIMIT) return;
-    for (const key of cache.keys()) {
-        cache.delete(key);
-        if (cache.size <= CACHE_LIMIT / 2) return;
-    }
-}
-
-function readModule(uri: string): string | undefined {
-    try {
-        const fsPath = URI.parse(uri).fsPath;
-        const mtimeMs = statSync(fsPath).mtimeMs;
-        const cached = moduleTextCache.get(fsPath);
-        if (cached && cached.mtimeMs === mtimeMs) return cached.text;
-        const text = readFileSync(fsPath, 'utf8');
-        trimCache(moduleTextCache);
-        moduleTextCache.set(fsPath, { mtimeMs, text });
-        return text;
-    } catch {
-        return undefined;
-    }
-}
-
-function parseModuleCached(text: string, uri: string, services: TetaueServices): Model {
-    const hash = hashText(text);
-    const key = `${uri}\u0000${hash}`;
-    const cached = moduleAstCache.get(key);
-    if (cached && cached.hash === hash) return cached.model;
-    const model = parseModel(text, uri, services);
-    trimCache(moduleAstCache);
-    moduleAstCache.set(key, { hash, model });
-    return model;
+/** Resolved module tree of a root, plus its re-export edges. */
+export interface ProjectTree {
+    modules: readonly ProjectModule[];
+    importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    exportsByModule: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]>;
+    diagnostics: readonly Diagnostic[];
 }
 
 /**
- * Resolve the import tree of a root module (root model provided by the
- * caller — the CLI's parsed file or the LSP's open document) and parse every
- * imported module from disk. Shared by the CLI, the language server's
+ * Resolve the import/export tree of a root module (root model provided by
+ * the caller — the CLI's parsed file or the LSP's open document) and parse
+ * every imported module from disk. Shared by the CLI, the language server's
  * `tetaue/render`, hover, and completion so they all see the same tree.
  */
-export function projectTreeFor(root: ProjectModule, services: TetaueServices): { modules: readonly ProjectModule[]; importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>; diagnostics: readonly Diagnostic[]; warnings: readonly Diagnostic[] } {
-    // Relative imports first, then tetaue.toml dependencies — see resolve.ts.
+export function projectTreeFor(root: ProjectModule, services: TetaueServices): ProjectTree {
+    // Imports and re-exports resolve relative to the importing file — see
+    // resolve.ts. The same loader serves both, so a diamond graph parses
+    // each module once.
     const tree = collectModuleTree(root, {
         resolve: createImportResolver(),
-        read: readModule,
-        parse: (text, uri) => parseModuleCached(text, uri, services),
+        read: moduleLoader.read,
+        parse: (text, uri) => moduleLoader.parse(text, uri, services),
     });
-    return { modules: tree.modules, importsByModule: tree.importsByModule, diagnostics: tree.diagnostics, warnings: tree.warnings };
+    return {
+        modules: tree.modules,
+        importsByModule: tree.importsByModule,
+        exportsByModule: tree.exportsByModule,
+        diagnostics: tree.diagnostics,
+    };
 }
 
 function diagnostic(d: { node?: { $cstNode?: { range: { start: { line: number; character: number } } } | null } | null; message: string }, uri: string): CompileDiagnostic {
@@ -214,13 +179,14 @@ export function compileModuleText(
         };
     }
 
-    const { modules, importsByModule, diagnostics: treeDiagnostics, warnings: treeWarnings } = projectTreeFor(main, services);
+    const { modules, importsByModule, exportsByModule, diagnostics: treeDiagnostics } = projectTreeFor(main, services);
     const { value, diagnostics: merged } = checkProject(modules, {
         requireQuery,
         // Strict main by default for render/check; `build` opts in via
         // requireMain while keeping requireQuery off (library detection).
         requireMain: requireMain ?? requireQuery,
         importsByModule,
+        reexportsByModule: exportsByModule,
         entryBinding: binding,
         prelude: standardPrelude(services),
     });
@@ -230,7 +196,6 @@ export function compileModuleText(
         const m = moduleOf(d.node, modules) ?? main;
         all.push(diagnostic(d, m.uri ?? rootUri));
     }
-    const warningList: CompileDiagnostic[] = treeWarnings.map(d => diagnostic(d, (moduleOf(d.node, modules) ?? main).uri ?? rootUri));
 
     if (all.length > 0 || value.kind === 'error') {
         return { ok: false, diagnostics: all };
@@ -246,5 +211,5 @@ export function compileModuleText(
             diagnostics: rendered.diagnostics.map(d => renderDiagnostic(d, rootUri, modules, main)),
         };
     }
-    return { ok: true, sql: rendered.sql, parameters: rendered.parameters, warnings: warningList };
+    return { ok: true, sql: rendered.sql, parameters: rendered.parameters };
 }
