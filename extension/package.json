@@ -66,6 +66,12 @@
           "default": true,
           "description": "Render the module to SQL in the Tetaue output panel whenever a .tetaue file is saved."
         },
+        "tetaue.validationDelayMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "description": "Milliseconds of typing pause before the language server re-checks the document and publishes diagnostics. Higher values make typing feel lighter on large modules; 0 checks on every keystroke."
+        },
         "tetaue.copyToClipboardOnRender": {
           "type": "boolean",
           "default": false,
