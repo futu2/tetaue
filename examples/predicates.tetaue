@@ -4,5 +4,13 @@
 # has an `age` column. Because it is exported as a scheme, the polymorphism
 # survives qualified access: `p.adult` instantiates fresh row variables at
 # every use.
+#
+# As in tables.tetaue, the `main` binding makes this a runnable example too:
+# rendering it applies `adult` to a bare table whose open row gains the
+# `age` column — the predicate is polymorphic, so `SELECT * FROM members
+# WHERE age >= 18` needs no schema. Importers never see `main` (not exported).
 
 export adult = u => u.age >= 18
+
+# adult on a bare table with an open row: the row gains the age column.
+main = table "members" & filter adult

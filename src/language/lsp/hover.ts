@@ -11,15 +11,13 @@ import { readFileSync } from 'node:fs';
 import type { HoverProvider } from 'langium/lsp';
 import { Hover, HoverParams, MarkupKind } from 'vscode-languageserver';
 import type { TetaueServices } from '../tetaue-module.js';
-import { checkProject } from '../checker.js';
-import { projectTreeFor } from '../compile.js';
+import { checkedProjectForDocument } from './document-analysis.js';
 import { moduleOf } from '../imports.js';
 import type { ProjectModule } from '../imports.js';
 import { isAccessExpression, isBinding, isIdentifier } from '../generated/ast.js';
 import type { Binding, Model } from '../generated/ast.js';
 import { moduleQualifiedBinding } from './module-access.js';
 import { labelName } from '../strings.js';
-import { standardPrelude } from '../prelude.js';
 
 export class TetaueHoverProvider implements HoverProvider {
     constructor(private readonly services: TetaueServices) {}
@@ -32,20 +30,19 @@ export class TetaueHoverProvider implements HoverProvider {
         const node = leaf?.astNode;
         if (!node) return undefined;
 
-        const { modules, importsByModule, exportsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
-        const result = checkProject(modules, {
-            requireQuery: false,
-            importsByModule,
-            reexportsByModule: exportsByModule,
-            prelude: standardPrelude(this.services),
-        });
+        // The per-document analysis is memoized: hover reuses the typed check
+        // (and the import tree) from the last validation unless the document
+        // or an imported file changed — no re-analysis of the dependency
+        // graph per hover, which is what made hovering imported values slow.
+        const { tree, checked } = checkedProjectForDocument(document, this.services);
+        const { modules, importsByModule, exportsByModule } = tree;
 
         // Walk up to the nearest node with a recorded type (leaf terminals
         // belong to their owning AST node, which is already recorded).
         let typed: AstNode | undefined = node;
-        while (typed && !result.nodeTypes.has(typed)) typed = typed.$container;
+        while (typed && !checked.nodeTypes.has(typed)) typed = typed.$container;
         if (!typed) return undefined;
-        const typeText = result.typeOf(typed);
+        const typeText = checked.typeOf(typed);
         if (typeText === undefined) return undefined;
 
         const parts: string[] = [];

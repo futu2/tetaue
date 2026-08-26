@@ -6,6 +6,10 @@
 # Only `export`ed bindings are visible to importers — everything else is
 # module-private. `import "tables.tetaue"` brings the exported bindings into
 # scope; `import "tables.tetaue" as t` reaches them qualified as `t.users`.
+#
+# The `main` binding makes this file a runnable example too: `tetaue render
+# tables.tetaue` shows the users table. Importers never see `main` (it is not
+# exported), so it stays a shared module for the other examples.
 
 export users: query {
     id: int,
@@ -20,3 +24,6 @@ export orders: query {
     total: float,
     status: string,
 } = table "orders"
+
+# users is this module's query.
+main = users

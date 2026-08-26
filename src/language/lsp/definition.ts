@@ -16,7 +16,7 @@ import {
     isAccessExpression, isIdentifier, isImport,
 } from '../generated/ast.js';
 import type { Import, Model } from '../generated/ast.js';
-import { projectTreeFor } from '../compile.js';
+import { treeFor } from './document-analysis.js';
 import { parseStringLiteral } from '../interpreter.js';
 import { resolveImport } from '../resolve.js';
 import { moduleOf } from '../imports.js';
@@ -34,7 +34,7 @@ export class TetaueDefinitionProvider implements DefinitionProvider {
         const node = leaf?.astNode;
         if (!node) return undefined;
 
-        const { modules, importsByModule, exportsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
+        const { modules, importsByModule, exportsByModule } = treeFor(model, document.uri.toString(), this.services);
 
         // 1. `import "path"` (clicked on the keyword or the string).
         const imp = importOf(node);

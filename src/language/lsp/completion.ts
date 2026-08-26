@@ -21,13 +21,12 @@ import {
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, Range, TextEdit,
 } from 'vscode-languageserver';
 import type { TetaueServices } from '../tetaue-module.js';
-import { checkProject } from '../checker.js';
-import { projectTreeFor } from '../compile.js';
+import { checkedProjectFor } from './document-analysis.js';
 import { isAccessExpression, isApplication, isIdentifier } from '../generated/ast.js';
 import type { Model } from '../generated/ast.js';
 import type { ProjectModule } from '../imports.js';
 import { effectiveExportNames } from '../imports.js';
-import { standardPrelude, standardPreludeNames } from '../prelude.js';
+import { standardPreludeNames } from '../prelude.js';
 
 /** Synthetic property inserted after the dot so the access parses. */
 const DUMMY = '_tetaue_field';
@@ -139,7 +138,12 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
         const receiver = accessNode.receiver;
         if (!receiver) return undefined;
 
-        const { modules, importsByModule, exportsByModule } = projectTreeFor({ model, uri: document.uri.toString(), imports: [] }, this.services);
+        // The synthetic text differs from the document text only after the
+        // cursor, so consecutive keystrokes inside the same expression share
+        // one `modified` text — the per-document analysis cache serves them
+        // without re-analyzing the import graph.
+        const { tree, checked } = checkedProjectFor(model, document.uri.toString(), modified, this.services);
+        const { modules, importsByModule, exportsByModule } = tree;
 
         // Module-qualified access `t.` — the receiver is a bare identifier
         // naming an imported namespace; suggest its EXPORTED bindings.
@@ -156,16 +160,10 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
             return CompletionList.create(items, false);
         }
 
-        const inferred = checkProject(modules, {
-            requireQuery: false,
-            importsByModule,
-            reexportsByModule: exportsByModule,
-            prelude: standardPrelude(this.services),
-        });
         let typed: AstNode | undefined = receiver;
-        while (typed && !inferred.nodeTypes.has(typed)) typed = typed.$container;
+        while (typed && !checked.nodeTypes.has(typed)) typed = typed.$container;
         if (!typed) return undefined;
-        const fields = inferred.fieldsOf(typed);
+        const fields = checked.fieldsOf(typed);
         if (!fields || fields.length === 0) return undefined;
 
         const replaceStart = document.textDocument.positionAt(dotPos + 1);

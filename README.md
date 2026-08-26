@@ -709,7 +709,10 @@ every keystroke: errors underline in the editor and land in the Problems panel.
   demand from disk through a memoized, budgeted loader (text cached by mtime,
   AST by content hash, per-module size budget, byte-bounded cache), so a huge
   vendored schema library cannot OOM the process and its closure is not
-  re-parsed on every keystroke.
+  re-parsed on every keystroke. The expensive typed check is memoized per
+  document and shared by validation, hover and completion — hovering an
+  imported value reuses the analysis instead of re-type-checking the whole
+  dependency graph on every request.
 - **Hover** — shows the static type of the expression under the cursor
 (`u.age : int`, `adult : { active: bool, age: int | r } -> bool`), plus the
 `#` doc-comment block of the binding it refers to.
@@ -768,6 +771,9 @@ by both the CLI and `tetaue/render`, so they never disagree.
 - `src/language/lsp/completion.ts` — `.`-field completion on a synthetic
 parse (inserts a dummy property, balances delimiters) so the real checker
 resolves the receiver's row even mid-typing.
+- `src/language/lsp/document-analysis.ts` — the LSP's shared per-document
+analysis: one memoized typed check per document state, reused by
+validation / hover / completion.
 - `src/language/lsp/formatter.ts` — token-stream formatter: canonical spacing
 and depth-aware indentation, layout-preserving (keeps line breaks), `-`-safe.
 - `src/language/lsp/semantic-tokens.ts` — grammar-aware highlighting: builtins,

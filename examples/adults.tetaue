@@ -1,6 +1,6 @@
 # tetaue — the classic "adults" query.
 #
-# A module is a list of bindings; the LAST binding is the module's query.
+# A module is a list of bindings; the `main` binding is the module's query.
 # Bindings need no terminator — `users: query { ... } = table "users"` is a
 # binding with a type annotation, and the next binding starts right after it.
 # `table` is an ordinary function (`table : string -> query r`); the query

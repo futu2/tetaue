@@ -5,8 +5,10 @@
 # scope. Only `export`ed bindings are visible through the namespace; a
 # missing export is an error ("module 't' has no exported binding ...").
 #
-# Re-exporting works by exporting a binding whose value is imported:
-# `export adult = p.adult` re-exports the helper under the same name.
+# Re-exporting adds a name to this module's public surface without binding
+# it locally: `export adult = p.adult` re-exports the imported value, and the
+# dedicated form `export { adult } from "./predicates"` re-exports the
+# target's export directly (index modules use `export * from "..."`).
 
 import "tables.tetaue" as t
 import "predicates.tetaue" as p

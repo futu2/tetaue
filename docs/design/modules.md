@@ -350,10 +350,17 @@ dependency graph:
   loader (`module-cache.ts`): text is read once per mtime, a module's AST is
   parsed once per content hash and cached under a byte budget (not per
   keystroke), modules over the per-module size budget degrade to
-  "module too large to analyze" instead of crashing, and the validator's
-  loader drops the CST of large imported modules after parsing (diagnostics
-  are folded onto the open document's `import` statement, so positions
-  survive) — the server retains no unbounded AST/CST.
+  "module too large to analyze" instead of crashing, and large imported
+  modules lose their CST after parsing (diagnostics are folded onto the open
+  document's `import` statement, so positions survive) — the server retains
+  no unbounded AST/CST.
+- The typed check is **memoized per document** (`lsp/document-analysis.ts`):
+  the validator, hover and completion share ONE `checkProject` result per
+  document state, invalidated only when the document text or any imported
+  file's content changes. Hovering an imported value therefore does not
+  re-type-check the whole dependency graph on every request; the import tree
+  itself is rebuilt cheaply (statSync + memoized reads) per request for
+  cycle/missing-file diagnostics.
 - `t.` completion suggests the namespace's *effective* exports (through
   index re-exports). Go-to-definition: `import "…"` → the resolved file,
   `t.binding` → the export in the lib (following re-export chains to the

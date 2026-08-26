@@ -27,6 +27,8 @@ import type { Model } from './generated/ast.js';
 export const DEFAULT_MODULE_BUDGET_BYTES = 4 * 1024 * 1024;
 /** Total AST-retention budget for imported modules (bytes of source text). */
 export const DEFAULT_AST_CACHE_BYTES = 64 * 1024 * 1024;
+/** Total source-text retention budget (bytes). */
+export const DEFAULT_TEXT_CACHE_BYTES = 32 * 1024 * 1024;
 /** LSP-only: imported modules above this size lose their CST after parsing. */
 export const CST_DROP_BYTES = 512 * 1024;
 
@@ -43,6 +45,8 @@ export interface ModuleLoaderOptions {
     maxModuleBytes?: number;
     /** Total AST cache budget: oldest cached ASTs are evicted past this. */
     maxCacheBytes?: number;
+    /** Total source-text cache budget: oldest texts are evicted past this. */
+    maxTextBytes?: number;
     /** Drop the CST of imported modules above this size (0 = never drop). */
     cstDropBytes?: number;
 }
@@ -52,6 +56,12 @@ export interface ModuleLoader {
     read(uri: string): string | undefined;
     /** Parse module text into a Model; throws `ModuleTooLargeError` and parse errors. */
     parse(text: string, uri: string, services: TetaueServices): Model;
+    /**
+     * Content version of a loaded module (its text hash, from the mtime-keyed
+     * text cache). Undefined when the module was never read. Used by the LSP's
+     * per-document analysis cache to detect "nothing imported changed".
+     */
+    versionOf(uri: string): string | undefined;
 }
 
 function hashText(text: string): string {
@@ -66,6 +76,9 @@ function formatBytes(bytes: number): string {
 
 interface TextEntry {
     mtimeMs: number;
+    /** Content hash, shared with the AST cache key (cheap change detection). */
+    hash: string;
+    bytes: number;
     text: string;
 }
 
@@ -80,12 +93,24 @@ interface AstEntry {
 export function createModuleLoader(options: ModuleLoaderOptions = {}): ModuleLoader {
     const maxModuleBytes = options.maxModuleBytes ?? DEFAULT_MODULE_BUDGET_BYTES;
     const maxCacheBytes = options.maxCacheBytes ?? DEFAULT_AST_CACHE_BYTES;
+    const maxTextBytes = options.maxTextBytes ?? DEFAULT_TEXT_CACHE_BYTES;
     const cstDropBytes = options.cstDropBytes ?? 0;
 
     // Insertion-ordered: the Map's first keys are the oldest entries.
     const textCache = new Map<string, TextEntry>();
+    let textBytes = 0;
     const astCache = new Map<string, AstEntry>();
     let astBytes = 0;
+
+    /** Evict oldest text entries until the cache fits its byte budget. */
+    const trimText = (): void => {
+        while (textBytes > maxTextBytes && textCache.size > 1) {
+            const oldest = textCache.keys().next().value as string;
+            const evicted = textCache.get(oldest)!;
+            textCache.delete(oldest);
+            textBytes -= evicted.bytes;
+        }
+    };
 
     const read = (uri: string): string | undefined => {
         try {
@@ -94,8 +119,21 @@ export function createModuleLoader(options: ModuleLoaderOptions = {}): ModuleLoa
             const cached = textCache.get(fsPath);
             if (cached && cached.mtimeMs === mtimeMs) return cached.text;
             const text = readFileSync(fsPath, 'utf8');
-            textCache.set(fsPath, { mtimeMs, text });
+            const entry: TextEntry = { mtimeMs, hash: hashText(text), bytes: text.length, text };
+            const prev = textCache.get(fsPath);
+            if (prev) textBytes -= prev.bytes;
+            textCache.set(fsPath, entry);
+            textBytes += entry.bytes;
+            trimText();
             return text;
+        } catch {
+            return undefined;
+        }
+    };
+
+    const versionOf = (uri: string): string | undefined => {
+        try {
+            return textCache.get(URI.parse(uri).fsPath)?.hash;
         } catch {
             return undefined;
         }
@@ -127,7 +165,7 @@ export function createModuleLoader(options: ModuleLoaderOptions = {}): ModuleLoa
         return model;
     };
 
-    return { read, parse };
+    return { read, parse, versionOf };
 }
 
 /** Parse text into a Model, throwing with a message on lexer/parser errors. */

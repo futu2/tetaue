@@ -11,24 +11,10 @@ import * as path from 'node:path';
 import type { Import, TetaueAstType, Model } from './generated/ast.js';
 import { parseStringLiteral, type Diagnostic } from './interpreter.js';
 import { mergeDiagnostics } from './inference.js';
-import { checkProject } from './checker.js';
-import { createImportResolver } from './resolve.js';
-import { createModuleLoader, CST_DROP_BYTES } from './module-cache.js';
+import { checkedProjectFor } from './lsp/document-analysis.js';
 import type { TetaueServices } from './tetaue-module.js';
-import { collectModuleTree, moduleOf } from './imports.js';
+import { moduleOf } from './imports.js';
 import type { ProjectModule } from './imports.js';
-import { standardPrelude } from './prelude.js';
-
-/**
- * The LSP validator is the hot path: it runs on every keystroke for every
- * open document. Imported modules are read/parsed through a shared loader
- * (mtime-keyed text, hash-keyed AST, per-module size budget, byte-bounded
- * cache) so the whole import closure is NOT re-parsed per keystroke, and
- * modules above the CST threshold lose their CST after parsing — the only
- * CST that must survive is the open document's, and imported diagnostics
- * are folded onto its `import` statement anyway.
- */
-const moduleLoader = createModuleLoader({ cstDropBytes: CST_DROP_BYTES });
 
 export function registerValidationChecks(services: TetaueServices): void {
     const registry = services.validation.ValidationRegistry;
@@ -40,26 +26,22 @@ export function registerValidationChecks(services: TetaueServices): void {
 }
 
 export function checkModel(model: Model, accept: ValidationAcceptor, services: TetaueServices): void {
-    const rootUri = model.$document?.uri.toString();
-    const { modules, importsByModule, exportsByModule, diagnostics } = collectModuleTree({ model, uri: rootUri, imports: [] }, {
-        resolve: createImportResolver(),
-        read: moduleLoader.read,
-        parse: (text, uri) => moduleLoader.parse(text, uri, services),
-    });
+    const document = model.$document;
+    const rootText = document?.textDocument.getText() ?? '';
+    // The analysis runs through the shared per-document cache
+    // (`document-analysis.ts`): one typed check per document state, reused by
+    // hover/completion, so validation does not re-type-check the whole
+    // dependency graph on every keystroke.
+    const { tree, checked } = checkedProjectFor(model, document?.uri.toString() ?? '', rootText, services);
+    const { modules, diagnostics } = tree;
 
     // The root document is analyzed without the query requirement (imported
     // helper modules legitimately end in non-query bindings); the CLI enforces
     // it for the root. The checker runs IR construction and type inference as
     // one pass and returns the exact-deduped diagnostics.
-    const { diagnostics: checked } = checkProject(modules, {
-        requireQuery: false,
-        importsByModule,
-        reexportsByModule: exportsByModule,
-        prelude: standardPrelude(services),
-    });
     // Tree diagnostics (unresolved imports, cycles, parse errors) are not
     // produced by the checker, so fold them into the same exact-deduped list.
-    const merged = mergeDiagnostics(modules, diagnostics, checked);
+    const merged = mergeDiagnostics(modules, diagnostics, checked.diagnostics);
 
     for (const diagnostic of merged) acceptFolded(diagnostic, 'error', model, modules, accept);
 }
