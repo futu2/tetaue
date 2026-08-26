@@ -174,6 +174,26 @@ describe('semantic errors', () => {
         expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");
     });
 
+    test('this/that inside an explicit lambda body are errors like $n', () => {
+        const messages = errors(`
+            users: query { id: int } = table "users"
+            q = users & filter (u => this.id == that.id)
+        `);
+        expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");
+        expect(messages.join('\n')).toContain("unknown lambda parameter '$2'");
+    });
+
+    test('$n inside a nested parenthesized argument is its own implicit lambda', () => {
+        // The inner `filter` predicate is a parenthesized argument — its own
+        // implicit-lambda scope — so `$1` is not captured by the outer `u`
+        // lambda nor treated as an unbound parameter of it.
+        const messages = errors(`
+            s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
+            main = s03_corp_chrem_tx_dtl & filter (u => exists (filter (cast $1.pt_dt "date" <= u.pt_dt) s03_corp_chrem_tx_dtl))
+        `);
+        expect(messages).toEqual([]);
+    });
+
     test('unbound $n at the top level is an error', () => {
         const messages = errors(`
             users: query { id: int } = table "users"

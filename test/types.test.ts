@@ -398,6 +398,32 @@ describe('type errors', () => {
         expect(typeErrors(`${USERS}\nq = users & filter 5`)).not.toEqual([]);
     });
 
+    test('$n inside a query-argument nested filter stays a query, not a lambda', () => {
+        // The `$`-right operand `filter (P2) s03` and the `exists` argument
+        // are queries whose filter predicates own their `$1` implicit lambdas;
+        // neither side may be abstracted into a whole-argument lambda.
+        expect(allErrors(`
+            s03: query { pt_dt: date } = table "s03"
+            main = filter (cast $1.pt_dt "date" >= date "2025-12-31") $ filter (cast $1.pt_dt "date" <= current_date) s03
+        `)).toEqual([]);
+        expect(allErrors(`
+            s03: query { pt_dt: date } = table "s03"
+            main = s03 & filter (u => exists (filter (cast $1.pt_dt "date" <= u.pt_dt) s03))
+        `)).toEqual([]);
+    });
+
+    test('this/that type exactly like $1/$2', () => {
+        expect(allErrors(`
+            s03: query { pt_dt: date } = table "s03"
+            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03
+        `)).toEqual([]);
+        expect(allErrors(`
+            users: query { id: int } = table "users"
+            orders: query { user_id: int, status: string } = table "orders"
+            main = users & joinInner orders (this.id == that.user_id) { uid = this.id, status = that.status }
+        `)).toEqual([]);
+    });
+
     test('map with a scalar projection is rejected', () => {
         expect(allErrors(`${USERS}\nq = users & map (u => u.age)`).join('\n')).toContain('projection must be a record');
     });

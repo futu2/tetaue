@@ -37,7 +37,7 @@ import { moduleOf } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
 import { checkBinding, missingBindingExpressionMessage, parseStringLiteral } from './interpreter.js';
 import type { Diagnostic, Value } from './interpreter.js';
-import { labelName } from './strings.js';
+import { implicitParamName, labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
 import { CAST_TYPES, LIST_ARITY, coreBuiltinName, CORE_TYPE_NAMES, type CoreTypeName } from './builtin.js';
 import {
@@ -658,7 +658,11 @@ export class Inferencer {
         if (isOperatorSection(e)) return this.inferOperatorSection(e, env);
         if (isIdentifier(e)) {
             const scheme = env.get(e.name);
-            return scheme ? this.u.instantiate(scheme) : this.u.fresh(); // unknown ids are the interpreter's call
+            if (scheme) return this.u.instantiate(scheme);
+            // `this`/`that` sugar for the first two implicit lambda parameters.
+            const dollar = implicitParamName(e.name);
+            const param = dollar && env.get(dollar);
+            return param ? this.u.instantiate(param) : this.u.fresh(); // unknown ids are the interpreter's call
         }
         if (isDollarParam(e)) {
             const scheme = env.get(e.value);
@@ -2695,21 +2699,27 @@ export class Inferencer {
     private dollarArity(node: AstNode, env: Map<string, Scheme>): number {
         let arity = 0;
         // Walk the AST subtree; `$n` nodes not bound in `env` and not hidden
-        // inside an explicit lambda body contribute their index.
+        // behind an explicit lambda body contribute their index. An argument
+        // in a FUNCTION position of an application (by its callee's scheme) is
+        // its own implicit-lambda scope and does not leak its $n outward, nor
+        // does it let $n be captured by an explicit lambda further out
+        // (mirrors interpreter.dollarArity).
         const stack: AstNode[] = [node];
         while (stack.length > 0) {
             const cur = stack.pop()!;
             if (isDollarParam(cur)) {
-                if (!env.has(cur.value)) {
-                    let hidden = false;
-                    let node2: AstNode | undefined = cur;
-                    while (node2) {
-                        const parent: AstNode | undefined = node2.$container;
-                        if (!parent) break;
-                        if (isLambda(parent) && parent.body === node2) { hidden = true; break; }
-                        node2 = parent;
-                    }
-                    if (!hidden) arity = Math.max(arity, Number(cur.value.slice(1)));
+                if (!env.has(cur.value) && !this.hiddenBehindLambda(cur, env)) {
+                    arity = Math.max(arity, Number(cur.value.slice(1)));
+                }
+                continue;
+            }
+            // `this`/`that` sugar: an unbound identifier naming an implicit
+            // parameter ($1/$2) counts like a DollarParam, unless shadowed by
+            // a binding or an already-bound $n of the same name.
+            if (isIdentifier(cur) && !env.has(cur.name)) {
+                const dollar = implicitParamName(cur.name);
+                if (dollar && !env.has(dollar) && !this.hiddenBehindLambda(cur, env)) {
+                    arity = Math.max(arity, Number(dollar.slice(1)));
                 }
                 continue;
             }
@@ -2717,13 +2727,65 @@ export class Inferencer {
                 if (key.startsWith('$')) continue;
                 const value = (cur as unknown as Record<string, unknown>)[key];
                 if (Array.isArray(value)) {
-                    for (const v of value) if (v && typeof v === 'object' && '$type' in (v as object)) stack.push(v as AstNode);
+                    const skipFnArgs = key === 'arguments' && isApplication(cur) ? this.fnArgIndexesOf(cur, env) : undefined;
+                    for (let i = 0; i < value.length; i++) {
+                        const v = value[i];
+                        if (!v || typeof v !== 'object' || !('$type' in (v as object))) continue;
+                        if (skipFnArgs?.has(i)) continue;
+                        stack.push(v as AstNode);
+                    }
                 } else if (value && typeof value === 'object' && '$type' in (value as object)) {
                     stack.push(value as AstNode);
                 }
             }
         }
         return arity;
+    }
+
+    /**
+     * Is `node` inside an explicit lambda body WITHOUT an intervening implicit
+     * scope? `$n` belongs to an explicit lambda only when no function-position
+     * application argument sits between it and that lambda (mirrors the
+     * interpreter's hiddenBehindLambda).
+     */
+    private hiddenBehindLambda(node: AstNode, env: Map<string, Scheme>): boolean {
+        let cur: AstNode | undefined = node;
+        while (cur) {
+            const parent: AstNode | undefined = cur.$container;
+            if (!parent) break;
+            if (isLambda(parent) && parent.body === cur) return true;
+            if (isApplication(parent)) {
+                const index = parent.arguments.indexOf(cur as import('./generated/ast.js').Expr);
+                if (index >= 0 && this.fnArgIndexesOf(parent, env).has(index)) return false;
+            }
+            cur = parent;
+        }
+        return false;
+    }
+
+    /**
+     * Argument indexes of `app` that consume a function — derived from the
+     * callee's scheme in scope (builtins and user bindings alike).
+     */
+    private fnArgIndexesOf(app: import('./generated/ast.js').Application, env: Map<string, Scheme>): Set<number> {
+        if (!isIdentifier(app.func)) return new Set();
+        const scheme = env.get(app.func.name);
+        return scheme ? this.fnArgIndexes(scheme.type) : new Set();
+    }
+
+    /** Indexes of a curried type's parameters whose (peeled) type is a function. */
+    private fnArgIndexes(t: Type): Set<number> {
+        const out = new Set<number>();
+        let cur: Type | undefined = t;
+        let index = 0;
+        while (cur) {
+            const r = this.u.peel(cur);
+            if (r.kind !== 'fun') break;
+            if (this.u.peel(r.from).kind === 'fun') out.add(index);
+            cur = r.to;
+            index++;
+        }
+        return out;
     }
 }
 

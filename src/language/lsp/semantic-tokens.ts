@@ -31,6 +31,7 @@ import {
     isRecordField, isStringLiteral, isTypeAtom, isTypeHole, isTypeVar, isUnaryMinus,
 } from '../generated/ast.js';
 import type { Model } from '../generated/ast.js';
+import { implicitParamName } from '../strings.js';
 
 export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
     private readonly standardNames: ReadonlySet<string>;
@@ -164,11 +165,14 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
 
         // --- references -------------------------------------------------------
         if (isIdentifier(node)) {
-            const { type, modifier } = this.referenceType(node, node.name);
+            const { type, modifier, resolved } = this.referenceType(node, node.name);
+            // `this`/`that` sugar: an unresolvable occurrence is an implicit
+            // lambda parameter (the first/second row binding).
+            const final = !resolved && implicitParamName(node.name) ? 'parameter' : type;
             if (modifier) {
-                acceptor({ node, property: 'name', type, modifier });
+                acceptor({ node, property: 'name', type: final, modifier });
             } else {
-                acceptor({ node, property: 'name', type });
+                acceptor({ node, property: 'name', type: final });
             }
         }
     }
@@ -178,11 +182,12 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
      * scope first: an enclosing lambda parameter, then a same-module binding,
      * then an import alias, then the prelude. Prelude builtins are `function`
      * with the `defaultLibrary` modifier; bindings whose value is a lambda are
-     * `function`, everything else `variable`.
+     * `function`, everything else `variable`. `resolved` is false only for the
+     * unresolvable fallback (unknown names and `this`/`that` sugar).
      */
-    private referenceType(node: AstNode, name: string): { type: string; modifier?: string } {
+    private referenceType(node: AstNode, name: string): { type: string; modifier?: string; resolved: boolean } {
         if (this.enclosingLambdaParam(node, name)) {
-            return { type: 'parameter' };
+            return { type: 'parameter', resolved: true };
         }
         const root = this.currentDocument?.parseResult.value as Model | undefined;
         if (root) {
@@ -191,17 +196,17 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
             for (let i = root.bindings.length - 1; i >= 0; i--) {
                 const binding = root.bindings[i]!;
                 if (binding.name === name) {
-                    return binding.value && isLambdaValue(binding.value) ? { type: 'function' } : { type: 'variable' };
+                    return binding.value && isLambdaValue(binding.value) ? { type: 'function', resolved: true } : { type: 'variable', resolved: true };
                 }
             }
             if (root.imports.some(imp => imp.alias === name)) {
-                return { type: 'namespace' };
+                return { type: 'namespace', resolved: true };
             }
         }
         if (this.standardNames.has(name)) {
-            return { type: 'function', modifier: 'defaultLibrary' };
+            return { type: 'function', modifier: 'defaultLibrary', resolved: true };
         }
-        return { type: 'variable' };
+        return { type: 'variable', resolved: false };
     }
 
     /**

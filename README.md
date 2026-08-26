@@ -652,18 +652,29 @@ Lambdas abstract over a row. Two ways to write them:
 
 - **Implicit (`$n`)** — a parenthesized expression using `$1`, `$2`, ... is a lambda
   whose parameters are the row bindings in order: `($1 + 3)` ≡ `u => u + 3`,
-  `($1 + $2)` ≡ `$1 => $2 => $1 + $2`. The highest `$n` used sets the arity:
+  `($1 + $2)` ≡ `$1 => $2 => $1 + $2`. The highest `$n` used sets the arity.
+  `this` / `that` are sugar for `$1` / `$2` — `filter (this.active)` ≡
+  `filter ($1.active)` and `joinInner orders (this.id == that.user_id)` ≡
+  `($1.id == $2.user_id)`. They stay ordinary identifiers when a binding of the
+  same name is in scope:
   ```
   filter ($1.active && $1.age >= 18)          # ≡ filter (u => u.active && u.age >= 18)
   map { id = $1.id, name = $1.name }          # braces delimit the lambda — no extra parens
-  joinInner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.id }   # $1 left row, $2 right row; the merger projects the result row
+  joinInner orders (this.id == that.user_id) { uid = this.id }   # this left row, that right row
   ```
-  Parens inside are pure grouping: `map { a = ($1.id + 1) }` means exactly the same
-  as `map { a = $1.id + 1 }` — `$n` binds to the enclosing argument (the outermost
-  lambda), never to an inner pair of parens.
+  Parens inside an argument are pure grouping: `map { a = ($1.id + 1) }` means
+  exactly the same as `map { a = $1.id + 1 }`. A FUNCTION-position argument of a
+  nested call — a position whose callee takes a lambda, like `filter`'s predicate
+  or a join's ON/merger — opens its own implicit-lambda scope: in
+  `filter (P1) $ filter (P2) s03` the `$1` inside `P2` is the inner `filter`'s
+  predicate parameter, and `joinInner orders ($1.id == $2.user_id) { ... }` scopes
+  `$1`/`$2` to the join's ON lambda. So `$n` binds to the nearest enclosing
+  lambda-taking argument — never through a lambda-taking position, and never
+  directly inside an explicit lambda body.
 - **Explicit** — `u => u.age >= 18`. Lambdas are curried: a two-argument function
   is `l => r => l.id == r.user_id` (there is no `(l, r) => ...` form). `$n` is not
-  available inside an explicit body.
+  available directly inside an explicit body — it must sit in its own nested
+  lambda-taking argument, e.g. `filter (u => exists (filter (cast $1.x "int" >= 0) t))`.
 
 A lambda body extends until the next `&` (pipeline) or `$` (application) at the same
 level — `joinInner orders (l => r => l.id == r.user_id) (l => r => { id = l.id }) & take 3`

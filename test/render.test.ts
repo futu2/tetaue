@@ -690,6 +690,81 @@ describe('implicit lambda parameters ($n)', () => {
         expect(sql).toContain('WHERE age >= 18');
     });
 
+    test('this/that are sugar for $1/$2', () => {
+        const sql = render(`
+            users: query { id: int, active: bool, age: int } = table "users"
+            orders: query { user_id: int, total: float, status: string } = table "orders"
+            q = users
+                & filter (this.active && this.age >= 18)
+                & joinInner orders (this.id == that.user_id) { uid = this.id, status = that.status }
+        `);
+        expect(sql).toContain([
+            'WHERE',
+            '    users.active',
+            '    AND users.age >= 18',
+        ].join('\n'));
+        expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id');
+    });
+
+    test('this/that stay ordinary names when a binding shadows them', () => {
+        const sql = render(`
+            ${USERS}
+            this = 5
+            q = users & filter (u => u.id == this)
+        `);
+        expect(sql).toContain('WHERE id = 5');
+    });
+
+    test('this/that work through the $ application operator', () => {
+        const sql = render(`
+            s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
+            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03_corp_chrem_tx_dtl
+        `);
+        expect(sql).toContain([
+            'WHERE',
+            '    CAST(pt_dt AS DATE) <= CURRENT_DATE',
+            "    AND CAST(pt_dt AS DATE) >= '2025-12-31'",
+        ].join('\n'));
+    });
+
+    test('$n predicates scope to their own filter across $ application', () => {
+        // `$1` inside each parenthesized filter predicate is that filter's
+        // row parameter; the `$`-right operand must NOT be abstracted as a
+        // whole lambda (step applied to a lambda would be a type error).
+        const sql = render(`
+            s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
+            main = filter (cast $1.pt_dt "date" >= date "2025-12-31") $ filter (cast $1.pt_dt "date" <= current_date) s03_corp_chrem_tx_dtl
+        `);
+        expect(sql).toContain([
+            'WHERE',
+            '    CAST(pt_dt AS DATE) <= CURRENT_DATE',
+            "    AND CAST(pt_dt AS DATE) >= '2025-12-31'",
+        ].join('\n'));
+    });
+
+    test('$n in a filter nested inside an explicit lambda scopes to the inner filter', () => {
+        // The inner `filter` predicate is a parenthesized argument — its own
+        // implicit-lambda scope — so `$1` is NOT captured by the outer `u`
+        // lambda; the explicit-lambda hiding walk stops at the boundary.
+        const sql = render(`
+            s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
+            main = s03_corp_chrem_tx_dtl & filter (u => exists (filter (cast $1.pt_dt "date" <= u.pt_dt) s03_corp_chrem_tx_dtl))
+        `);
+        expect(sql).toContain('EXISTS (SELECT * FROM s03_corp_chrem_tx_dtl WHERE CAST(pt_dt AS DATE) <= pt_dt)');
+        expect(sql).not.toContain('unknown lambda parameter');
+    });
+
+    test('$n in a VALUE-position argument bubbles up to the enclosing lambda', () => {
+        // `is_in`'s first argument is a value expression, not a function
+        // position — `$1` inside its nested call is the `filter` row, so the
+        // predicate is abstracted as one lambda (the lpbirthday pattern).
+        const sql = render(`
+            users: query { id: int, active: bool } = table "users"
+            q = users & filter (is_in (from_maybe 0 $1.id) [1, 2, 3])
+        `);
+        expect(sql).toContain('WHERE COALESCE(id, 0) IN (1, 2, 3)');
+    });
+
     test('a step with $n can be bound and reused', () => {
         const sql = render(`
             ${USERS}

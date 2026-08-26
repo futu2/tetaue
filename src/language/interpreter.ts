@@ -8,7 +8,6 @@
  ******************************************************************************/
 import type { AstNode } from 'langium';
 import type { NumberLiteral } from './generated/ast.js';
-import { AstUtils } from 'langium';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBooleanLiteral,
     isCaseExpression, isIdentifier, isLambda, isLambdaBinaryExpression, isLambdaLetExpression,
@@ -16,13 +15,15 @@ import {
     isListType, isMapLiteral,
     isNullLiteral, isNumberLiteral, isOperatorSection, isQualifiedTypeName, isQueryType, isStringLiteral,
     isTypeAtom, isTypeHole, isTypeParen, isTypeVar, isUnaryMinus,
-    type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
+    type Application, type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
 } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
-import { labelName, parseStringLiteral } from './strings.js';
+import { implicitParamName, labelName, parseStringLiteral } from './strings.js';
 export { parseStringLiteral };
-import { CAST_TYPES, LIST_ARITY, coreBuiltinName, type BuiltinName } from './builtin.js';
+import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, LIST_ARITY, coreBuiltinName, type BuiltinName } from './builtin.js';
+import { TypeUniverse } from './types.js';
+import type { Type } from './types.js';
 import {
     INTRINSIC_OPERATORS, isBinaryOperator, isIntrinsicOperator, isOperatorIntrinsicName,
     operatorIntrinsicName, sectionName, sectionSpelling, type BinaryOperator, type IntrinsicOperator,
@@ -886,22 +887,129 @@ function access(recv: Value, prop: string, at: AstNode, ctx: Ctx): Value {
 /**
  * Highest $n index in `node` that is NOT bound in `env` and not hidden inside
  * an explicit lambda body (explicit lambdas are their own scope).
+ *
+ * An argument in a FUNCTION position of an application — a position whose
+ * type is a curried function, e.g. `filter`'s predicate or a join's `on`
+ * merger — is its own implicit-lambda scope and does not leak its $n
+ * parameters outward: `filter (P1) $ filter (P2) s03` keeps the `$1` inside
+ * the inner `filter`'s predicate instead of abstracting the whole `$`-right
+ * operand into a lambda. VALUE-position $n arguments (like `cast $1.pt_dt` or
+ * `is_in (from_maybe "" $1.x) [...]`) bubble up to the enclosing expression's
+ * implicit lambda.
  */
 function dollarArity(node: AstNode, env: ReadonlyMap<string, Value>): number {
     let arity = 0;
-    for (const n of AstUtils.streamAst(node)) {
-        if (!isDollarParam(n) || env.has(n.value)) continue;
-        let cur: AstNode | undefined = n;
-        let hidden = false;
-        while (cur) {
-            const parent: AstNode | undefined = cur.$container;
-            if (!parent) break;
-            if (isLambda(parent) && parent.body === cur) { hidden = true; break; }
-            cur = parent;
+    const stack: AstNode[] = [node];
+    while (stack.length > 0) {
+        const cur = stack.pop()!;
+        if (isDollarParam(cur)) {
+            if (env.has(cur.value)) continue;
+            if (hiddenBehindLambda(cur, env)) continue;
+            arity = Math.max(arity, Number(cur.value.slice(1)));
+            continue;
         }
-        if (!hidden) arity = Math.max(arity, Number(n.value.slice(1)));
+        // `this`/`that` sugar: an unbound identifier naming an implicit
+        // parameter ($1/$2) counts like a DollarParam — unless a binding or
+        // an already-bound $n of the same name shadows it.
+        if (isIdentifier(cur) && !env.has(cur.name)) {
+            const dollar = implicitParamName(cur.name);
+            if (dollar && !env.has(dollar)) {
+                if (hiddenBehindLambda(cur, env)) continue;
+                arity = Math.max(arity, Number(dollar.slice(1)));
+                continue;
+            }
+        }
+        for (const key of Object.keys(cur)) {
+            if (key.startsWith('$')) continue;
+            const value = (cur as unknown as Record<string, unknown>)[key];
+            if (Array.isArray(value)) {
+                const skipFnArgs = key === 'arguments' && isApplication(cur) ? functionArgIndexesOf(cur, env) : undefined;
+                for (let i = 0; i < value.length; i++) {
+                    const v = value[i];
+                    if (!v || typeof v !== 'object' || !('$type' in (v as object))) continue;
+                    if (skipFnArgs?.has(i)) continue;
+                    stack.push(v as AstNode);
+                }
+            } else if (value && typeof value === 'object' && '$type' in (value as object)) {
+                stack.push(value as AstNode);
+            }
+        }
     }
     return arity;
+}
+
+/**
+ * Is `node` inside an explicit lambda body WITHOUT an intervening implicit
+ * scope? `$n` belongs to an explicit lambda only when no function-position
+ * application argument sits between it and that lambda: `filter (u =>
+ * $1.active)` leaves `$1` unbound inside `u`, but
+ * `filter (u => exists (filter (cast $1.x ...) t))` scopes `$1` to the inner
+ * `filter` predicate. The walk stops at the first function-position argument.
+ */
+function hiddenBehindLambda(node: AstNode, env: ReadonlyMap<string, Value>): boolean {
+    let cur: AstNode | undefined = node;
+    while (cur) {
+        const parent: AstNode | undefined = cur.$container;
+        if (!parent) break;
+        if (isLambda(parent) && parent.body === cur) return true;
+        if (isApplication(parent)) {
+            const index = parent.arguments.indexOf(cur as Expr);
+            if (index >= 0 && functionArgIndexesOf(parent, env).has(index)) return false;
+        }
+        cur = parent;
+    }
+    return false;
+}
+
+const NO_FN_ARG_INDEXES = new Set<number>();
+
+/**
+ * Argument indexes of `app` that consume a function (an implicit-lambda
+ * scope), derived from the callee's type scheme when the callee is a known
+ * builtin. Unknown callees return an empty set, so the scan descends into all
+ * of their arguments (the pre-existing behavior).
+ */
+function functionArgIndexesOf(app: Application, env: ReadonlyMap<string, Value>): Set<number> {
+    const func = app.func;
+    if (!isIdentifier(func)) return NO_FN_ARG_INDEXES;
+    const value = env.get(func.name);
+    let name: string | undefined;
+    if (value?.kind === 'fn') {
+        name = value.name;
+    } else {
+        name = func.name;
+    }
+    const canonical = Object.hasOwn(BUILTIN_ALIASES, name) ? BUILTIN_ALIASES[name as keyof typeof BUILTIN_ALIASES] : name;
+    return builtinFnArgIndexes(canonical) ?? NO_FN_ARG_INDEXES;
+}
+
+/** Lazily-built map: builtin name → argument indexes that take a function. */
+let builtinFnArgIndexesByName: ReadonlyMap<string, Set<number>> | undefined;
+function builtinFnArgIndexes(name: string): Set<number> | undefined {
+    if (!builtinFnArgIndexesByName) {
+        const u = new TypeUniverse();
+        const map = new Map<string, Set<number>>();
+        for (const spec of BUILTIN_SPECS) {
+            map.set(spec.name, fnArgIndexesOfType(spec.scheme(u).type, u));
+        }
+        builtinFnArgIndexesByName = map;
+    }
+    return builtinFnArgIndexesByName.get(name);
+}
+
+/** Indexes of a curried type's parameters whose (peeled) type is a function. */
+function fnArgIndexesOfType(t: Type, u: TypeUniverse): Set<number> {
+    const out = new Set<number>();
+    let cur: Type | undefined = t;
+    let index = 0;
+    while (cur) {
+        const r = u.peel(cur);
+        if (r.kind !== 'fun') break;
+        if (u.peel(r.from).kind === 'fun') out.add(index);
+        cur = r.to;
+        index++;
+    }
+    return out;
 }
 
 /**
@@ -1080,6 +1188,14 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
     if (isIdentifier(e)) {
         const v = ctx.env.get(e.name);
         if (v) return v;
+        // `this`/`that` sugar for the first two implicit lambda parameters.
+        const dollar = implicitParamName(e.name);
+        if (dollar) {
+            const param = ctx.env.get(dollar);
+            if (param) return param;
+            ctx.diagnostics.push({ node: e, message: `unknown lambda parameter '${dollar}' — $n refers to the implicit parameters of the enclosing lambda, e.g. filter ($1.active)` });
+            return ERROR;
+        }
         if (ctx.moduleBindings.has(e.name)) {
             ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}' — bindings must be defined before use` });
             return ERROR;

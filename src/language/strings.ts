@@ -35,3 +35,20 @@ export function parseStringLiteral(raw: string): string {
 export function labelName(raw: string): string {
     return raw.startsWith('"') ? parseStringLiteral(raw) : raw;
 }
+
+/**
+ * `this` / `that` are sugar for the first two implicit lambda parameters:
+ * `filter (this.active)` ≡ `filter ($1.active)` and
+ * `joinInner orders (this.id == that.user_id) { ... }` ≡ `($1.id == $2.user_id)`.
+ * They resolve like any identifier when a binding of the same name is in
+ * scope, so they stay usable as ordinary names when shadowed.
+ */
+export const IMPLICIT_PARAM_SUGAR: ReadonlyMap<string, string> = new Map([
+    ['this', '$1'],
+    ['that', '$2'],
+]);
+
+/** The `$n` parameter an identifier names via `this`/`that` sugar, if any. */
+export function implicitParamName(name: string): string | undefined {
+    return IMPLICIT_PARAM_SUGAR.get(name);
+}
