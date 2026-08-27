@@ -35,7 +35,7 @@ import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
 import { moduleOf } from './imports.js';
 import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
-import { checkBinding, missingBindingExpressionMessage, parseStringLiteral } from './interpreter.js';
+import { checkBinding, missingBindingExpressionMessage, parseStringLiteral, recursiveBindingMessage, topoOrderBindings } from './interpreter.js';
 import type { Diagnostic, Value } from './interpreter.js';
 import { implicitParamName, labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
@@ -392,7 +392,17 @@ export class Inferencer {
     ): Map<string, Scheme> {
         const { scope } = this.beginModule(module, imports, exportsByModule, typeExportsByModule, standardTypes);
         const exported = new Map<string, Scheme>();
-        for (const binding of module.model.bindings) {
+        // Top-down resolution mirrors the interpreter: bindings are inferred
+        // in dependency order (source order as tiebreak) so a definition may
+        // reference any other binding in the module. Cycle members are
+        // inferred last in source order (their recursion is diagnosed once
+        // here; the interpreter reports the same message for dedupe).
+        const { order, cycles } = topoOrderBindings(module.model.bindings);
+        for (const binding of order) {
+            this.inferBinding(binding, exported, scope);
+        }
+        for (const binding of cycles) {
+            this.diag(binding, recursiveBindingMessage(binding.name));
             this.inferBinding(binding, exported, scope);
         }
         // --- re-exports: `export * from "x"` / `export { a as b } from "x"` ---
@@ -500,6 +510,7 @@ export class Inferencer {
         moduleBindings: ReadonlySet<string>,
         seen: ReadonlySet<string>,
         nodeValues?: Map<AstNode, Value>,
+        topoCycleNames: ReadonlySet<string> = new Set(),
     ): { env: Map<string, Value>; seen: Set<string>; value: Value; diagnostics: Diagnostic[] } {
         const diagnostics: Diagnostic[] = [];
         if (scope.has(b.name)) {
@@ -507,6 +518,15 @@ export class Inferencer {
                 node: b,
                 message: `name '${b.name}' (a local binding) conflicts with ${scope.get(b.name)!}`,
             });
+        }
+
+        // Recursive cycles are diagnosed once per cycle member here; the
+        // interpreter reports the same message (exact-deduped on merge).
+        // Duplicate names are handled by `seen` inside checkBinding, so this
+        // runs only for the recursion case (topoOrderBindings keeps cycles
+        // out of the main order).
+        if (topoCycleNames.has(b.name)) {
+            diagnostics.push({ node: b, message: recursiveBindingMessage(b.name) });
         }
 
         // Type first against the ORIGINAL imported scope; the runtime

@@ -18,12 +18,18 @@
  * Semantics follow teta (https://github.com/futu2/teta): immutable queries,
  * curried query steps, composed with `&`, rendered to SQL.
  *
- * A module is a list of bindings; the LAST binding is the module's query.
- * Bindings need no terminator. Bare identifiers ARE allowed as application
- * arguments (`filter adult`) — the ARG_ID terminal lexes an identifier only
- * when it is NOT followed by `:` or `=` (with only whitespace between), so an
- * application can never swallow the next binding's name: `filter adult` then
- * `x = 5` or `x: T = ...` always ends the application at `adult`.
+ * A module is a list of bindings; its query is the `main` binding (or the
+ * last binding when there is no `main`). Bindings need no terminator. Bare
+ * identifiers ARE allowed as application arguments (`filter adult`) — the
+ * ARG_ID terminal lexes an identifier only when it is NOT followed by `:` or
+ * `=` (with only whitespace between), so an application can never swallow the
+ * next binding's name: `filter adult` then `x = 5` or `x: T = ...` always
+ * ends the application at `adult`.
+ *
+ * Binding resolution is TOP-DOWN (Haskell-style): a binding may reference any
+ * other binding in the module, so definitions may appear in any order
+ * (`main = x` before `x = table "k"` is valid). Recursive top-level bindings
+ * are rejected.
  ******************************************************************************/
 
 grammar Tetaue

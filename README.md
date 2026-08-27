@@ -197,6 +197,16 @@ binding with a type annotation, and the next binding starts right after it.
 `table` is an ordinary function — `table : string -> query r` — and the query
 type annotation IS the table's schema.
 
+Bindings are **order-independent** (Haskell-style): a definition may reference
+any other binding in the module, whether it appears earlier or later, so
+
+    main = x
+    x = table "ktable"
+
+is exactly as valid as the reverse order. Recursive top-level bindings
+(`a = b`, `b = a`) are not supported — use `let` for a local recursion or the
+`recursive` query step for SQL recursion.
+
 ### Core and standard prelude
 
 The language is checked and evaluated by one shared pass (`checkProject`). Its

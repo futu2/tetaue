@@ -21,7 +21,7 @@
  ******************************************************************************/
 import type { AstNode } from 'langium';
 import {
-    ERROR, createPreludeEnv, describe, parseStringLiteral, type Diagnostic, type Value,
+    ERROR, createPreludeEnv, describe, parseStringLiteral, recursiveBindingMessage, topoOrderBindings, type Diagnostic, type Value,
 } from './interpreter.js';
 import { Inferencer, mergeDiagnostics } from './inference.js';
 import type { Scheme, Type } from './types.js';
@@ -148,9 +148,20 @@ export function checkProject(
         const exports = new Map<string, Value>();
         const exportedSchemes = new Map<string, Scheme>();
         let seen = new Set<string>();
-        for (const binding of module.model.bindings) {
+        // Top-down resolution (Haskell-style): infer + evaluate each binding
+        // in dependency order so a definition may reference any other binding
+        // in the module, regardless of position. Cycle members are processed
+        // last in source order; their recursion is diagnosed once.
+        const { order, cycles } = topoOrderBindings(module.model.bindings);
+        const cycleNames = new Set(cycles.map(b => b.name));
+        // Pre-bind cycle members to ERROR so dependents report their own
+        // errors instead of a misleading "unknown identifier".
+        for (const binding of cycles) {
+            env = new Map(env).set(binding.name, ERROR);
+        }
+        for (const binding of [...order, ...cycles]) {
             const result = inferencer.typedBinding(
-                binding, exportedSchemes, scope, env, moduleBindings, seen, nodeValues,
+                binding, exportedSchemes, scope, env, moduleBindings, seen, nodeValues, cycleNames,
             );
             moduleDiagnostics.push(...result.diagnostics);
             env = result.env;
@@ -230,6 +241,11 @@ export function checkProject(
         value = rootEnv.get(entryBinding) ?? ERROR;
     } else if (mainValue !== undefined) {
         value = mainValue;
+    } else if (root && rootEnv && selectedBinding) {
+        // No `main` and no --binding: the query is the LAST binding in source
+        // order (bindings evaluate in dependency order, so the trailing loop
+        // value is not necessarily the entry).
+        value = rootEnv.get(selectedBinding.name) ?? ERROR;
     }
     if (requireMain && !entryBinding && root) {
         if (!mainBinding) {

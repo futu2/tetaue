@@ -576,13 +576,33 @@ describe('haskell-style operators (review change)', () => {
         expect(sql).toContain('name IS NULL');
     });
 
-    test('bindings must be defined before use (lexical order)', () => {
-        const messages = errors(`
+    test('bindings are order-independent (Haskell-style top-down resolution)', () => {
+        // A binding may reference a later binding: `min_age` is defined after
+        // the query that uses it.
+        const sql = render(`
             ${USERS2}
-            q = users & filter (u => u.age >= min_age)
+            main = users & filter (u => u.age >= min_age)
             min_age = 18
         `);
-        expect(messages.join('\n')).toContain("unknown identifier 'min_age' — bindings must be defined before use");
+        expect(sql).toContain('age >= 18');
+    });
+
+    test('forward reference through the module entry works', () => {
+        const sql = render(`
+            main = x
+            x = table "ktable"
+        `);
+        expect(sql).toContain('FROM ktable');
+    });
+
+    test('recursive top-level bindings are rejected', () => {
+        const messages = errors(`
+            ${USERS2}
+            a = b
+            b = a
+        `);
+        expect(messages.join('\n')).toContain("binding 'a' is part of a recursive cycle");
+        expect(messages.join('\n')).toContain("binding 'b' is part of a recursive cycle");
     });
 });
 

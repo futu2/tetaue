@@ -134,8 +134,14 @@ Each module is evaluated in its own environment:
 scope(M) = prelude
          ∪ { alias -> module(target)   | import "spec" as alias in M }
          ∪ { name  -> export(target)   | import "spec"        in M }
-         ∪ { name  -> binding value    | binding in M, in order }
+         ∪ { name  -> binding value    | binding in M }
 ```
+
+- Bindings are **order-independent**: the scope contains every binding of the
+  module, so a definition may reference any other binding regardless of
+  position. Bindings are evaluated in dependency order (topological sort,
+  source order as a tiebreak); recursive top-level binding cycles are
+  rejected.
 
 - The prelude is shadowable by imports and local bindings, exactly as user
   bindings shadow builtins today.
