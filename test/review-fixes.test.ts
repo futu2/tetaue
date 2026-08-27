@@ -105,14 +105,11 @@ describe('aggregation edges (review fixes)', () => {
                 & fold (r => { grand = sum r.total })
         `);
         expect(sql).toBe([
+            'WITH orders_1 AS (',
+            '    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id',
+            ')',
             'SELECT SUM(total) AS grand',
-            'FROM (',
-            '    SELECT',
-            '        user_id,',
-            '        SUM(total) AS total',
-            '    FROM orders',
-            '    GROUP BY user_id',
-            ') AS orders',
+            'FROM orders_1 AS orders',
         ].join('\n'));
     });
 
@@ -124,16 +121,13 @@ describe('aggregation edges (review fixes)', () => {
                 & fold (r => { tier = group r.user_id, grand = sum r.total })
         `);
         expect(sql).toBe([
+            'WITH orders_1 AS (',
+            '    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id',
+            ')',
             'SELECT',
             '    user_id AS tier,',
             '    SUM(total) AS grand',
-            'FROM (',
-            '    SELECT',
-            '        user_id,',
-            '        SUM(total) AS total',
-            '    FROM orders',
-            '    GROUP BY user_id',
-            ') AS orders',
+            'FROM orders_1 AS orders',
             'GROUP BY user_id',
         ].join('\n'));
     });
@@ -147,14 +141,11 @@ describe('aggregation edges (review fixes)', () => {
                 & sort (r => [desc r.grand])
         `);
         expect(sql).toBe([
+            'WITH orders_1 AS (',
+            '    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id',
+            ')',
             'SELECT SUM(total) AS grand',
-            'FROM (',
-            '    SELECT',
-            '        user_id,',
-            '        SUM(total) AS total',
-            '    FROM orders',
-            '    GROUP BY user_id',
-            ') AS orders',
+            'FROM orders_1 AS orders',
             'ORDER BY SUM(total) DESC',
         ].join('\n'));
     });
@@ -167,14 +158,11 @@ describe('aggregation edges (review fixes)', () => {
                 & map (r => { t = r.total })
         `);
         expect(sql).toBe([
+            'WITH orders_1 AS (',
+            '    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id',
+            ')',
             'SELECT total AS t',
-            'FROM (',
-            '    SELECT',
-            '        user_id,',
-            '        SUM(total) AS total',
-            '    FROM orders',
-            '    GROUP BY user_id',
-            ') AS orders',
+            'FROM orders_1 AS orders',
         ].join('\n'));
     });
 
@@ -186,14 +174,11 @@ describe('aggregation edges (review fixes)', () => {
                 & map (r => { grand_total = sum r.total })
         `);
         expect(sql).toBe([
+            'WITH orders_1 AS (',
+            '    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id',
+            ')',
             'SELECT SUM(total) AS grand_total',
-            'FROM (',
-            '    SELECT',
-            '        user_id,',
-            '        SUM(total) AS total',
-            '    FROM orders',
-            '    GROUP BY user_id',
-            ') AS orders',
+            'FROM orders_1 AS orders',
         ].join('\n'));
     });
 
@@ -206,14 +191,11 @@ describe('aggregation edges (review fixes)', () => {
                 & filter (r => r.grand_total > 1000)
         `);
         expect(sql).toBe([
+            'WITH orders_1 AS (',
+            '    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id',
+            ')',
             'SELECT SUM(total) AS grand_total',
-            'FROM (',
-            '    SELECT',
-            '        user_id,',
-            '        SUM(total) AS total',
-            '    FROM orders',
-            '    GROUP BY user_id',
-            ') AS orders',
+            'FROM orders_1 AS orders',
             'HAVING SUM(total) > 1000',
         ].join('\n'));
     });
@@ -227,16 +209,13 @@ describe('aggregation edges (review fixes)', () => {
                 & joinInner users (o => u => o.user_id == u.id) (o => u => { user_id = o.user_id, id = u.id })
         `);
         expect(sql).toBe([
+            'WITH orders_1 AS (',
+            '    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id',
+            ')',
             'SELECT',
             '    orders.user_id,',
             '    users.id',
-            'FROM (',
-            '    SELECT',
-            '        user_id,',
-            '        SUM(total) AS total',
-            '    FROM orders',
-            '    GROUP BY user_id',
-            ') AS orders',
+            'FROM orders_1 AS orders',
             'INNER JOIN users ON orders.user_id = users.id',
         ].join('\n'));
     });
@@ -264,18 +243,15 @@ describe('aggregation edges (review fixes)', () => {
                 & filter (r => is_in r.user_id [1, 2])
         `);
         expect(sql).toBe([
+            'WITH totals AS (',
+            '    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id',
+            ')',
             'SELECT',
             '    totals.user_id,',
             '    totals.total,',
             '    users.id,',
             '    users.name',
-            'FROM (',
-            '    SELECT',
-            '        user_id,',
-            '        SUM(total) AS total',
-            '    FROM orders',
-            '    GROUP BY user_id',
-            ') AS totals',
+            'FROM totals',
             'LEFT JOIN users ON totals.user_id = users.id',
             'WHERE totals.user_id IN (1, 2)',
         ].join('\n'));

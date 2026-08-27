@@ -148,11 +148,12 @@ describe('semantic errors', () => {
             q = users & joinInner paid (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.user_id })
         `);
         expect(sql).toContain([
-            'INNER JOIN (',
-            '    SELECT *',
-            '    FROM orders',
-            "    WHERE status = 'paid'",
-            ') AS paid',
+            'WITH paid AS (',
+            "    SELECT * FROM orders WHERE status = 'paid'",
+            ')',
+        ].join('\n'));
+        expect(sql).toContain([
+            'INNER JOIN paid',
             '    ON users.id = paid.user_id',
         ].join('\n'));
     });

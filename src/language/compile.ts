@@ -17,7 +17,7 @@ import { type AstNode } from 'langium';
 import type { TetaueServices } from './tetaue-module.js';
 import type { Diagnostic } from './interpreter.js';
 import { checkProject } from './checker.js';
-import { renderQuery, renderQueryWithCtes, DIALECTS, isDialect } from './render.js';
+import { renderQuery, DIALECTS, isDialect } from './render.js';
 import type { RenderDiagnostic, RenderFormat } from './render.js';
 import { collectModuleTree, moduleOf } from './imports.js';
 import type { ResolvedImportEdge, ResolvedExportEdge } from './imports.js';
@@ -48,8 +48,6 @@ export type CompileOutcome =
 export interface CompileOptions {
     dialect?: string;
     format?: RenderFormat;
-    /** Emit named intermediate queries as WITH ... AS CTEs. */
-    cte?: boolean;
     /**
      * Require the root module's last binding to be a query (default true).
      * `build` disables it so library modules (no query) compile cleanly and
@@ -156,7 +154,7 @@ export function compileModuleText(
     services: TetaueServices,
     options?: CompileOptions,
 ): CompileOutcome {
-    const { dialect = 'sqlite', format = 'pretty', requireQuery = true, requireMain, cte = false, binding } = options ?? {};
+    const { dialect = 'sqlite', format = 'pretty', requireQuery = true, requireMain, binding } = options ?? {};
     if (!isDialect(dialect)) {
         return {
             ok: false,
@@ -204,7 +202,7 @@ export function compileModuleText(
         return { ok: false, diagnostics: [] };
     }
     const spec = DIALECTS[dialect]!;
-    const rendered = cte ? renderQueryWithCtes(value.query, spec, format) : renderQuery(value.query, spec, format);
+    const rendered = renderQuery(value.query, spec, format);
     if (!rendered.ok) {
         return {
             ok: false,

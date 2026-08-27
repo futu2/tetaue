@@ -1,7 +1,7 @@
 /******************************************************************************
  * tetaue CLI — render / check / parse / format / build / watch / lsp.
  *
- *   tetaue render <file> [--dialect sqlite|postgresql|mysql|trino|hive] [--format pretty|compact] [--cte] [--json] [--binding <name>]
+ *   tetaue render <file> [--dialect sqlite|postgresql|mysql|trino|hive] [--format pretty|compact] [--json] [--binding <name>]
  *   tetaue check <file>
  *   tetaue parse <file>
  *   tetaue format <file...> [--check] [--tabs] [--tab-width <n>]     (alias: fmt)
@@ -39,8 +39,10 @@ import { standardPrelude } from './language/prelude.js';
 const HELP = `tetaue — a pure functional SQL query language
 
 Usage:
-  tetaue render <file.tetaue> [--dialect <name>] [--format pretty|compact] [--cte] [--json] [--binding <name>]
+  tetaue render <file.tetaue> [--dialect <name>] [--format pretty|compact] [--json] [--binding <name>]
       Validate the module (and its imports) and render its query to SQL.
+      Named intermediates render as WITH CTEs, so the body never duplicates
+      a subquery.
   tetaue check <file.tetaue>
       Validate the module and report all diagnostics.
   tetaue types <file.tetaue>
@@ -91,7 +93,6 @@ function printCompileDiagnostics(diagnostics: CompileDiagnostic[]): void {
 async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Promise<number> {
     let dialect = 'sqlite';
     let format: RenderFormat = 'pretty';
-    let cte = false;
     let json = false;
     let binding: string | undefined;
     const files: string[] = [];
@@ -101,8 +102,6 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
             const value = args.shift();
             if (value === undefined) return usage(`--dialect expects a value (${Object.keys(DIALECTS).join(', ')})`);
             dialect = value;
-        } else if (arg === '--cte') {
-            cte = true;
         } else if (arg === '--json') {
             json = true;
         } else if (arg === '--binding') {
@@ -136,7 +135,7 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
         console.error(`error: cannot read ${file}: ${msg(err)}`);
         return 1;
     }
-    const outcome = compileModuleText(rootUri, rootText, services, { dialect, format, cte, binding });
+    const outcome = compileModuleText(rootUri, rootText, services, { dialect, format, binding });
     if (!outcome.ok) {
         printCompileDiagnostics(outcome.diagnostics);
         return 1;

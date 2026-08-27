@@ -1485,7 +1485,11 @@ function joinBuiltin(name: string, joinKind: JoinKind): () => Value {
                     );
                     const rightQuery: Query = {
                         ...right.query,
-                        root: { name: rightName, schema: rightSchema },
+                        // Re-qualify the schema with the join alias, but keep
+                        // the rest of the root — dropping `root.from` here
+                        // makes a derived right side render as a raw table
+                        // name (`FROM all_detail`) instead of its subquery.
+                        root: { ...right.query.root, schema: rightSchema },
                         aliases: [alias],
                     };
                     const rightRow: Value = { kind: 'record', schema: rightSchema, open: !right.query.known, defaultTable: alias, fields: [], ast: at4 };
@@ -1863,7 +1867,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                     const rightSchema: Schema = new Map(
                         [...querySchema(right.query)].map(([key, col]) => [key, { type: col.type, table: alias }]),
                     );
-                    const rightQuery: Query = { ...right.query, root: { name: right.query.root.name, schema: rightSchema }, aliases: [alias] };
+                    const rightQuery: Query = { ...right.query, root: { ...right.query.root, schema: rightSchema }, aliases: [alias] };
                     const rightRow: Value = { kind: 'record', schema: rightSchema, open: !right.query.known, defaultTable: alias, fields: [], ast: at4 };
 
                     const on1 = applyWith(on, leftRow, at4, ctx4);

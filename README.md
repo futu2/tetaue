@@ -59,7 +59,7 @@ bun run src/cli.ts render examples/report.tetaue --dialect sqlite
 
 ```
 tetaue render <file.tetaue> [--dialect sqlite|postgresql|mysql|trino|hive] [--format pretty|compact]
-             [--cte] [--json] [--binding <name>]
+             [--json] [--binding <name>]
 tetaue check <file.tetaue>
 tetaue types <file.tetaue>
 tetaue parse <file.tetaue>
@@ -72,9 +72,11 @@ tetaue lsp [--stdio | --node-ipc | --socket=<port> | --pipe=<name>]
 ```
 
 - `render` validates the module (and its imports) and prints the rendered SQL.
-  `--cte` emits named intermediate queries as `WITH ... AS` clauses; `--json`
-  prints `{ sql, parameters }`; `--binding <name>` renders a named root binding
-  instead of the last one.
+  Every named intermediate query renders as a `WITH name AS (...)` CTE, so
+  the body references subqueries by name instead of duplicating them
+  (lateral join rights stay inline — they are correlated with the left row).
+  `--json` prints `{ sql, parameters }`; `--binding <name>` renders a named
+  root binding instead of the last one.
 - `check` prints diagnostics (or `OK`). `types` prints the inferred type
   of every binding. `parse` dumps the AST as JSON.
 - `format` (alias `fmt`) runs the same token-stream formatter the editor uses:
@@ -836,8 +838,9 @@ builds the typed SQL IR and returns exact-deduped diagnostics — so `check` and
   `Num`, `Eq`, `Ord`, `Semigroup`, `Monoid`, `Functor`, `Applicative`,
   `Alternative`, and `Monad` instances)
 - query cardinality types for scalar and singleton subqueries
-- more pure optimizer rewrites: projection pruning, safe predicate pushdown,
-  and common-subexpression/CTE sharing
+- more pure optimizer rewrites: projection pruning and safe predicate
+  pushdown (named intermediates already render as `WITH` CTEs, so subqueries
+  are defined once and referenced by name)
 - LSP polish: completion for `$n` implicit lambdas and richer cross-module
   documentation (go-to-definition, qualified completion, builtin completion,
   and importer revalidation are already implemented)

@@ -250,6 +250,128 @@ describe('joins', () => {
         expect(sql).toContain('users.id AS left_id');
         expect(sql).toContain('orders.id AS right_id');
     });
+
+    test('a derived right side (window wrap) inlines as a nested subquery, not a raw table', () => {
+        // A map with a window followed by a filter wraps the pipeline as a
+        // derived table. Joining that binding on the RIGHT previously dropped
+        // root.from and rendered `FROM detail` as a raw table name. All named
+        // intermediates now render as CTEs, and each reference site re-applies
+        // its own alias.
+        const sql = render(`
+            tx: query { cust_id: int, tx_dt: date, prod_cd: int } = table "tx"
+            prod: query { prod_cd: int } = table "prod"
+            detail = tx
+                & joinLeft prod (l => r => l.prod_cd == r.prod_cd) (l => r => merge l r)
+            first_buy = detail
+                & map (d => {
+                    customer_number = d.cust_id,
+                    buy_order = over row_number { partition = [d.cust_id], order = [asc d.tx_dt] },
+                })
+                & filter (d => d.buy_order == 1)
+            q = first_buy
+                & joinLeft first_buy (l => r => l.customer_number == r.customer_number) (l => r => merge l r)
+        `);
+        expect(sql).not.toContain('FROM detail\n    WHERE buy_order = 1'); // the raw-table bug
+        expect(sql).toContain('WITH detail AS (');
+        expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY tx.cust_id ORDER BY tx.tx_dt ASC) AS buy_order');
+        expect(sql).toContain('first_buy AS (\n    SELECT * FROM detail AS first_buy WHERE buy_order = 1');
+        expect(sql).toContain('LEFT JOIN first_buy\n    ON detail.customer_number = first_buy.customer_number');
+        expect(sql).toContain('WHERE detail.buy_order = 1');
+    });
+
+    test('a fold-derived right side also inlines its definition', () => {
+        const sql = render(`
+            orders: query { user_id: int, total: int } = table "orders"
+            users: query { id: int } = table "users"
+            ranked = orders
+                & fold (o => { user_id = group o.user_id, total = sum o.total })
+                & map (r => { id = r.user_id, amount = r.total })
+            q = users
+                & joinLeft ranked (u => r => u.id == r.id) (u => r => { id = u.id, amount = r.amount })
+        `);
+        expect(sql).toContain('WITH orders_1 AS (\n    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id');
+        expect(sql).toContain('ranked AS (\n    SELECT user_id AS id, total AS amount FROM orders_1 AS ranked');
+        expect(sql).toContain('LEFT JOIN ranked\n    ON users.id = ranked.id');
+    });
+});
+
+describe('CTE rendering by default', () => {
+    const WINDOW_SRC = `
+        tx: query { cust_id: int, tx_dt: date, prod_cd: int } = table "tx"
+        prod: query { prod_cd: int } = table "prod"
+        detail = tx
+            & joinLeft prod (l => r => l.prod_cd == r.prod_cd) (l => r => merge l r)
+        first_buy = detail
+            & map (d => {
+                customer_number = d.cust_id,
+                buy_order = over row_number { partition = [d.cust_id], order = [asc d.tx_dt] },
+            })
+            & filter (d => d.buy_order == 1)
+    `;
+
+    test('every named intermediate renders as a WITH CTE', () => {
+        const sql = render(WINDOW_SRC + `q = first_buy
+            & joinLeft first_buy (l => r => l.customer_number == r.customer_number) (l => r => merge l r)
+        `);
+        expect(sql).toContain('WITH detail AS (');
+        expect(sql).toContain('first_buy AS (\n    SELECT * FROM detail AS first_buy WHERE buy_order = 1');
+        expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY tx.cust_id ORDER BY tx.tx_dt ASC) AS buy_order');
+        expect(sql).toContain('FROM detail\nLEFT JOIN first_buy\n    ON detail.customer_number = first_buy.customer_number');
+        expect(sql).toContain('WHERE detail.buy_order = 1');
+        // the subquery is defined once, then referenced by name
+        expect(sql.match(/ROW_NUMBER\(\) OVER \(PARTITION BY tx\.cust_id/g)?.length).toBe(1);
+        expect(sql).not.toContain('FROM (\n    SELECT\n        tx.cust_id AS customer_number,');
+    });
+
+    test('repeated bindings share one CTE across all reference sites', () => {
+        const sql = render(WINDOW_SRC + `q = first_buy
+            & joinLeft first_buy (l => r => l.customer_number == r.customer_number) (l => r => merge l r)
+            & joinLeft first_buy (l => r => l.customer_number == r.customer_number) (l => r => merge l r)
+        `);
+        expect((sql.match(/WITH detail AS/g) ?? []).length).toBe(1);
+        // one definition plus one reference inside each of the two first_buy CTEs
+        expect(sql.match(/FROM detail\b/g)?.length).toBe(3);
+        expect(sql).toContain('first_buy_1 AS (\n    SELECT * FROM detail AS first_buy_1 WHERE buy_order = 1');
+        expect(sql).toContain('LEFT JOIN first_buy_1\n    ON first_buy.customer_number = first_buy_1.customer_number');
+    });
+
+    test('a single-use stepped binding also becomes a CTE', () => {
+        const sql = render(`
+            orders: query { user_id: int, total: int } = table "orders"
+            users: query { id: int } = table "users"
+            ranked = orders & fold (o => { user_id = group o.user_id, total = sum o.total })
+            q = users & joinLeft ranked (u => r => u.id == r.user_id) (u => r => { id = u.id, total = r.total })
+        `);
+        expect(sql).toContain('WITH ranked AS (\n    SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id');
+        expect(sql).toContain('LEFT JOIN ranked\n    ON users.id = ranked.user_id');
+    });
+
+    test('lateral right sides stay inline, even when shared', () => {
+        // A correlated lateral right cannot move into a WITH clause; the same
+        // named pipeline used in two lateral joins stays inline in each.
+        const sql = render(`
+            users: query { id: int, name: string } = table "users"
+            orders: query { user_id: int, total: float } = table "orders"
+            ranked = orders
+                & fold (o => { user_id = group o.user_id, total = sum o.total })
+                & map (r => { id = r.user_id, total = r.total })
+            q = users
+                & join_lateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, t1 = r.total })
+                & join_lateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, t2 = r.total })
+        `, 'postgresql');
+        expect(sql).not.toMatch(/\bWITH\b/);
+        expect(sql.match(/INNER JOIN LATERAL \(/g)?.length).toBe(2);
+        expect(sql).toContain('WHERE user_id = users.id');
+    });
+
+    test('a CTE name never collides with a real table name', () => {
+        // `t & take 2` wraps as a derived table named `t`; the CTE must not
+        // reuse that name or `WITH t AS (SELECT * FROM t ...)` would recurse
+        // into the CTE itself (SQLite: "circular reference").
+        const sql = render(`t: query { a: int } = table "t"\nq = t & take 2 & fold (u => { total = sum u.a })`);
+        expect(sql).toContain('WITH t_1 AS (\n    SELECT * FROM t LIMIT 2');
+        expect(sql).toContain('FROM t_1 AS t');
+    });
 });
 
 describe('schema-qualified table names', () => {
@@ -329,8 +451,8 @@ describe('schema-qualified table names', () => {
         expect(sql).toContain('cust_f.roleplayer AS p_cino');
         expect(sql).not.toContain('ecs.cust_f.roleplayer');
         expect(sql).not.toContain('ecs.bday_f.customer_number');
-        expect(sql).toContain('LEFT JOIN (\n    SELECT\n        individualid AS customer_number,');
-        expect(sql).toContain(') AS bday\n    ON cust_f.roleplayer = bday.customer_number');
+        expect(sql).toContain('WITH bday AS (\n    SELECT individualid AS customer_number, birthdate AS birthday FROM ecs.bday_f WHERE pt_dt = CURRENT_DATE');
+        expect(sql).toContain('LEFT JOIN bday\n    ON cust_f.roleplayer = bday.customer_number');
         expect(sql).toContain('WHERE cust_f.pt_dt = CURRENT_DATE');
     });
 });
@@ -514,8 +636,8 @@ describe('composable joins (review change)', () => {
             o2 = orders & map (o => { uid = o.user_id, amount = o.total })
             q = users & joinInner o2 (u => o => u.id == o.uid) (u => o => { uid = u.id, amount = o.amount })
         `);
-        expect(sql).toContain('INNER JOIN (\n    SELECT\n        user_id AS uid,');
-        expect(sql).toContain(') AS o2\n    ON users.id = o2.uid');
+        expect(sql).toContain('WITH o2 AS (\n    SELECT user_id AS uid, total AS amount FROM orders');
+        expect(sql).toContain('INNER JOIN o2\n    ON users.id = o2.uid');
     });
 
     test('a stepped self-join gets a unique subquery alias', () => {
@@ -524,13 +646,8 @@ describe('composable joins (review change)', () => {
             q = users
                 & joinInner (users & map (u => { uid = u.id })) (l => r => l.id == r.uid) (l => r => { id = l.id, uid = r.uid })
         `);
-        expect(sql).toContain([
-            'INNER JOIN (',
-            '    SELECT id AS uid',
-            '    FROM users',
-            ') AS users_1',
-            '    ON users.id = users_1.uid',
-        ].join('\n'));
+        expect(sql).toContain('WITH users_1 AS (\n    SELECT id AS uid FROM users');
+        expect(sql).toContain('INNER JOIN users_1\n    ON users.id = users_1.uid');
     });
 
     test('a distinct right side renders as a DISTINCT subquery', () => {
@@ -539,13 +656,8 @@ describe('composable joins (review change)', () => {
             orders: query { user_id: int } = table "orders"
             q = users & joinInner (orders & distinct) (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
-        expect(sql).toContain([
-            'INNER JOIN (',
-            '    SELECT DISTINCT *',
-            '    FROM orders',
-            ') AS orders',
-            '    ON users.id = orders.user_id',
-        ].join('\n'));
+        expect(sql).toContain('WITH orders_1 AS (\n    SELECT DISTINCT * FROM orders');
+        expect(sql).toContain('INNER JOIN orders_1 AS orders\n    ON users.id = orders.user_id');
     });
 
     test('join composes inside a pipeline with other steps', () => {

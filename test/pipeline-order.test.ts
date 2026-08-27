@@ -13,8 +13,8 @@ describe('pipeline order is preserved by derived tables', () => {
         db.run('CREATE TABLE t (a int)');
         db.run('INSERT INTO t VALUES (3), (2), (1)');
         const sql = render(`t: query { a: int } = table "t"\nq = t & take 2 & sort (u => asc u.a)`);
-        expect(sql).toContain('FROM (\n    SELECT *\n    FROM t\n    LIMIT 2');
-        expect(sql).toContain('ORDER BY a ASC');
+        expect(sql).toContain('LIMIT 2');
+        expect(sql).toContain('FROM t_1 AS t\nORDER BY a ASC');
         expect(db.query(sql).all()).toBeArray();
     });
 
@@ -80,7 +80,7 @@ describe('window projections create a derived-table boundary', () => {
             q = t & map (u => { rn = over row_number { partition = [u.dept], order = [desc u.salary] } })
                   & filter (u => u.rn == 1)
         `);
-        expect(sql).toContain('FROM (\n    SELECT');
+        expect(sql).toContain('FROM t_1 AS t\nWHERE rn = 1');
         const out = db.query(sql).all() as { rn: number }[];
         expect(out.map(r => r.rn)).toEqual([1, 1]);
     });

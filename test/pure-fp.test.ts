@@ -51,9 +51,30 @@ describe('pure evaluation API', () => {
 const USERS_A = `a: query { id: int, name: string } = table "a"`;
 const USERS_B = `b: query { id: int, name: string } = table "b"`;
 
-describe('opt-in CTE rendering', () => {
-    test('named intermediates can render as WITH clauses', () => {
+describe('CTE rendering', () => {
+    test('named intermediates render as WITH clauses', () => {
         const src = `users: query { id: int } = table \"users\"\norders: query { id: int, user_id: int } = table \"orders\"\npaid = orders & filter (o => o.id > 0)\nq = users & joinInner paid (u => o => u.id == o.user_id) (u => o => { uid = u.id, oid = o.id })`;
+        const model = parseModel(src);
+        const { value } = analyze(model, standardPrelude(services));
+        expect(value.kind).toBe('query');
+        if (value.kind !== 'query') return;
+        const result = renderQuery(value.query, DIALECTS.postgresql!);
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+            expect(result.sql).toContain('WITH paid AS (');
+            expect(result.sql).toContain('INNER JOIN paid');
+        }
+    });
+
+    test('a shared binding keeps one stable CTE name and valid qualifiers', () => {
+        // The same binding is reached twice, so its CTE must be claimed once
+        // (old bug: every visit suffixed the name → `detail_1`) and each
+        // reference site must re-apply its own alias (`FROM detail AS
+        // first_buy`) or ON/WHERE qualifiers point at a missing table.
+        const src = `tx: query { cust_id: int, tx_dt: date } = table "tx"
+detail = tx & map (d => { customer_number = d.cust_id, buy_order = over row_number { partition = [d.cust_id], order = [asc d.tx_dt] } })
+first_buy = detail & filter (d => d.buy_order == 1)
+q = first_buy & joinLeft first_buy (l => r => l.customer_number == r.customer_number) (l => r => merge l r)`;
         const model = parseModel(src);
         const { value } = analyze(model, standardPrelude(services));
         expect(value.kind).toBe('query');
@@ -61,8 +82,28 @@ describe('opt-in CTE rendering', () => {
         const result = renderQueryWithCtes(value.query, DIALECTS.postgresql!);
         expect(result.ok).toBe(true);
         if (result.ok) {
-            expect(result.sql).toContain('WITH paid AS (');
-            expect(result.sql).toContain('INNER JOIN paid');
+            expect(result.sql).toContain('WITH detail AS (');
+            expect(result.sql).not.toContain('detail_1');
+            expect(result.sql).toContain('FROM detail');
+            expect(result.sql).toContain('FROM detail AS first_buy');
+            expect(result.sql).toContain('ON detail.customer_number = first_buy.customer_number');
+        }
+    });
+
+    test('lateral right sides are not collected as CTEs', () => {
+        const src = `users: query { id: int } = table "users"
+orders: query { user_id: int, total: float } = table "orders"
+ranked = orders & fold (o => { user_id = group o.user_id, total = sum o.total })
+q = users & join_lateral (l => (ranked & filter (r => r.user_id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })`;
+        const model = parseModel(src);
+        const { value } = analyze(model, standardPrelude(services));
+        expect(value.kind).toBe('query');
+        if (value.kind !== 'query') return;
+        const result = renderQueryWithCtes(value.query, DIALECTS.postgresql!);
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+            expect(result.sql).toContain('INNER JOIN LATERAL (');
+            expect(result.sql).not.toMatch(/\bWITH\b/);
         }
     });
 });

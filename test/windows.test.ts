@@ -119,8 +119,8 @@ describe('window functions', () => {
                 & filter (u => u.rn == 1)
         `, 'trino');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn');
-        expect(sql).toContain('FROM (\n    SELECT');
-        expect(sql).toContain('WHERE rn = 1');
+        expect(sql).toContain('WITH users_1 AS (\n    SELECT id, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM users');
+        expect(sql).toContain('FROM users_1 AS users\nWHERE rn = 1');
     });
 });
 

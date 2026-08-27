@@ -542,6 +542,22 @@ orders: query { user_id: int } = table "orders"
 q = users & join_lateral (l => orders) (l => r => l.id == r.user_id) (l => r => { id = l.id })`;
         expect(() => render(src, 'sqlite')).toThrow(/lateral joins are not supported/);
     });
+
+    test('a derived right side inlines as a subquery, not a raw table', () => {
+        const src = `users: query { id: int, name: string } = table "users"
+orders: query { user_id: int, total: float } = table "orders"
+ranked = orders
+    & fold (o => { user_id = group o.user_id, total = sum o.total })
+    & map (r => { id = r.user_id, total = r.total })
+q = users
+    & join_lateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })`;
+        expect(typeErrors(src)).toEqual([]);
+        const pg = render(src, 'postgresql');
+        expect(pg).toContain('INNER JOIN LATERAL (');
+        expect(pg).toContain('FROM (\n        SELECT\n            user_id,\n            SUM(total) AS total\n        FROM orders\n        GROUP BY user_id\n    ) AS ranked');
+        expect(pg).not.toContain('FROM ranked WHERE');
+        expect(pg).toContain('WHERE user_id = users.id');
+    });
 });
 
 describe('filtered aggregates', () => {

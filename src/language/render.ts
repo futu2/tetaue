@@ -960,7 +960,13 @@ function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: Rend
         } else {
             const cteName = ctes.get(q.root.from);
             if (cteName !== undefined) {
-                clauses.push(`FROM ${dialect.quoteIdentifier(cteName)}`);
+                // A CTE reference is a bare table; the site's own alias
+                // (`q.aliases[0]`, the name outer columns are qualified
+                // with) must be reapplied or every `alias.column` reference
+                // would point at a nonexistent table. Skipped when the CTE
+                // name already matches.
+                const siteAlias = q.aliases[0] ?? q.root.name;
+                clauses.push(`FROM ${dialect.quoteIdentifier(cteName)}${cteName !== siteAlias ? ` AS ${dialect.quoteIdentifier(siteAlias)}` : ''}`);
             } else {
                 const derivedAlias = q.aliases[0] ?? q.root.name;
                 clauses.push(pretty
@@ -996,9 +1002,13 @@ function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: Rend
             } else {
                 // stepped or derived right side: render as a subquery so
                 // joins compose
-                const cteName = ctes.get(right);
+                // Lateral rights are correlated with the left row, so they
+                // are never collected as CTEs; guard the lookup anyway.
+                const cteName = step.lateral ? undefined : ctes.get(right);
                 rightSql = cteName !== undefined
-                    ? dialect.quoteIdentifier(cteName)
+                    // Reapply the join-site alias: the CTE name may differ
+                    // from the alias the ON clause qualifies columns with.
+                    ? `${dialect.quoteIdentifier(cteName)}${cteName !== rightAlias ? ` AS ${dialect.quoteIdentifier(rightAlias)}` : ''}`
                     : pretty
                         ? `(\n${indentLines(renderQueryWithDiagnostics(right, dialect, 'pretty', ctx.diagnostics, ctes, ctx.parameters, step.lateral ? new Set([...ctx.outerAliases, ...ctx.innerAliases]) : outerAliases), INDENT)}\n) AS ${dialect.quoteIdentifier(rightAlias)}`
                         : `(${renderQueryWithDiagnostics(right, dialect, 'compact', ctx.diagnostics, ctes, ctx.parameters, step.lateral ? new Set([...ctx.outerAliases, ...ctx.innerAliases]) : outerAliases)}) AS ${dialect.quoteIdentifier(rightAlias)}`;
@@ -1094,24 +1104,52 @@ export type RenderResult =
     | { ok: false; diagnostics: RenderDiagnostic[] };
 
 /**
- * Collect named, non-trivial subqueries in `q` in dependency order so they
- * can be emitted as CTEs. The top-level query is never a CTE.
+ * Walk the render tree to collect named, non-trivial subqueries in `q` in
+ * dependency order so they can be emitted as CTEs. The top-level query is
+ * never a CTE. Lateral join rights are correlated with the enclosing left
+ * row, so they are never collected (inline only).
  */
 function collectCtes(top: Query, dialect: DialectSpec): CteMap {
     const ctes = new Map<Query, string>();
     const used = new Map<string, number>();
+    // Real table names anywhere in the render tree (including lateral right
+    // subtrees). A CTE must not reuse one: in standard SQL the CTE name is
+    // in scope from the WITH keyword on, so `WITH t AS (SELECT * FROM t ...)`
+    // self-references the CTE (SQLite: "circular reference") instead of the
+    // real table. Suffix the claimed name until it is collision-free.
+    const tableNames = new Set<string>();
+    const collectTables = (q: Query): void => {
+        if (q.root.from) {
+            collectTables(q.root.from);
+        } else {
+            tableNames.add(q.root.name);
+        }
+        for (const step of q.steps) {
+            if (step.kind === 'join' || step.kind === 'set') collectTables(step.right);
+        }
+    };
+    collectTables(top);
+
     const claim = (name: string): string => {
-        const n = used.get(name) ?? 0;
-        used.set(name, n + 1);
-        return n === 0 ? name : `${name}_${n}`;
+        let i = used.get(name) ?? 0;
+        let candidate = i === 0 ? name : `${name}_${i}`;
+        while (tableNames.has(candidate)) {
+            i += 1;
+            candidate = `${name}_${i}`;
+        }
+        used.set(name, i + 1);
+        return candidate;
     };
 
     const visit = (q: Query, parent: Query | null): void => {
         if (q.root.from) visit(q.root.from, q);
         for (const step of q.steps) {
+            if (step.kind === 'join' && step.lateral) continue; // correlated: inline only
             if (step.kind === 'join' || step.kind === 'set') visit(step.right, q);
         }
-        if (parent !== null && q.name && (q.steps.length > 0 || q.distinct || q.root.from)) {
+        // A shared query is reached once per reference site; claim it on the
+        // first visit so repeated references keep a stable, unsuffixed name.
+        if (parent !== null && !ctes.has(q) && q.name && (q.steps.length > 0 || q.distinct || q.root.from)) {
             ctes.set(q, claim(q.name));
         }
     };
@@ -1120,8 +1158,20 @@ function collectCtes(top: Query, dialect: DialectSpec): CteMap {
     return ctes;
 }
 
-/** Render with named intermediates emitted as `WITH name AS (...)` CTEs. */
-export function renderQueryWithCtes(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
+/** Assemble the `WITH name AS (...), ...` header for a CTE map. */
+function renderCtes(bodies: readonly { name: string; sql: string }[], dialect: DialectSpec): string {
+    if (bodies.length === 0) return '';
+    return `WITH ${bodies.map((b, i) => `${dialect.quoteIdentifier(b.name)} AS (\n${indentLines(b.sql, INDENT)}\n)${i < bodies.length - 1 ? ',' : ''}`).join('\n')}\n`;
+}
+
+/**
+ * Pure renderer entry point: lowering errors are data, not exceptions.
+ * Dialect capability failures are preflighted before this lowering pass;
+ * defensive checks remain in the renderer for malformed hand-built IR.
+ * Every named intermediate query is emitted as a `WITH name AS (...)` CTE,
+ * so the body references it by name instead of duplicating the subquery.
+ */
+export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
     const diagnostics: RenderDiagnostic[] = [];
     const parameters: ParameterState = new Map();
     try {
@@ -1135,32 +1185,7 @@ export function renderQueryWithCtes(q: Query, dialect: DialectSpec, format: Rend
         });
         const body = renderQueryWithDiagnostics(normalized, dialect, format, diagnostics, ctes, parameters);
         if (diagnostics.length > 0) return { ok: false, diagnostics };
-        const withClause = bodies.length > 0
-            ? `WITH ${bodies.map((b, i) => `${dialect.quoteIdentifier(b.name)} AS (\n${indentLines(b.sql, INDENT)}\n)${i < bodies.length - 1 ? ',' : ''}`).join('\n')}\n`
-            : '';
-        return { ok: true, sql: withClause + body, parameters: [...parameters.keys()] };
-    } catch (err) {
-        return {
-            ok: false,
-            diagnostics: [{ message: err instanceof Error ? err.message : String(err), node: undefined }],
-        };
-    }
-}
-
-/**
- * Pure renderer entry point: lowering errors are data, not exceptions.
- * Dialect capability failures are preflighted before this lowering pass;
- * defensive checks remain in the renderer for malformed hand-built IR.
- */
-export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
-    const diagnostics: RenderDiagnostic[] = [];
-    const parameters: ParameterState = new Map();
-    try {
-        const normalized = optimizeQuery(q);
-        const capabilityDiagnostics = checkDialectCapabilities(normalized, dialect);
-        if (capabilityDiagnostics.length > 0) return { ok: false, diagnostics: capabilityDiagnostics };
-        const sql = renderQueryWithDiagnostics(normalized, dialect, format, diagnostics, new Map(), parameters);
-        return diagnostics.length > 0 ? { ok: false, diagnostics } : { ok: true, sql, parameters: [...parameters.keys()] };
+        return { ok: true, sql: renderCtes(bodies, dialect) + body, parameters: [...parameters.keys()] };
     } catch (err) {
         return {
             ok: false,
@@ -1170,4 +1195,12 @@ export function renderQuery(q: Query, dialect: DialectSpec, format: RenderFormat
             }],
         };
     }
+}
+
+/**
+ * Compatibility alias: CTE rendering is now the default; this entry point
+ * exists for callers that previously opted in explicitly.
+ */
+export function renderQueryWithCtes(q: Query, dialect: DialectSpec, format: RenderFormat = 'pretty'): RenderResult {
+    return renderQuery(q, dialect, format);
 }
