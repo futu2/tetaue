@@ -18,8 +18,8 @@
 import type { AstNode } from 'langium';
 import {
     isAccessExpression, isAscription, isApplication, isBinaryExpression,
-    isBooleanLiteral, isCaseExpression, isDollarParam, isFunType, isIdentifier, isLambda,
-    isLambdaBinaryExpression, isLambdaLetExpression, isLetExpression, isListLiteral, isListType,
+    isBooleanLiteral, isCaseExpression, isFunType, isIdentifier, isLambda,
+    isLetExpression, isListLiteral, isListType,
     isMapLiteral, isNullLiteral, isOperatorSection,
     isNumberLiteral, isQualifiedTypeName, isQueryType, isRecordType, isStringLiteral, isTypeAtom, isTypeHole, isTypeParen,
     isTypeVar, isUnaryMinus,
@@ -572,7 +572,7 @@ export class Inferencer {
             }
             return operand;
         }
-        if (isLetExpression(e) || isLambdaLetExpression(e)) {
+        if (isLetExpression(e)) {
             // `let x = value in body` is a pure lexical binding. Like a
             // top-level binding, the declared type becomes the local type once
             // the signature check passes, and the local is let-polymorphic.
@@ -617,9 +617,7 @@ export class Inferencer {
             }
             return t;
         }
-        // LambdaBinaryExpression is the `&`/`$`-free chain used for lambda
-        // bodies — structurally identical to BinaryExpression.
-        if (isBinaryExpression(e) || isLambdaBinaryExpression(e)) return this.inferBinary(e as unknown as import('./generated/ast.js').BinaryExpression, env);
+        if (isBinaryExpression(e)) return this.inferBinary(e as unknown as import('./generated/ast.js').BinaryExpression, env);
         if (isAccessExpression(e)) return this.inferAccess(e, env);
         if (isApplication(e)) return this.inferApplication(e, env);
         if (isNumberLiteral(e)) return numericLiteralScheme(this.u, e);
@@ -684,14 +682,10 @@ export class Inferencer {
             const param = dollar && env.get(dollar);
             return param ? this.u.instantiate(param) : this.u.fresh(); // unknown ids are the interpreter's call
         }
-        if (isDollarParam(e)) {
-            const scheme = env.get(e.value);
-            return scheme ? this.u.instantiate(scheme) : this.u.fresh();
-        }
         return this.u.fresh();
     }
 
-    /** An application argument: `$n` expressions become implicit lambdas. */
+    /** An application argument: `this`/`that` expressions become implicit lambdas. */
     private inferArg(e: Expr, env: Map<string, Scheme>): Type {
         const arity = this.dollarArity(e, env);
         if (arity > 0) {
@@ -2307,7 +2301,7 @@ export class Inferencer {
         let current: AstNode | undefined = e;
         while (current) {
             const parent: AstNode | undefined = current.$container;
-            if (parent && (isBinaryExpression(parent) || isLambdaBinaryExpression(parent))) {
+            if (parent && isBinaryExpression(parent)) {
                 if (parent.left === current || parent.right === current) return parent;
             }
             current = parent;
@@ -2375,7 +2369,7 @@ export class Inferencer {
             case 'joinRight':
             case 'joinFull':
                 if (index === 0) this.diag(node, `${name} expects a query as its first argument, got an expression of type ${p(argType)} — bind a table or pipeline first, e.g. ${name} orders (l => r => ...)`);
-                else if (index === 1) this.diag(node, `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got an expression of type ${p(argType)}`);
+                else if (index === 1) this.diag(node, `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or (this.id == that.user_id), got an expression of type ${p(argType)}`);
                 else if (index === 2) this.diag(node, `${name} 'merger' must be a two-argument function (curried), e.g. (l => r => merge l r) or merge, got an expression of type ${p(argType)}`);
                 else this.diag(node, `${name} takes exactly three arguments: the right query, the 'on' function, and the merger function`);
                 break;
@@ -2713,29 +2707,25 @@ export class Inferencer {
     }
 
     // -----------------------------------------------------------------------
-    // $n implicit lambda parameters (mirrors the interpreter's dollarArity)
+    // `this`/`that` implicit lambda parameters (mirrors interpreter.dollarArity)
     // -----------------------------------------------------------------------
 
     private dollarArity(node: AstNode, env: Map<string, Scheme>): number {
         let arity = 0;
-        // Walk the AST subtree; `$n` nodes not bound in `env` and not hidden
-        // behind an explicit lambda body contribute their index. An argument
-        // in a FUNCTION position of an application (by its callee's scheme) is
-        // its own implicit-lambda scope and does not leak its $n outward, nor
-        // does it let $n be captured by an explicit lambda further out
+        // Walk the AST subtree for unbound `this`/`that` identifiers (the
+        // implicit parameters, internally `$1`/`$2`), skipping those hidden
+        // behind an explicit lambda body. An argument in a FUNCTION position of an application
+        // (by its callee's scheme) is its own implicit-lambda scope and does
+        // not leak its this/that outward, nor does it let this/that be
+        // captured by an explicit lambda further out
         // (mirrors interpreter.dollarArity).
         const stack: AstNode[] = [node];
         while (stack.length > 0) {
             const cur = stack.pop()!;
-            if (isDollarParam(cur)) {
-                if (!env.has(cur.value) && !this.hiddenBehindLambda(cur, env)) {
-                    arity = Math.max(arity, Number(cur.value.slice(1)));
-                }
-                continue;
-            }
             // `this`/`that` sugar: an unbound identifier naming an implicit
-            // parameter ($1/$2) counts like a DollarParam, unless shadowed by
-            // a binding or an already-bound $n of the same name.
+            // parameter (internally $1/$2) contributes its index, unless
+            // shadowed by a binding or an already-bound $1/$2 of the same
+            // name.
             if (isIdentifier(cur) && !env.has(cur.name)) {
                 const dollar = implicitParamName(cur.name);
                 if (dollar && !env.has(dollar) && !this.hiddenBehindLambda(cur, env)) {
@@ -2764,9 +2754,9 @@ export class Inferencer {
 
     /**
      * Is `node` inside an explicit lambda body WITHOUT an intervening implicit
-     * scope? `$n` belongs to an explicit lambda only when no function-position
-     * application argument sits between it and that lambda (mirrors the
-     * interpreter's hiddenBehindLambda).
+     * scope? `this`/`that` belong to an explicit lambda only when no
+     * function-position application argument sits between it and that lambda
+     * (mirrors the interpreter's hiddenBehindLambda).
      */
     private hiddenBehindLambda(node: AstNode, env: Map<string, Scheme>): boolean {
         let cur: AstNode | undefined = node;

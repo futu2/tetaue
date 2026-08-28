@@ -424,7 +424,7 @@ describe('tetaue language server (LSP over stdio)', () => {
                 'users: query { id: int, age: int } = table "users"',
                 'adult = u => u.active && u.age >= 18',
                 'adults = users & filter (adult) & map (u => { id = u.id, age = u.age })',
-                'q = adults & take ($1 + 3)',
+                'q = adults & take (this + 3)',
                 'done: (maybe bool) = null',
                 'always = true',
                 'cased = map (u => { x = case { u.age > 18 => "adult", _ => "minor" } })',
@@ -510,7 +510,7 @@ describe('tetaue language server (LSP over stdio)', () => {
             expect(at(3, 25).text).toBe('adult');
             expect(at(3, 25).type).toBe('function');
 
-            // Lambda parameters: declaration and every use, incl. $n.
+            // Lambda parameters: declaration and every use, incl. this/that.
             expect(at(2, 8).text).toBe('u');
             expect(at(2, 8).type).toBe('parameter');
             expect(at(2, 8).modifier).toBe('declaration');
@@ -518,7 +518,7 @@ describe('tetaue language server (LSP over stdio)', () => {
             expect(at(2, 13).type).toBe('parameter');
             expect(at(3, 39).text).toBe('u');
             expect(at(3, 39).type).toBe('parameter');
-            expect(at(4, 19).text).toBe('$1');
+            expect(at(4, 19).text).toBe('this');
             expect(at(4, 19).type).toBe('parameter');
 
             // Property access, literals, null/booleans, operators.

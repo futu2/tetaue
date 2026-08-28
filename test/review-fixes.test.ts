@@ -239,7 +239,7 @@ describe('aggregation edges (review fixes)', () => {
             users: query { id: int, name: string } = table "users"
             totals = orders & fold (o => { user_id = group o.user_id, total = sum o.total })
             q = totals
-                & joinLeft users ($1.user_id == $2.id) merge
+                & joinLeft users (this.user_id == that.id) merge
                 & filter (r => is_in r.user_id [1, 2])
         `);
         expect(sql).toBe([

@@ -264,7 +264,7 @@ report: query {
     name: string,
     order_count: int,
 } = adults
-    & map { uid = $1.id, name = $1.name }
+    & map { uid = this.id, name = this.name }
     & joinInner orders (l => r => l.uid == r.user_id) (l => r => { user_id = r.user_id, name = l.name, order_id = r.id })
     & fold (r => { user_id = group r.user_id, name = group r.name, order_count = count r.order_id })
     & take 20
@@ -346,7 +346,7 @@ true  false   # bool
 null          # SQL NULL
 [1, 2, 3]     # list (IN lists, sort items)
 { a = 1 }     # record (projections)
-$1, $2        # implicit lambda parameters: ($1 + 3) ≡ u => u + 3
+this, that    # implicit lambda parameters: (this.id + 3) ≡ u => u.id + 3
 param "id"    # query parameter placeholder (SQL bind parameter)
 date "2024-01-01" / timestamp "2024-01-01 12:00:00"  # ISO literals
 ```
@@ -546,7 +546,7 @@ are static errors, not runtime surprises:
 | `drop n` | OFFSET | `LIMIT n OFFSET n` / dialect-specific |
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
 | `fold (o => { k = group o.k, s = sum o.v })` | grouping and/or aggregation | `SELECT ... GROUP BY ...` |
-| `joinInner table ($1.id == $2.user_id) { uid = $1.id }` | inner join; `joinLeft`, `joinRight`, and `joinFull` select the outer variants | `... JOIN ... ON ...` |
+| `joinInner table (this.id == that.user_id) { uid = this.id }` | inner join; `joinLeft`, `joinRight`, and `joinFull` select the outer variants | `... JOIN ... ON ...` |
 | `join_lateral (l => right) (l => r => on) (l => r => row)` | lateral join | `INNER JOIN LATERAL (...) ON ...` (PG/MySQL) |
 | `recursive (self => termQuery)` | fixed point | `WITH RECURSIVE ... UNION ALL ...` |
 
@@ -561,7 +561,7 @@ of both rows (right wins on overlap):
 
 ```
 paid_orders = orders & filter (o => o.status == "paid")
-q = users & joinInner paid_orders ($1.id == $2.user_id) merge
+q = users & joinInner paid_orders (this.id == that.user_id) merge
 ```
 
 The right side is a first-class query VALUE (any binding or pipeline — stepped right
@@ -662,38 +662,51 @@ let-bound name are referentially transparent.
 
 Lambdas abstract over a row. Two ways to write them:
 
-- **Implicit (`$n`)** — a parenthesized expression using `$1`, `$2`, ... is a lambda
-  whose parameters are the row bindings in order: `($1 + 3)` ≡ `u => u + 3`,
-  `($1 + $2)` ≡ `$1 => $2 => $1 + $2`. The highest `$n` used sets the arity.
-  `this` / `that` are sugar for `$1` / `$2` — `filter (this.active)` ≡
-  `filter ($1.active)` and `joinInner orders (this.id == that.user_id)` ≡
-  `($1.id == $2.user_id)`. They stay ordinary identifiers when a binding of the
-  same name is in scope:
+- **Implicit (`this`/`that`)** — a parenthesized expression using `this` (first
+  row) and `that` (second row) is a lambda whose parameters are the row
+  bindings: `(this.age + 3)` ≡ `u => u.age + 3` and
+  `(this.id == that.user_id)` ≡ `(u, v) => u.id == v.user_id`. These two are the
+  ONLY implicit parameters — there is no `$1`-style positional sugar. They stay
+  ordinary identifiers when a binding of the same name is in scope:
   ```
-  filter ($1.active && $1.age >= 18)          # ≡ filter (u => u.active && u.age >= 18)
-  map { id = $1.id, name = $1.name }          # braces delimit the lambda — no extra parens
+  filter (this.active && this.age >= 18)      # ≡ filter (u => u.active && u.age >= 18)
+  map { id = this.id, name = this.name }      # braces delimit the lambda — no extra parens
   joinInner orders (this.id == that.user_id) { uid = this.id }   # this left row, that right row
   ```
-  Parens inside an argument are pure grouping: `map { a = ($1.id + 1) }` means
-  exactly the same as `map { a = $1.id + 1 }`. A FUNCTION-position argument of a
+  Parens inside an argument are pure grouping: `map { a = (this.id + 1) }` means
+  exactly the same as `map { a = this.id + 1 }`. A FUNCTION-position argument of a
   nested call — a position whose callee takes a lambda, like `filter`'s predicate
   or a join's ON/merger — opens its own implicit-lambda scope: in
-  `filter (P1) $ filter (P2) s03` the `$1` inside `P2` is the inner `filter`'s
-  predicate parameter, and `joinInner orders ($1.id == $2.user_id) { ... }` scopes
-  `$1`/`$2` to the join's ON lambda. So `$n` binds to the nearest enclosing
-  lambda-taking argument — never through a lambda-taking position, and never
-  directly inside an explicit lambda body.
+  `filter (P1) $ filter (P2) s03` the `this` inside `P2` is the inner `filter`'s
+  predicate parameter, and `joinInner orders (this.id == that.user_id) { ... }`
+  scopes `this`/`that` to the join's ON lambda. So `this`/`that` bind to the
+  nearest enclosing lambda-taking argument — never through a lambda-taking
+  position, and never directly inside an explicit lambda body.
 - **Explicit** — `u => u.age >= 18`. Lambdas are curried: a two-argument function
-  is `l => r => l.id == r.user_id` (there is no `(l, r) => ...` form). `$n` is not
-  available directly inside an explicit body — it must sit in its own nested
-  lambda-taking argument, e.g. `filter (u => exists (filter (cast $1.x "int" >= 0) t))`.
+  is `l => r => l.id == r.user_id` (there is no `(l, r) => ...` form). `this`/
+  `that` are not available directly inside an explicit body — they must sit in
+  their own nested lambda-taking argument, e.g.
+  `filter (u => exists (filter (cast this.x "int" >= 0) t))`.
 
-A lambda body extends until the next `&` (pipeline) or `$` (application) at the same
-level — `joinInner orders (l => r => l.id == r.user_id) (l => r => { id = l.id }) & take 3`
-ends the merger at the record and pipelines `take 3` to the join. To use `&`/`$`
-inside a lambda body, parenthesize it: `u => (u.a & take 1)`.
+A lambda body is the same operator chain as an ordinary expression — `&` (pipeline)
+and `$` (application) are part of it, so a body extends until its chain ends
+naturally. The chain ends at a closing `)` / `]` / `}` or at the end of the
+expression; a NEWLINE is not a delimiter, so a lambda whose body is a pipeline
+continues on the next lines without extra parentheses:
+```
+account_final = process_date =>
+  s03_corp_chrem_acct
+  & filter (u => cast u.pt_dt "date" == process_date)
+  & filter (this.chrem_acct_bal_year_accum > 0)
+```
+Delimiting parens are still how you make a lambda an ARGUMENT
+(`joinInner orders (l => r => l.id == r.user_id) (l => r => { id = l.id }) & take 3`
+ends each lambda at its record and pipelines `take 3` to the join), and how you
+stop a lambda body from absorbing a following `&`/`$` step:
+`u => (u.a & take 1) & rest`. To use `&`/`$` inside a lambda that must itself
+fit in an argument position, keep it parenthesized: `u => (u.a & take 1)`.
 
-Either form binds a step the same way: `adults = filter ($1.active)` is a step
+Either form binds a step the same way: `adults = filter (this.active)` is a step
 value, so `users & adults` works.
 
 ### Column references
@@ -741,7 +754,7 @@ every keystroke: errors underline in the editor and land in the Problems panel.
 `#` doc-comment block of the binding it refers to.
 - **Semantic highlighting** — the language server colors tokens from the
 grammar, not regexes: prelude builtins (`table`, `filter`, …) as
-`function` + `defaultLibrary`, lambda bindings and parameters (including `$n`)
+`function` + `defaultLibrary`, lambda bindings and parameters (`this`/`that` implicit)
 as `function`/`parameter`, type names as `type`, record fields and map keys as
 `property`, operators as `operator`. The bundled TextMate grammar stays as the
 offline fallback.
@@ -851,6 +864,6 @@ builds the typed SQL IR and returns exact-deduped diagnostics — so `check` and
 - more pure optimizer rewrites: projection pruning and safe predicate
   pushdown (named intermediates already render as `WITH` CTEs, so subqueries
   are defined once and referenced by name)
-- LSP polish: completion for `$n` implicit lambdas and richer cross-module
+- LSP polish: completion for `this`/`that` implicit lambdas and richer cross-module
   documentation (go-to-definition, qualified completion, builtin completion,
   and importer revalidation are already implemented)

@@ -439,13 +439,13 @@ describe('schema-qualified table names', () => {
         // `alias.column` — `ecs.table.column` is invalid in most engines.
         const sql = render(`
             cust = table "ecs.cust_f"
-                & filter ($1.pt_dt == current_date)
-                & map { p_cino = $1.roleplayer, cp = $1.par_to_par_rel_rol }
+                & filter (this.pt_dt == current_date)
+                & map { p_cino = this.roleplayer, cp = this.par_to_par_rel_rol }
             bday = table "ecs.bday_f"
-                & filter ($1.pt_dt == current_date)
-                & map { customer_number = $1.individualid, birthday = $1.birthdate }
+                & filter (this.pt_dt == current_date)
+                & map { customer_number = this.individualid, birthday = this.birthdate }
             q = cust
-                & joinLeft bday (u => v => u.p_cino == v.customer_number) ($1 <> $2)
+                & joinLeft bday (u => v => u.p_cino == v.customer_number) (this <> that)
         `, 'hive');
         expect(sql).toContain('FROM ecs.cust_f AS cust_f');
         expect(sql).toContain('cust_f.roleplayer AS p_cino');
@@ -716,21 +716,21 @@ describe('composable joins (review change)', () => {
     });
 });
 
-describe('implicit lambda parameters ($n)', () => {
+describe('implicit lambda parameters (this/that)', () => {
     const USERS = `users: query { id: int, name: string, age: int, active: bool } = table "users"`;
 
-    test('($1 + 3) is a one-parameter lambda', () => {
+    test('(this.age + 3) is a one-parameter lambda', () => {
         const sql = render(`
             ${USERS}
-            q = users & map ({ x = $1.age + 3 })
+            q = users & map ({ x = this.age + 3 })
         `);
         expect(sql).toContain('SELECT age + 3 AS x');
     });
 
-    test('filter with $1', () => {
+    test('filter with this', () => {
         const sql = render(`
             ${USERS}
-            q = users & filter ($1.active && $1.age >= 18)
+            q = users & filter (this.active && this.age >= 18)
         `);
         expect(sql).toContain([
             'WHERE',
@@ -739,10 +739,10 @@ describe('implicit lambda parameters ($n)', () => {
         ].join('\n'));
     });
 
-    test('map projection with $1', () => {
+    test('map projection with this', () => {
         const sql = render(`
             ${USERS}
-            q = users & map { uid = $1.id, name = $1.name }
+            q = users & map { uid = this.id, name = this.name }
         `);
         expect(sql).toContain([
             'SELECT',
@@ -751,26 +751,26 @@ describe('implicit lambda parameters ($n)', () => {
         ].join('\n'));
     });
 
-    test('map projection with $1', () => {
+    test('map projection with this', () => {
         const sql = render(`
             ${USERS}
-            q = users & map { uid = $1.id }
+            q = users & map { uid = this.id }
         `);
         expect(sql).toContain('SELECT id AS uid');
     });
 
-    test('sort with $1', () => {
+    test('sort with this', () => {
         const sql = render(`
             users: query { id: int, age: int } = table "users"
-            q = users & sort [desc $1.age]
+            q = users & sort [desc this.age]
         `);
         expect(sql).toContain('ORDER BY age DESC');
     });
 
-    test('fold with $1', () => {
+    test('fold with this', () => {
         const sql = render(`
             orders: query { user_id: int, total: int } = table "orders"
-            q = orders & fold { uid = group $1.user_id, t = sum $1.total }
+            q = orders & fold { uid = group this.user_id, t = sum this.total }
         `);
         expect(sql).toContain([
             'SELECT',
@@ -780,16 +780,16 @@ describe('implicit lambda parameters ($n)', () => {
         expect(sql).toContain('GROUP BY user_id');
     });
 
-    test('($1 + $2) is a two-argument implicit lambda — join on', () => {
+    test('(this.id == that.user_id) is a two-argument implicit lambda — join on', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int, total: float } = table "orders"
-            q = users & joinInner orders ($1.id == $2.user_id) { uid = $1.id, total = $2.total }
+            q = users & joinInner orders (this.id == that.user_id) { uid = this.id, total = that.total }
         `);
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id');
     });
 
-    test('fixed join functions render their encoded SQL kind with $n', () => {
+    test('fixed join functions render their encoded SQL kind with this/that', () => {
         for (const [name, sqlKind] of [
             ['joinInner', 'INNER'],
             ['joinLeft', 'LEFT'],
@@ -799,30 +799,30 @@ describe('implicit lambda parameters ($n)', () => {
             const sql = render(`
                 users: query { id: int } = table "users"
                 orders: query { user_id: int } = table "orders"
-                q = users & ${name} orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }
+                q = users & ${name} orders (this.id == that.user_id) { uid = this.id, oid = that.user_id }
             `);
             expect(sql).toContain(`${sqlKind} JOIN orders ON users.id = orders.user_id`);
         }
     });
 
-    test('$n bound by the enclosing lambda resolves inside nested calls', () => {
+    test('this/that bound by the enclosing lambda resolves inside nested calls', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int, status: string } = table "orders"
-            q = users & joinInner orders ($1.id == $2.user_id && is_in $2.status ["paid", "sent"]) { uid = $1.id, oid = $2.user_id }
+            q = users & joinInner orders (this.id == that.user_id && is_in that.status ["paid", "sent"]) { uid = this.id, oid = that.user_id }
         `);
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id AND orders.status IN (\'paid\', \'sent\')');
     });
 
-    test('$n works through the $ application operator', () => {
+    test('this works through the $ application operator', () => {
         const sql = render(`
             ${USERS}
-            q = users & (filter $ ($1.age >= 18))
+            q = users & (filter $ (this.age >= 18))
         `);
         expect(sql).toContain('WHERE age >= 18');
     });
 
-    test('this/that are sugar for $1/$2', () => {
+    test('this/that are the two implicit row parameters', () => {
         const sql = render(`
             users: query { id: int, active: bool, age: int } = table "users"
             orders: query { user_id: int, total: float, status: string } = table "orders"
@@ -859,13 +859,14 @@ describe('implicit lambda parameters ($n)', () => {
         ].join('\n'));
     });
 
-    test('$n predicates scope to their own filter across $ application', () => {
-        // `$1` inside each parenthesized filter predicate is that filter's
-        // row parameter; the `$`-right operand must NOT be abstracted as a
-        // whole lambda (step applied to a lambda would be a type error).
+    test('this/that scope to their own filter across $ application', () => {
+        // `this`/`that` inside each parenthesized filter predicate is that
+        // filter's row parameter; the `$`-right operand must NOT be
+        // abstracted as a whole lambda (step applied to a lambda would be a
+        // type error).
         const sql = render(`
             s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
-            main = filter (cast $1.pt_dt "date" >= date "2025-12-31") $ filter (cast $1.pt_dt "date" <= current_date) s03_corp_chrem_tx_dtl
+            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03_corp_chrem_tx_dtl
         `);
         expect(sql).toContain([
             'WHERE',
@@ -874,34 +875,34 @@ describe('implicit lambda parameters ($n)', () => {
         ].join('\n'));
     });
 
-    test('$n in a filter nested inside an explicit lambda scopes to the inner filter', () => {
+    test('this in a filter nested inside an explicit lambda scopes to the inner filter', () => {
         // The inner `filter` predicate is a parenthesized argument — its own
-        // implicit-lambda scope — so `$1` is NOT captured by the outer `u`
+        // implicit-lambda scope — so `this` is NOT captured by the outer `u`
         // lambda; the explicit-lambda hiding walk stops at the boundary.
         const sql = render(`
             s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
-            main = s03_corp_chrem_tx_dtl & filter (u => exists (filter (cast $1.pt_dt "date" <= u.pt_dt) s03_corp_chrem_tx_dtl))
+            main = s03_corp_chrem_tx_dtl & filter (u => exists (filter (cast this.pt_dt "date" <= u.pt_dt) s03_corp_chrem_tx_dtl))
         `);
         expect(sql).toContain('EXISTS (SELECT * FROM s03_corp_chrem_tx_dtl WHERE CAST(pt_dt AS DATE) <= pt_dt)');
         expect(sql).not.toContain('unknown lambda parameter');
     });
 
-    test('$n in a VALUE-position argument bubbles up to the enclosing lambda', () => {
+    test('this/that in a VALUE-position argument bubbles up to the enclosing lambda', () => {
         // `is_in`'s first argument is a value expression, not a function
-        // position — `$1` inside its nested call is the `filter` row, so the
-        // predicate is abstracted as one lambda (the lpbirthday pattern).
+        // position — `this` inside its nested call is the `filter` row, so
+        // the predicate is abstracted as one lambda (the lpbirthday pattern).
         const sql = render(`
             users: query { id: int, active: bool } = table "users"
-            q = users & filter (is_in (from_maybe 0 $1.id) [1, 2, 3])
+            q = users & filter (is_in (from_maybe 0 this.id) [1, 2, 3])
         `);
         expect(sql).toContain('WHERE COALESCE(id, 0) IN (1, 2, 3)');
     });
 
-    test('a step with $n can be bound and reused', () => {
+    test('a step with this/that can be bound and reused', () => {
         const sql = render(`
             ${USERS}
-            adults = filter ($1.active && $1.age >= 18)
-            q = users & adults & map ({ uid = $1.id })
+            adults = filter (this.active && this.age >= 18)
+            q = users & adults & map ({ uid = this.id })
         `);
         expect(sql).toContain([
             'WHERE',
@@ -911,18 +912,18 @@ describe('implicit lambda parameters ($n)', () => {
         expect(sql).toContain('SELECT id AS uid');
     });
 
-    test('inner parens are pure grouping — they never rebind $n', () => {
-        const plain = 'users: query { id: int, age: int } = table "users"\nq = users & map { a = $1.age + 1 }';
-        const grouped = 'users: query { id: int, age: int } = table "users"\nq = users & map { a = ($1.age + 1) }';
+    test('inner parens are pure grouping — they never rebind this/that', () => {
+        const plain = 'users: query { id: int, age: int } = table "users"\nq = users & map { a = this.age + 1 }';
+        const grouped = 'users: query { id: int, age: int } = table "users"\nq = users & map { a = (this.age + 1) }';
         expect(render(grouped)).toBe(render(plain));
     });
 
-    test('$n and explicit lambdas coexist', () => {
+    test('this/that and explicit lambdas coexist', () => {
         const sql = render(`
             ${USERS}
             q = users
                 & filter (u => u.active)
-                & map ({ id = $1.id, name = upper $1.name })
+                & map ({ id = this.id, name = upper this.name })
         `);
         expect(sql).toContain('WHERE active');
         expect(sql).toContain([
@@ -932,8 +933,8 @@ describe('implicit lambda parameters ($n)', () => {
         ].join('\n'));
     });
 
-    test('unary minus works in lambda bodies (explicit and $n)', () => {
-        const src1 = 'users: query { id: int, age: int } = table "users"\nq = users & map ({ a = -$1.age })';
+    test('unary minus works in lambda bodies (explicit and implicit)', () => {
+        const src1 = 'users: query { id: int, age: int } = table "users"\nq = users & map ({ a = -this.age })';
         expect(render(src1)).toContain('0 - age AS a');
         const src2 = 'users: query { id: int, age: int } = table "users"\nq = users & map (u => { b = -u.age })';
         expect(render(src2)).toContain('0 - age AS b');
@@ -981,5 +982,54 @@ describe('review fixes: pure-local bindings, step composition, SQL escaping', ()
     test('a let-bound table accepts a query-type schema annotation', () => {
         const sql = render('q = let users: query { id: int } = table "users" in users & map (u => { id = u.id })');
         expect(sql).toBe('SELECT id\nFROM users');
+    });
+});
+
+describe('lambda bodies are full operator chains', () => {
+    test('a pipeline lambda body continues across lines without parens', () => {
+        const sql = render(`
+            users: query { id: int, age: int, active: bool } = table "users"
+            adults_for = cutoff => users
+                & filter (u => u.age >= cutoff)
+                & filter (u => u.active)
+            q = adults_for 18
+        `);
+        expect(sql).toContain('WHERE');
+        expect(sql).toContain('age >= 18');
+        expect(sql).toContain('active');
+    });
+
+    test('an unparenthesized pipeline lambda body and its parenthesized twin render identically', () => {
+        const unparenthesized = `
+            s03: query { pt_dt: date, chrem_acct_bal_year_accum: float } = table "s03"
+            account_final = process_date =>
+                s03
+                & filter (u => cast u.pt_dt "date" == process_date)
+                & filter (this.chrem_acct_bal_year_accum > 0)
+            q = account_final (cast "2024-01-01" "date")
+        `;
+        const parenthesized = `
+            s03: query { pt_dt: date, chrem_acct_bal_year_accum: float } = table "s03"
+            account_final = process_date => (
+                s03
+                & filter (u => cast u.pt_dt "date" == process_date)
+                & filter (this.chrem_acct_bal_year_accum > 0)
+            )
+            q = account_final (cast "2024-01-01" "date")
+        `;
+        const sql = render(unparenthesized);
+        const sqlParens = render(parenthesized);
+        expect(sql).toBe(sqlParens);
+        expect(sql).toContain('CAST(pt_dt AS DATE) = CAST(\'2024-01-01\' AS DATE)');
+        expect(sql).toContain('chrem_acct_bal_year_accum > 0');
+    });
+
+    test('$ inside a lambda body stays part of the body', () => {
+        // `$` is right-associative application: `upper $ u.name` ≡ `upper (u.name)`.
+        const sql = render(`
+            ${USERS}
+            q = users & map (u => { n = upper $ u.name })
+        `);
+        expect(sql).toContain('UPPER(name)');
     });
 });

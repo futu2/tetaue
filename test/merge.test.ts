@@ -213,10 +213,10 @@ describe('merge infix operator <>', () => {
         expect(render(`${USERS}\nq = users & map (u => {} <> u)`, 'sqlite')).toContain(identity);
     });
 
-    test('works with $n implicit lambdas', () => {
+    test('works with this/that implicit lambdas', () => {
         const src = `
             ${USERS}
-            q = users & map ($1 <> { active = $1.balance > 100.0 })
+            q = users & map (this <> { active = this.balance > 100.0 })
         `;
         expect(allErrors(src)).toEqual([]);
         expect(render(src, 'sqlite')).toContain('balance > 100 AS active');

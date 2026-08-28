@@ -10,8 +10,7 @@ import type { AstNode } from 'langium';
 import type { NumberLiteral } from './generated/ast.js';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBooleanLiteral,
-    isCaseExpression, isIdentifier, isLambda, isLambdaBinaryExpression, isLambdaLetExpression,
-    isDollarParam, isLetExpression, isListLiteral,
+    isCaseExpression, isIdentifier, isLambda, isLetExpression, isListLiteral,
     isListType, isMapLiteral,
     isNullLiteral, isNumberLiteral, isOperatorSection, isQualifiedTypeName, isQueryType, isStringLiteral,
     isTypeAtom, isTypeHole, isTypeParen, isTypeVar, isUnaryMinus,
@@ -881,36 +880,31 @@ function access(recv: Value, prop: string, at: AstNode, ctx: Ctx): Value {
 }
 
 // ---------------------------------------------------------------------------
-// $n implicit lambda parameters
+// `this`/`that` implicit lambda parameters
 // ---------------------------------------------------------------------------
 
 /**
- * Highest $n index in `node` that is NOT bound in `env` and not hidden inside
- * an explicit lambda body (explicit lambdas are their own scope).
+ * Highest implicit-parameter index in `node` that is NOT bound in `env` and
+ * not hidden inside an explicit lambda body (explicit lambdas are their own
+ * scope). `this` is parameter 1 and `that` is parameter 2 — the only two.
  *
  * An argument in a FUNCTION position of an application — a position whose
  * type is a curried function, e.g. `filter`'s predicate or a join's `on`
- * merger — is its own implicit-lambda scope and does not leak its $n
- * parameters outward: `filter (P1) $ filter (P2) s03` keeps the `$1` inside
+ * merger — is its own implicit-lambda scope and does not leak its `this`/
+ * `that` outward: `filter (P1) $ filter (P2) s03` keeps the `this` inside
  * the inner `filter`'s predicate instead of abstracting the whole `$`-right
- * operand into a lambda. VALUE-position $n arguments (like `cast $1.pt_dt` or
- * `is_in (from_maybe "" $1.x) [...]`) bubble up to the enclosing expression's
- * implicit lambda.
+ * operand into a lambda. VALUE-position `this`/`that` arguments (like
+ * `cast this.pt_dt` or `is_in (from_maybe "" this.x) [...]`) bubble up to
+ * the enclosing expression's implicit lambda.
  */
 function dollarArity(node: AstNode, env: ReadonlyMap<string, Value>): number {
     let arity = 0;
     const stack: AstNode[] = [node];
     while (stack.length > 0) {
         const cur = stack.pop()!;
-        if (isDollarParam(cur)) {
-            if (env.has(cur.value)) continue;
-            if (hiddenBehindLambda(cur, env)) continue;
-            arity = Math.max(arity, Number(cur.value.slice(1)));
-            continue;
-        }
         // `this`/`that` sugar: an unbound identifier naming an implicit
-        // parameter ($1/$2) counts like a DollarParam — unless a binding or
-        // an already-bound $n of the same name shadows it.
+        // parameter (internally $1/$2) contributes its index, unless shadowed
+        // by a binding or an already-bound $1/$2 of the same name.
         if (isIdentifier(cur) && !env.has(cur.name)) {
             const dollar = implicitParamName(cur.name);
             if (dollar && !env.has(dollar)) {
@@ -940,11 +934,11 @@ function dollarArity(node: AstNode, env: ReadonlyMap<string, Value>): number {
 
 /**
  * Is `node` inside an explicit lambda body WITHOUT an intervening implicit
- * scope? `$n` belongs to an explicit lambda only when no function-position
- * application argument sits between it and that lambda: `filter (u =>
- * $1.active)` leaves `$1` unbound inside `u`, but
- * `filter (u => exists (filter (cast $1.x ...) t))` scopes `$1` to the inner
- * `filter` predicate. The walk stops at the first function-position argument.
+ * scope? `this`/`that` belong to an explicit lambda only when no
+ * function-position application argument sits between it and that lambda:
+ * `filter (this.active)` scopes `this` to the filter's predicate, but
+ * `filter (u => exists (filter (cast this.x ...) t))` scopes `this` to the
+ * INNER filter. The walk stops at the first function-position argument.
  */
 function hiddenBehindLambda(node: AstNode, env: ReadonlyMap<string, Value>): boolean {
     let cur: AstNode | undefined = node;
@@ -1013,12 +1007,13 @@ function fnArgIndexesOfType(t: Type, u: TypeUniverse): Set<number> {
 }
 
 /**
- * Evaluate an expression as a value, but if it uses $n parameters that are not
- * bound in the current environment, abstract it into an implicit lambda:
- *   ($1 + 3)   ≡   u => u + 3
- *   ($1 + $2)  ≡   (u, v) => u + v
- * Lambda bodies are parenthesized, e.g. `filter ($1.active)`,
- * `joinInner orders ($1.id == $2.user_id) { uid = $1.id }`.
+ * Evaluate an expression as an argument. If it uses `this`/`that` (the
+ * implicit parameters, internally `$1`/`$2`) that are not bound in the
+ * current environment, abstract it into an implicit lambda:
+ *   (this.age + 3)            ≡   u => u.age + 3
+ *   (this.id == that.user_id) ≡   (u, v) => u.id == v.user_id
+ * Lambda arguments are parenthesized, e.g. `filter (this.active)`,
+ * `joinInner orders (this.id == that.user_id) { uid = this.id }`.
  */
 function evalArg(expr: Expr, ctx: Ctx): Value {
     const arity = dollarArity(expr, ctx.env);
@@ -1038,7 +1033,7 @@ export function evalExprWith(e: Expr, ctx: Ctx): Value {
 }
 
 function evalExprWithInner(e: Expr, ctx: Ctx): Value {
-    if (isLetExpression(e) || isLambdaLetExpression(e)) {
+    if (isLetExpression(e)) {
         // `let x = value in body` — a pure lexical binding. Evaluation
         // extends the environment immutably; the value is not mutable state.
         let v = evalExprWith(e.value as Expr, ctx);
@@ -1074,12 +1069,11 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
         return stampQueryTypeAnnotation(v, e.type, e, ctx);
     }
     if (isUnaryMinus(e)) return evalUnary(e, ctx);
-    if (isBinaryExpression(e) || isLambdaBinaryExpression(e)) {
-        // (LambdaBinaryExpression is the `&`/`$`-free chain used for lambda
-        // bodies — structurally identical to BinaryExpression.)
+    if (isBinaryExpression(e)) {
         const left = evalUnary(e.left, ctx);
-        // `$` keeps implicit-lambda argument behavior; all other operators use
-        // the ordinary unary operand evaluation already encoded by the AST.
+        // `$` keeps implicit-lambda argument behavior (its right operand is
+        // an application argument); all other operators use the ordinary
+        // unary operand evaluation already encoded by the AST.
         const right = e.operator === '$'
             ? evalArg(e.right as Expr, ctx)
             : evalUnary(e.right, ctx);
@@ -1193,7 +1187,7 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
         if (dollar) {
             const param = ctx.env.get(dollar);
             if (param) return param;
-            ctx.diagnostics.push({ node: e, message: `unknown lambda parameter '${dollar}' — $n refers to the implicit parameters of the enclosing lambda, e.g. filter ($1.active)` });
+            ctx.diagnostics.push({ node: e, message: `unknown lambda parameter '${e.name}' — this/that refer to the implicit parameters of the enclosing lambda, e.g. filter (this.active)` });
             return ERROR;
         }
         if (ctx.moduleBindings.has(e.name)) {
@@ -1202,12 +1196,6 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
         }
         const known = [...ctx.env.keys()].filter(k => !k.startsWith('@') && !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
         ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
-        return ERROR;
-    }
-    if (isDollarParam(e)) {
-        const v = ctx.env.get(e.value);
-        if (v) return v;
-        ctx.diagnostics.push({ node: e, message: `unknown lambda parameter '${e.value}' — $n refers to the implicit parameters of the enclosing lambda, e.g. filter ($1.active)` });
         return ERROR;
     }
     ctx.diagnostics.push({ node: e, message: 'unexpected expression' });
@@ -1461,7 +1449,7 @@ function joinBuiltin(name: string, joinKind: JoinKind): () => Value {
         }
         return fn(name, (on, at2, ctx2) => {
             if (!isApplicable(on)) {
-                ctx2.diagnostics.push({ node: at2 ?? on.ast, message: `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got ${describe(on)}` });
+                ctx2.diagnostics.push({ node: at2 ?? on.ast, message: `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or (this.id == that.user_id), got ${describe(on)}` });
                 return ERROR;
             }
             return fn(name, (merge, at3, ctx3) => {
@@ -1497,7 +1485,7 @@ function joinBuiltin(name: string, joinKind: JoinKind): () => Value {
                     const on1 = applyWith(on, leftRow, at4, ctx4);
                     if (isError(on1)) return null;
                     if (!isApplicable(on1)) {
-                        ctx4.diagnostics.push({ node: at4 ?? on.ast, message: `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or ($1.id == $2.user_id), got a one-argument function` });
+                        ctx4.diagnostics.push({ node: at4 ?? on.ast, message: `${name} 'on' must be a two-argument function (curried), e.g. (l => r => l.id == r.user_id) or (this.id == that.user_id), got a one-argument function` });
                         return null;
                     }
                     const onVal = applyWith(on1, rightRow, at4, ctx4);
@@ -3707,7 +3695,7 @@ function freeModuleRefs(node: AstNode, moduleNames: ReadonlySet<string>, shadow:
         if (param) shadow.delete(param);
         return;
     }
-    if (isLetExpression(node) || isLambdaLetExpression(node)) {
+    if (isLetExpression(node)) {
         if (node.value) freeModuleRefs(node.value as unknown as AstNode, moduleNames, shadow, out);
         if (node.name) shadow.add(node.name);
         if (node.body) freeModuleRefs(node.body as unknown as AstNode, moduleNames, shadow, out);

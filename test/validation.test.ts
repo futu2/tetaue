@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { errors, render, buildDocument, services } from './helpers.ts';
+import { errors, render, buildDocument, services, parseModel } from './helpers.ts';
 
 const USERS = `users: query {
     id: int,
@@ -158,49 +158,65 @@ describe('semantic errors', () => {
         ].join('\n'));
     });
 
-    test('join on with a one-parameter $n expression is rejected', () => {
+    test('join on with a one-parameter this/that expression is rejected', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
             orders: query { user_id: int } = table "orders"
-            q = users & joinInner orders ($1.id == 3) { uid = $1.id }
+            q = users & joinInner orders (this.id == 3) { uid = this.id }
         `);
         expect(messages.join('\n')).toContain("joinInner 'on' must be a two-argument function (curried)");
     });
 
-    test('$n inside an explicit lambda body is an error', () => {
+    test('this inside an explicit lambda body is an error', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
-            q = users & filter (u => $1.active)
+            q = users & filter (u => this.active)
         `);
-        expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");
+        expect(messages.join('\n')).toContain("unknown lambda parameter 'this'");
     });
 
-    test('this/that inside an explicit lambda body are errors like $n', () => {
+    test('this/that inside an explicit lambda body are errors', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
             q = users & filter (u => this.id == that.id)
         `);
-        expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");
-        expect(messages.join('\n')).toContain("unknown lambda parameter '$2'");
+        expect(messages.join('\n')).toContain("unknown lambda parameter 'this'");
+        expect(messages.join('\n')).toContain("unknown lambda parameter 'that'");
     });
 
-    test('$n inside a nested parenthesized argument is its own implicit lambda', () => {
+    test('this/that inside a nested parenthesized argument is its own implicit lambda', () => {
         // The inner `filter` predicate is a parenthesized argument — its own
-        // implicit-lambda scope — so `$1` is not captured by the outer `u`
+        // implicit-lambda scope — so `this` is not captured by the outer `u`
         // lambda nor treated as an unbound parameter of it.
         const messages = errors(`
             s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
-            main = s03_corp_chrem_tx_dtl & filter (u => exists (filter (cast $1.pt_dt "date" <= u.pt_dt) s03_corp_chrem_tx_dtl))
+            main = s03_corp_chrem_tx_dtl & filter (u => exists (filter (cast this.pt_dt "date" <= u.pt_dt) s03_corp_chrem_tx_dtl))
         `);
         expect(messages).toEqual([]);
     });
 
-    test('unbound $n at the top level is an error', () => {
+    test('unbound this/that at the top level is an error', () => {
         const messages = errors(`
             users: query { id: int } = table "users"
-            q = $1 + 3
+            q = this + 3
         `);
-        expect(messages.join('\n')).toContain("unknown lambda parameter '$1'");
+        expect(messages.join('\n')).toContain("unknown lambda parameter 'this'");
+    });
+
+    test('the positional $1/$2 sugar is gone — only this/that are implicit parameters', () => {
+        // `$1`/`$2` used to be the positional implicit-lambda sugar; it was
+        // dropped in favour of `this`/`that` only. A `$1` is no longer a
+        // token — `$` is now only the application operator — so `($1 == 1)`
+        // does not parse.
+        expect(() => parseModel(`
+            users: query { id: int } = table "users"
+            q = users & filter ($1 == 1)
+        `)).toThrow();
+        // The `this`/`that` spelling parses and type-checks instead.
+        expect(parseModel(`
+            users: query { id: int } = table "users"
+            q = users & filter (this.id == 1)
+        `)).toBeTruthy();
     });
 
     test('not requires boolean', () => {

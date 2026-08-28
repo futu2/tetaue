@@ -33,9 +33,9 @@ describe('tetaue formatter', () => {
         expect(out).toBe('q = users & filter (u => u.age >= 18 && u.active) & take 3\n');
     });
 
-    test('keeps field access and $-params tight', () => {
-        const out = roundTrip('a = $1.id == $2.user_id\n');
-        expect(out).toBe('a = $1.id == $2.user_id\n');
+    test('keeps field access and this/that tight', () => {
+        const out = roundTrip('a = this.id == that.user_id\n');
+        expect(out).toBe('a = this.id == that.user_id\n');
     });
 
     test('preserves `-` adjacency', () => {
@@ -162,6 +162,22 @@ describe('tetaue formatter', () => {
 
     test('spaces let and in', () => {
         expect(roundTrip('q = let x=1 in x\n')).toBe('q = let x = 1 in x\n');
+    });
+
+    test('formats a multi-line lambda pipeline body with & steps indented one level', () => {
+        const input = [
+            'account_final = process_date =>',
+            's03_corp_chrem_acct',
+            '& filter (u => cast u.pt_dt "date" == process_date)',
+            '& filter (this.chrem_acct_bal_year_accum > 0)',
+        ].join('\n');
+        const expected = [
+            'account_final = process_date =>',
+            's03_corp_chrem_acct',
+            '    & filter (u => cast u.pt_dt "date" == process_date)',
+            '    & filter (this.chrem_acct_bal_year_accum > 0)',
+        ].join('\n') + '\n';
+        expect(roundTrip(input)).toBe(expected);
     });
 
     test('returns undefined on unlexable input', () => {

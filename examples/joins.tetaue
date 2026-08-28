@@ -5,7 +5,7 @@
 # - <right> is any query value (a table or a pipeline — a stepped right side
 #   renders as a subquery)
 # - <on> is a two-argument function (curried): l => r => bool — the
-#   JOIN ... ON condition (or the $n sugar `($1.id == $2.user_id)`)
+#   JOIN ... ON condition (or the this/that sugar `(this.id == that.user_id)`)
 # - <merger> is a two-argument function (curried): l => r => { ... } that
 #   projects the result row, exactly like `map` with both rows in scope.
 #   `merge` itself works as the merger, giving the union of both rows.
@@ -30,11 +30,11 @@ with_names = users
     & take 5
 
 
-# --- $n implicit lambdas --------------------------------------------------
-# `($1.id == $2.user_id)` ≡ `(l => r => l.id == r.user_id)`; the map-literal
-# merger `{ ... }` uses $1 (left row) and $2 (right row).
+# --- this/that implicit lambdas ------------------------------------------
+# `(this.id == that.user_id)` ≡ `(l => r => l.id == r.user_id)`; the map-literal
+# merger `{ ... }` uses `this` (left row) and `that` (right row).
 spend_by_user = users
-    & joinInner orders ($1.id == $2.user_id) { user_id = $1.id, total = $2.total }
+    & joinInner orders (this.id == that.user_id) { user_id = this.id, total = that.total }
     & fold (o => { user_id = group o.user_id, spent = sum o.total })
     & sort (r => [desc r.spent])
     & take 10

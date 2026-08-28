@@ -12,8 +12,8 @@
  *   function   prelude builtins (defaultLibrary modifier), lambda bindings,
  *              and references to them
  *   variable   data bindings, ordinary references, namespace aliases
- *   parameter  lambda parameters (declaration modifier) and `$n` implicit
- *              parameters
+ *   parameter  lambda parameters (declaration modifier) and `this`/`that`
+ *              implicit parameters
  *   property   record field access (`u.age`) and record/map keys
  *   number     numeric literals
  *   string     string literals
@@ -26,7 +26,7 @@ import { standardPreludeNames } from '../prelude.js';
 import type { TetaueServices } from '../tetaue-module.js';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBinding, isBooleanLiteral,
-    isCaseBranch, isCaseExpression, isDollarParam, isFunType, isIdentifier, isImport, isLambda, isLambdaBinaryExpression,
+    isCaseBranch, isCaseExpression, isFunType, isIdentifier, isImport, isLambda,
     isLambdaParam, isMapEntry, isNullLiteral, isNumberLiteral, isOperatorSection, isQueryType,
     isRecordField, isStringLiteral, isTypeAtom, isTypeHole, isTypeVar, isUnaryMinus,
 } from '../generated/ast.js';
@@ -105,10 +105,6 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
             acceptor({ node, keyword: 'null', type: 'keyword' });
             return;
         }
-        if (isDollarParam(node)) {
-            acceptor({ node, property: 'value', type: 'parameter' });
-            return;
-        }
         if (isOperatorSection(node)) {
             acceptor({ node, property: 'value', type: 'operator' });
             return;
@@ -134,7 +130,7 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
             acceptor({ node, keyword: '-', type: 'operator' });
             return;
         }
-        if (isBinaryExpression(node) || isLambdaBinaryExpression(node)) {
+        if (isBinaryExpression(node)) {
             // Infix rules store their operator keywords under the CST
             // assignment feature `operators`, not the AST property
             // `operator` (the generic acceptor only knows typed properties).

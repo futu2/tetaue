@@ -16,7 +16,7 @@ report: query {
     total_spent: (maybe float),
 } = adults
 # & map (u => { uid = u.id, name = u.name })
-    & map { uid = $1.id, name = $1.name }
+    & map { uid = this.id, name = this.name }
     & joinInner orders
     (l => r => l.uid == r.user_id)
     (l => r => {
@@ -30,7 +30,7 @@ report: query {
         order_count = count r.order_id,
         total_spent = sum $ 1.0 + r.total,
     })
-    & sort [desc $1.total_spent]
+    & sort [desc this.total_spent]
     & take 20
 
 # report is this module's query.

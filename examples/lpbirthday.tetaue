@@ -31,32 +31,32 @@ corporateCustomerRelationName: string -> string
 
 custRelation =
 table "ecs.dcm_ecs_c_ecis_m_tb1150_sf_f"
-  & filter ($1.pt_dt == yesterday)
-  & filter ($1.rol_lifecycle == 1)
+  & filter (this.pt_dt == yesterday)
+  & filter (this.rol_lifecycle == 1)
   & map {
-    c_cino = $1.contextroleplayer,
-    p_cino = $1.roleplayer,
-    cp_relation = $1.par_to_par_rel_rol,
+    c_cino = this.contextroleplayer,
+    p_cino = this.roleplayer,
+    cp_relation = this.par_to_par_rel_rol,
   }
-  & map ($1 <> { relation_name = corporateCustomerRelationName $1.cp_relation })
+  & map (this <> { relation_name = corporateCustomerRelationName this.cp_relation })
   & fold {
-    c_cino = group $1.c_cino,
-    p_cino = group $1.p_cino,
-    relation_names = list $1.relation_name,
+    c_cino = group this.c_cino,
+    p_cino = group this.p_cino,
+    relation_names = list this.relation_name,
   }
 
 customerBirthday =
 table "ecs.dcm_ecs_p_ecis_m_tb1010_sf_f"
-  & filter ($1.pt_dt == yesterday)
-  & filter ($1.individual_stat == "000")
+  & filter (this.pt_dt == yesterday)
+  & filter (this.individual_stat == "000")
   & map {
-    customer_number = $1.individualid,
-    birthday = $1.birthdate,
+    customer_number = this.individualid,
+    birthday = this.birthdate,
   }
 
 corpBirthday = custRelation
-  & joinLeft customerBirthday (u => v => u.p_cino == v.customer_number) merge # ($1 <> $2)
-  & filter (is_in (from_maybe "" $1.c_cino) ["11114343"])
+  & joinLeft customerBirthday (u => v => u.p_cino == v.customer_number) merge # (this <> that)
+  & filter (is_in (from_maybe "" this.c_cino) ["11114343"])
 
 # corpBirthday is this module's query.
 main = corpBirthday

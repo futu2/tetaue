@@ -9,8 +9,9 @@
  *   - `case { cond => value, ..., _ => value }` — SQL CASE WHEN as a
  *     first-class expression (`_` is the fallback branch; `case`/`_` reserved)
  *   - `let x = e in body` — pure local bindings (`let`/`in` reserved)
- *   - implicit lambdas: a parenthesized expression using $n parameters,
- *     `($1 + 3)` ≡ `u => u + 3`, `($1 + $2)` ≡ `$1 => $2 => $1 + $2`
+ *   - implicit lambdas: a parenthesized expression using `this`/`that` sugar
+ *     for the first/second implicit row parameters: `filter (this.active)` is
+ *     `u => u.active`, and a two-row lambda is `(this.id == that.user_id)`
  *   - SQL primitives use reserved `@` names (for example `@table`); public
  *     names such as `table` and `filter` are ordinary prelude bindings
  * Operators: `&` is the pipeline (`a & f` ⇔ `f a`), `$` is right-associative
@@ -79,9 +80,8 @@ Expression:
     Ascription | LetExpression | BinaryExpression;
 
 // `let x = e in body` — a pure local binding (no recursion). The value and
-// body are ordinary expressions; inside a lambda the dedicated
-// LambdaLetExpression keeps `&`/`$` out of the lambda body unless
-// parenthesized.
+// body are ordinary expressions; a lambda body is an ordinary Expression too,
+// so `let` inside a lambda is plain `let x = e in body`.
 LetExpression:
     {infer LetExpression} 'let' name=(ID | ARG_ID | OP_SECTION) (':' type=Type)? '=' value=Expression 'in' body=Expression;
 
@@ -159,28 +159,19 @@ infix BinaryExpression on UnaryExpression:
     > '>>=' | '>>'
     > right assoc '$';
 
-// A lambda body is the same operator chain WITHOUT the `&` (pipeline) and `$`
-// (application) levels, which bind loosest: `(l => r => { ... }) & take 3` ends
-// the lambda at the record instead of swallowing the next pipeline step. To
-// use `&`/`$` inside a lambda body, parenthesize: `u => (u.a & take 1)`.
-LambdaBody:
-    Ascription | LambdaLetExpression | LambdaBinaryExpression;
-
-LambdaLetExpression:
-    {infer LambdaLetExpression} 'let' name=(ID | ARG_ID | OP_SECTION) (':' type=Type)? '=' value=LambdaBody 'in' body=LambdaBody;
-
-infix LambdaBinaryExpression on UnaryExpression:
-    right assoc '>>>' | '<<<'
-    > '<$>' | '<$' | '<*' | '*>' | '<*>'
-    > '<|>'
-    > '*' | '/'
-    > '+' | '-' | '<>'
-    > '==' | '!=' | '<' | '<=' | '>' | '>='
-    > '&&'
-    > '||'
-    > '?'
-    > '>>=' | '>>';
-
+// A lambda body is an ordinary Expression — the SAME full operator chain as
+// any other expression, `&` (pipeline) and `$` (application) included. There
+// is no separate lambda-body grammar: a body extends until its operator chain
+// ends, which is exactly where an ordinary expression ends — at a closing
+// `)` / `]` / `}` or at the end of the enclosing context. A newline is NOT a
+// delimiter, so a lambda binding whose body is a pipeline continues on the
+// next lines without extra parentheses:
+//   account_final = process_date =>
+//     s03_corp_chrem_acct & filter ... & filter ...
+// Delimiting parens make a lambda an ARGUMENT and stop its body from
+// absorbing a following `&`/`$` step:
+//   (l => r => { ... }) & take 3
+//   u => (u.a & take 1) & rest
 UnaryExpression:
     {infer UnaryMinus} '-' operand=UnaryExpression
     | AccessExpression;
@@ -202,9 +193,11 @@ Application infers Expr:
 // Application arguments are literals, containers, lambdas, parenthesized
 // expressions, or `u.field` access chains. Lambdas are curried: a
 // two-argument function is `(l => r => ...)` — there is no `(l, r) => ...`
-// form (use `$1`/`$2` for implicit parameters instead).
+// form (use `this`/`that` for implicit parameters instead). A lambda body is an
+// ordinary Expression; delimiting parens make the lambda an argument
+// (`filter (u => ...)`) and stop its body from absorbing a following `&`/`$`.
 Argument infers Expr:
-    {infer Lambda} '(' param=LambdaParam ')' '=>' body=LambdaBody
+    {infer Lambda} '(' param=LambdaParam ')' '=>' body=Expression
     | Atom ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | OP_SECTION | STRING))+
     | {infer Identifier} name=(ARG_ID | CORE_ID)
     | {infer OperatorSection} value=OP_SECTION
@@ -214,7 +207,7 @@ Argument infers Expr:
     | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
     | {infer MapLiteral} '{' (receiver=Expression '|')? (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
-    | {infer Lambda} param=LambdaParam '=>' body=LambdaBody
+    | {infer Lambda} param=LambdaParam '=>' body=Expression
     | {infer CaseExpression} 'case' (subject=Expression)? '{' (branches+=CaseBranch (',' branches+=CaseBranch)* ','?)? '}'
     | '(' Expression ')';
 
@@ -225,11 +218,10 @@ Atom infers Expr:
     | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
     | {infer MapLiteral} '{' (receiver=Expression '|')? (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
-    | {infer Lambda} param=LambdaParam '=>' body=LambdaBody
-    | {infer Lambda} '(' param=LambdaParam ')' '=>' body=LambdaBody
+    | {infer Lambda} param=LambdaParam '=>' body=Expression
+    | {infer Lambda} '(' param=LambdaParam ')' '=>' body=Expression
     | {infer CaseExpression} 'case' (subject=Expression)? '{' (branches+=CaseBranch (',' branches+=CaseBranch)* ','?)? '}'
     | Identifier
-    | {infer DollarParam} value=LAMBDA_PARAM
     | {infer OperatorSection} value=OP_SECTION
     | '(' Expression ')';
 
@@ -280,9 +272,6 @@ terminal ARG_ID: /(?=([_a-zA-Z][\w_]*))\1(?![ \t\r\n]*[:=])/;
 terminal ID: /[_a-zA-Z][\w_]*/;
 terminal NUMBER returns number: /[0-9]+(\.[0-9]*)?/;
 terminal STRING: /"(\\.|[^"\\])*"/;
-// Implicit lambda parameters: `$1` is the first parameter, `$2` the second, ...
-// (longest match keeps `$` as the application operator and `$1` as a parameter).
-terminal LAMBDA_PARAM: /\$[0-9]+/;
 
 // A type hole: an unsolved metavariable named by the user (or the compiler),
 // e.g. `query ?schema`, `{ id: int | ?rest }`.

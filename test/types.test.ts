@@ -152,12 +152,12 @@ describe('row polymorphism', () => {
         expect(messages.join('\n')).toContain('float/decimal literal'); // the 1.5 literal can't meet an int column
     });
 
-    test('map, fold, join, composition and $n all type-check', () => {
+    test('map, fold, join, composition and this/that all type-check', () => {
         expect(typeErrors(`${USERS}
             orders: query { user_id: int, total: float, status: string } = table "orders"
             paid = orders & filter (o => o.status == "paid")
             q = users
-                & filter ($1.active && $1.age >= 18)
+                & filter (this.active && this.age >= 18)
                 & map (u => { id = u.id, name = upper u.name, age = u.age })
                 & sort (u => [asc u.name])
                 & fold (r => { id = group r.id, n = count r.id })
@@ -398,21 +398,21 @@ describe('type errors', () => {
         expect(typeErrors(`${USERS}\nq = users & filter 5`)).not.toEqual([]);
     });
 
-    test('$n inside a query-argument nested filter stays a query, not a lambda', () => {
+    test('this/that inside a query-argument nested filter stays a query, not a lambda', () => {
         // The `$`-right operand `filter (P2) s03` and the `exists` argument
-        // are queries whose filter predicates own their `$1` implicit lambdas;
+        // are queries whose filter predicates own their `this`/`that` implicit lambdas;
         // neither side may be abstracted into a whole-argument lambda.
         expect(allErrors(`
             s03: query { pt_dt: date } = table "s03"
-            main = filter (cast $1.pt_dt "date" >= date "2025-12-31") $ filter (cast $1.pt_dt "date" <= current_date) s03
+            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03
         `)).toEqual([]);
         expect(allErrors(`
             s03: query { pt_dt: date } = table "s03"
-            main = s03 & filter (u => exists (filter (cast $1.pt_dt "date" <= u.pt_dt) s03))
+            main = s03 & filter (u => exists (filter (cast this.pt_dt "date" <= u.pt_dt) s03))
         `)).toEqual([]);
     });
 
-    test('this/that type exactly like $1/$2', () => {
+    test('this/that are the implicit row parameters', () => {
         expect(allErrors(`
             s03: query { pt_dt: date } = table "s03"
             main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03
@@ -513,7 +513,7 @@ q = users & map (u => { id = f u.id })`;
     });
 
     test('dynamic joins qualify both sides', () => {
-        const sql = render(`users = table "users"\norders = table "orders"\nq = users & joinInner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }`);
+        const sql = render(`users = table "users"\norders = table "orders"\nq = users & joinInner orders (this.id == that.user_id) { uid = this.id, oid = that.user_id }`);
         expect(sql).toContain('ON users.id = orders.user_id');
     });
 
@@ -578,7 +578,7 @@ describe('paren-free application', () => {
     });
 
     test('annotated bindings after a bare-identifier argument are not swallowed', () => {
-        const src = `users: query { id: int, active: bool } = table "users"\nby_active = filter ($1.active)\nq = users & by_active\nnext: query { id: int, active: bool } = users & take 2`;
+        const src = `users: query { id: int, active: bool } = table "users"\nby_active = filter (this.active)\nq = users & by_active\nnext: query { id: int, active: bool } = users & take 2`;
         expect(typeErrors(src)).toEqual([]);
     });
 
@@ -588,7 +588,7 @@ describe('paren-free application', () => {
     });
 
     test('join with a bare-identifier right side still works', () => {
-        const src = `users: query { id: int } = table "users"\norders: query { user_id: int } = table "orders"\nq = users & joinInner orders ($1.id == $2.user_id) { uid = $1.id, oid = $2.user_id }`;
+        const src = `users: query { id: int } = table "users"\norders: query { user_id: int } = table "orders"\nq = users & joinInner orders (this.id == that.user_id) { uid = this.id, oid = that.user_id }`;
         expect(typeErrors(src)).toEqual([]);
     });
 

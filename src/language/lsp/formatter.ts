@@ -33,7 +33,7 @@ interface Tok {
 const CONTINUATION = new Set(['&', '$', '|', '==', '!=', '<', '<=', '>', '>=', '&&', '||', '>>>', '<<<', '*', '/', '+', '-']);
 
 /** Word-like tokens that get a space between them and their neighbors. */
-const WORD_TOKEN_NAMES = new Set(['ID', 'ARG_ID', 'NUMBER', 'STRING', 'LAMBDA_PARAM']);
+const WORD_TOKEN_NAMES = new Set(['ID', 'ARG_ID', 'NUMBER', 'STRING']);
 const WORD_KEYWORDS = new Set(['query', 'maybe', 'true', 'false', 'null', 'let', 'in']);
 
 function isComment(t: Tok): boolean {
