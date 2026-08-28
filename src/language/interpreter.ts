@@ -12,7 +12,7 @@ import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBooleanLiteral,
     isCaseExpression, isIdentifier, isLambda, isLetExpression, isListLiteral,
     isListType, isMapLiteral,
-    isNullLiteral, isNumberLiteral, isOperatorSection, isQualifiedTypeName, isQueryType, isStringLiteral,
+    isNullLiteral, isNumberLiteral, isOperatorSection, isQualifiedTypeName, isQueryType, isRecordType, isStringLiteral,
     isTypeAtom, isTypeHole, isTypeParen, isTypeVar, isUnaryMinus,
     type Application, type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
 } from './generated/ast.js';
@@ -163,6 +163,13 @@ export type Value =
         defaultTable?: string | null }
     | { kind: 'expr'; node: SqlNode; ast?: AstNode }
     | { kind: 'list'; items: Value[]; ast?: AstNode }
+    /**
+     * The monoid identity (`mempty`). Its SQL value depends on the instance,
+     * which only the use site knows: a `<>` operand, an ascription, a
+     * list-argument builtin, or a row/record context resolves it. Unresolved,
+     * it renders as the string identity `''` (the concrete default).
+     */
+    | { kind: 'mempty'; ast?: AstNode }
     | { kind: 'error'; ast?: AstNode }
     /**
      * An imported module namespace (`import "x.tetaue" as t`). Qualified
@@ -249,6 +256,7 @@ export function describe(v: Value): string {
         case 'module': return `module '${v.name}'`;
 
         case 'error': return 'an error';
+        case 'mempty': return 'the monoid identity (mempty)';
     }
 }
 
@@ -529,12 +537,17 @@ export function applyWith(f: Value, arg: Value, at: AstNode | undefined, ctx: Ct
         case 'fn':
             return f.apply(arg, at, ctx);
         case 'step': {
+            // Diagnostics inside the step (bad predicate, bad projection, ...)
+            // anchor at the APPLICATION site (`users & filter ...`), never at
+            // the lambda the operator section resolved to (prelude `_&_`),
+            // which would print a misleading prelude position.
+            const site = at ?? f.ast;
             if (arg.kind !== 'query') {
-                ctx.diagnostics.push({ node: at ?? astOf(arg) ?? f.ast ?? fallbackNode(ctx), message: `step '${f.name}' expects a query, got ${describe(arg)} — use it in a pipeline: query & ${f.name} ...` });
+                ctx.diagnostics.push({ node: site ?? astOf(arg) ?? fallbackNode(ctx), message: `step '${f.name}' expects a query, got ${describe(arg)} — use it in a pipeline: query & ${f.name} ...` });
                 return ERROR;
             }
             const query = prepareQueryForStep(arg.query, f.name);
-            const next = f.apply(query, at, ctx);
+            const next = f.apply(query, site, ctx);
             return next ? { kind: 'query', query: next, ast: at } : ERROR;
         }
         case 'lambda': {
@@ -552,6 +565,12 @@ export function applyWith(f: Value, arg: Value, at: AstNode | undefined, ctx: Ct
                 });
             }
             return { kind: 'lambda', params: remaining, body: f.body, closure: env, ast: f.ast };
+        }
+        case 'mempty': {
+            // `mempty` is not a function; application always fails. Keep the
+            // message shared with the inference pass so both passes agree.
+            ctx.diagnostics.push({ node: at ?? f.ast, message: `mempty is a value, not a function — write (mempty : T) to pick the instance, e.g. (mempty : [int])` });
+            return ERROR;
         }
         default:
             ctx.diagnostics.push({ node: at ?? fallbackNode(ctx), message: `cannot apply ${describe(f)}` });
@@ -652,6 +671,100 @@ function mergeValues(l: Value, r: Value, at: AstNode | undefined, ctx: Ctx): Val
 }
 
 /**
+ * Resolve `mempty` against the OTHER `<>` operand (Haskell's type-directed
+ * instance selection, made explicit at the use site):
+ *   - `mempty <> s` / `s <> mempty` with s an expression of type string → ''
+ *   - with s a list → []
+ *   - with s a record → {} (right-biased merge keeps the other operand's
+ *     fields; the record identity carries no fields of its own)
+ * A `null` side (the empty-operand slot) returns the other operand unchanged
+ * for strings/lists; for records the merge call already handles it.
+ */
+function memptyIdentityFor(other: Value, at: AstNode | undefined, ctx: Ctx, otherIsRight: boolean): Value {
+    if (other.kind === 'expr' && other.node.type === 'string') {
+        return mkExpr(lit('', 'string'), at);
+    }
+    if (other.kind === 'list') {
+        return { kind: 'list', items: [], ast: at };
+    }
+    if (other.kind === 'record') {
+        // <> identity on records: the empty record. Merging {} with `other`
+        // yields exactly `other`'s materialized fields.
+        return mergeValues(recordValue([], at), other, at, ctx);
+    }
+    ctx.diagnostics.push({
+        node: at ?? other.ast,
+        message: `mempty has no instance for ${describe(other)} — the closed Monoid instances are string, [a], and records`,
+    });
+    return ERROR;
+}
+
+/**
+ * Decode an ascription annotation into a concrete `mempty` value. The closed
+ * instances (see docs/design/type-system.md §7): string, lists, and records.
+ * Scalars like int/bool have NO monoid instance — `(mempty : int)` is an
+ * error, matching the inference pass. Unknown annotations (holes, variables)
+ * leave the identity unresolved so a surrounding use site can still resolve it.
+ */
+function expandMemptyAnnotation(t: import('./generated/ast.js').Type, ctx: Ctx): Value | null {
+    let cur: import('./generated/ast.js').Type = t;
+    const seen = new Set<string>();
+    for (;;) {
+        if (isTypeAtom(cur)) {
+            if (cur.maybeType) { cur = cur.maybeType; continue; }
+            if (cur.base) { cur = cur.base; continue; }
+        }
+        if (isTypeParen(cur)) { cur = cur.type; continue; }
+        if (isTypeVar(cur) && !cur.name.startsWith('@') && ctx.typeAliases?.has(cur.name) && !seen.has(cur.name)) {
+            seen.add(cur.name);
+            cur = ctx.typeAliases.get(cur.name)!;
+            continue;
+        }
+        break;
+    }
+    if (isListType(cur)) return { kind: 'list', items: [] };
+    if (isRecordType(cur)) return recordValue([]);
+    if (isTypeVar(cur) && cur.name === '@string') return mkExpr(lit('', 'string'));
+    return null;
+}
+function memptyFromAnnotation(t: import('./generated/ast.js').Type, at: AstNode | undefined, ctx: Ctx): Value {
+    let cur: import('./generated/ast.js').Type = t;
+    for (;;) {
+        if (isTypeAtom(cur)) {
+            if (cur.maybeType) { cur = cur.maybeType; continue; }
+            if (cur.base) { cur = cur.base; continue; }
+        }
+        if (isTypeParen(cur)) { cur = cur.type; continue; }
+        // Expand module-local/scalar aliases (`int` → `@int`).
+        if (isTypeVar(cur) && !cur.name.startsWith('@') && ctx.typeAliases?.has(cur.name)) {
+            cur = ctx.typeAliases.get(cur.name)!;
+            continue;
+        }
+        break;
+    }
+    if (isListType(cur)) {
+        // The element type is unchecked at the value layer — lists are
+        // heterogeneous at evaluation time; inference checks elements.
+        return { kind: 'list', items: [], ast: at };
+    }
+    if (isRecordType(cur)) {
+        return recordValue([], at);
+    }
+    if (isTypeVar(cur) && cur.name.startsWith('@') && cur.name.slice(1) === 'string') {
+        return mkExpr(lit('', 'string'), at);
+    }
+    if (isTypeVar(cur) && cur.name.startsWith('@')) {
+        ctx.diagnostics.push({
+            node: at ?? cur,
+            message: `mempty has no instance for ${cur.name.slice(1)} — the closed Monoid instances are string, [a], and records`,
+        });
+        return mkExpr(lit('', 'string'), at); // concrete default keeps downstream IR valid
+    }
+    // Holes/type variables stay unresolved (`mempty : ?a` in a signature).
+    return { kind: 'mempty', ast: at };
+}
+
+/**
  * Read the field `name` off a record. Row-shaped records (no materialized
  * fields) synthesize the column expression from the schema, inlining derived
  * columns exactly like the previous row access did.
@@ -726,7 +839,9 @@ function applyScopedBinaryOperator(op: BinaryOperator, left: Value, right: Value
     const operator = ctx.env.get(sectionSpelling(op));
     if (operator) {
         const partial = applyWith(operator, left, at, ctx);
-        return isError(partial) ? ERROR : applyWith(partial, right, at, ctx);
+        return isError(partial)
+            ? ERROR
+            : reanchorDiagnostics(at, ctx, () => applyWith(partial, right, at, ctx));
     }
     if (!isIntrinsicOperator(op)) {
         ctx.diagnostics.push({ node: at, message: `operator '${op}' is not defined` });
@@ -734,6 +849,34 @@ function applyScopedBinaryOperator(op: BinaryOperator, left: Value, right: Value
     }
     const partial = applyWith(operatorIntrinsicValue(op), left, at, ctx);
     return isError(partial) ? ERROR : applyWith(partial, right, at, ctx);
+}
+
+/**
+ * Re-anchor diagnostics raised while evaluating an infix operator through a
+ * scoped `_op_` lambda (e.g. the prelude's `_&_ = x => f => f x`). The lambda
+ * body lives in ANOTHER module, so any diagnostic that grew there would print
+ * that module's position. After evaluation, diagnostics added while the body
+ * ran whose AST root is NOT the caller's operator node are re-anchored at
+ * `at` (keeping their message); diagnostics anchored inside the caller's own
+ * module keep their exact node.
+ */
+function reanchorDiagnostics(at: AstNode, ctx: Ctx, evalRest: () => Value): Value {
+    const mark = ctx.diagnostics.length;
+    const operatorRoot = rootOf(at);
+    const result = evalRest();
+    for (let i = mark; i < ctx.diagnostics.length; i++) {
+        const d = ctx.diagnostics[i]!;
+        if (d.node && rootOf(d.node) === operatorRoot) continue;
+        ctx.diagnostics[i] = { ...d, node: at };
+    }
+    return result;
+}
+
+/** Walk to the top-level owner (the Model) of a node. */
+function rootOf(node: AstNode): AstNode {
+    let current = node;
+    while (current.$container) current = current.$container;
+    return current;
 }
 
 /** SQL-aware semantics supplied only by hidden operator intrinsics. */
@@ -780,8 +923,15 @@ const dummyNode = { $type: 'Placeholder' } as unknown as AstNode;
 
 function evalBinary(op: string, l: Value, r: Value, at: AstNode, ctx: Ctx): Value {
     // `<>` is a closed Semigroup operation for strings and lists, while
-    // records retain their structural right-biased merge behavior.
+    // records retain their structural right-biased merge behavior. `mempty`
+    // resolves to the other operand's monoid identity.
     if (op === '<>') {
+        if (l.kind === 'mempty' && r.kind === 'mempty') {
+            ctx.diagnostics.push({ node: at, message: `cannot infer the monoid instance of mempty <> mempty — annotate one side, e.g. (mempty : [int]) <> xs` });
+            return ERROR;
+        }
+        if (l.kind === 'mempty') return memptyIdentityFor(r, at, ctx, true);
+        if (r.kind === 'mempty') return memptyIdentityFor(l, at, ctx, false);
         if (l.kind === 'list' && r.kind === 'list') {
             return { kind: 'list', items: [...l.items, ...r.items], ast: at };
         }
@@ -1064,7 +1214,8 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
     }
     if (isAscription(e)) {
         // Type annotations are erased except for query schemas on plain
-        // tables, where the annotation IS the schema.
+        // tables, where the annotation IS the schema — and `mempty`, where
+        // the annotation picks the monoid instance (type-directed value).
         const v = evalExprWith(e.operand!, ctx);
         return stampQueryTypeAnnotation(v, e.type, e, ctx);
     }
@@ -1419,7 +1570,12 @@ function sequenceBuiltin(name: 'applyLeft' | 'applyRight' | 'then', keep: 'left'
 }
 
 function step(name: string, impl: (q: Query, at: AstNode | undefined, ctx: Ctx) => Query | null): Value {
-    return { kind: 'step', name, apply: impl };
+    return { kind: 'step', name, apply: (q, at, ctx) => {
+        // `at` may legitimately be undefined (a step VALUE applied later, e.g.
+        // `users & adults` where `adults` was built with no application node);
+        // the impl's own fallbacks cover that case.
+        return impl(q, at ?? undefined, ctx);
+    } };
 }
 
 /** A set operation: `left & union right`, `intersect`, `except`, `union_all`. */
@@ -2085,6 +2241,10 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     // Zero-argument constants (SQL keywords, rendered bare — no parens).
     current_date: () => mkExpr({ kind: 'current-date', type: 'date' }),
     current_timestamp: () => mkExpr({ kind: 'current-timestamp', type: 'timestamp' }),
+
+    // The monoid identity is type-directed: `<>` resolves it against the other
+    // operand; an ascription resolves it through the schema/stamp decoders.
+    mempty: () => ({ kind: 'mempty' }),
 
     // Date-part helpers (teta's convenience helpers over extract):
     //   year u.created_at, month u.created_at, day u.created_at, ...
@@ -2871,7 +3031,10 @@ function exprArgs(
 ): SqlNode[] | null {
     const nodes: SqlNode[] = [];
     for (const a of args) {
-        const node = exprNode(a);
+        // An unresolved `mempty` in an expression list resolves to the
+        // string identity (the concrete default instance).
+        const resolved = a.kind === 'mempty' ? mkExpr(lit('', 'string'), a.ast) : a;
+        const node = exprNode(resolved);
         const ok = node !== null && (kind === 'any'
             ? true
             : kind === 'numeric'
@@ -2881,7 +3044,7 @@ function exprArgs(
                     : dateLike(node));
         if (!ok) {
             const want = kind === 'numeric' ? 'numeric' : kind === 'string' ? 'string' : 'date or timestamp';
-            ctx.diagnostics.push({ node: at ?? a.ast, message: `${what} expects ${want} expressions, got ${node ? `type ${typeName(node.type)}` : describe(a)}` });
+            ctx.diagnostics.push({ node: at ?? a.ast, message: `${what} expects ${want} expressions, got ${node ? `type ${typeName(node.type)}` : describe(resolved)}` });
             return null;
         }
         if (forbid(node, ['agg', 'group', 'order'], what, at ?? a.ast, ctx)) return null;
@@ -3648,6 +3811,9 @@ function stampQueryTypeAnnotation(
     at: AstNode | undefined,
     ctx: Ctx,
 ): Value {
+    if (v.kind === 'mempty' && typeAst) {
+        return memptyFromAnnotation(typeAst, at, ctx);
+    }
     if (v.kind !== 'query' || v.query.known || !typeAst
         || !v.query.steps.every(step => step.kind !== 'join')) {
         return v;
@@ -3806,6 +3972,20 @@ export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBi
     const ctx: Ctx = { env, diagnostics, moduleBindings: new Set(moduleBindings), ...ctxExtras };
     let v = evalExprWith(binding.value, ctx);
     v = stampQueryTypeAnnotation(v, binding.type, binding, ctx);
+    // A bare `mempty` with a binding annotation picks the instance from the
+    // annotation (`x: [int] = mempty`) — same type-directed rule as
+    // `x = (mempty : [int])`. Non-maybe annotations only; a query-typed
+    // annotation is a schema stamp, not a monoid instance.
+    if (v.kind === 'mempty' && binding.type) {
+        v = memptyFromAnnotation(binding.type, binding, ctx);
+    }
+    if (v.kind === 'mempty' && binding.type) {
+        // The annotation stayed abstract (a user alias wrapping a list, e.g.
+        // `type IntList = [int]`): decode it through the alias map before
+        // giving up — memptyFromAnnotation expanded `@` scalars only.
+        const aliased = expandMemptyAnnotation(binding.type, ctx);
+        if (aliased) v = aliased;
+    }
     // Remember the binding name on query values so generated SQL aliases
     // (derived tables, joined subqueries) can reuse it instead of inventing
     // names like `folded` — the SQL then reads like the source. Copy the

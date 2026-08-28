@@ -26,6 +26,7 @@ import { createImportResolver } from './resolve.js';
 import { createModuleLoader, parseModel } from './module-cache.js';
 import type { Model } from './generated/ast.js';
 import { standardPrelude } from './prelude.js';
+import { stringEscapeWarningsFor } from './strings.js';
 
 export interface CompileDiagnostic {
     /** URI of the module the diagnostic belongs to. */
@@ -34,6 +35,8 @@ export interface CompileDiagnostic {
     /** 0-based LSP position (the CST start of the offending node). */
     line: number;
     character: number;
+    /** `'error'` (default) or `'warning'` (e.g. unknown string escapes). */
+    severity?: 'error' | 'warning';
 }
 
 export type CompileOutcome =
@@ -42,6 +45,8 @@ export type CompileOutcome =
         sql: string;
         /** Named query parameters in the order they were encountered. */
         parameters: string[];
+        /** Non-fatal warnings (e.g. unknown string escapes); empty most of the time. */
+        diagnostics: CompileDiagnostic[];
     }
     | { ok: false; diagnostics: CompileDiagnostic[] };
 
@@ -112,13 +117,14 @@ export function projectTreeFor(root: ProjectModule, services: TetaueServices): P
     };
 }
 
-function diagnostic(d: { node?: { $cstNode?: { range: { start: { line: number; character: number } } } | null } | null; message: string }, uri: string): CompileDiagnostic {
+function diagnostic(d: { node?: { $cstNode?: { range: { start: { line: number; character: number } } } | null } | null; message: string }, uri: string, severity?: 'error' | 'warning'): CompileDiagnostic {
     const pos = d.node?.$cstNode?.range.start;
     return {
         uri,
         message: d.message,
         line: pos?.line ?? 0,
         character: pos?.character ?? 0,
+        ...(severity ? { severity } : {}),
     };
 }
 
@@ -178,6 +184,11 @@ export function compileModuleText(
     }
 
     const { modules, importsByModule, exportsByModule, diagnostics: treeDiagnostics } = projectTreeFor(main, services);
+    // The prelude module anchors its own diagnostics (e.g. an error raised
+    // while applying the `_&_` pipeline lambda must point at prelude.tetaue,
+    // not at the importing file).
+    const prelude = standardPrelude(services);
+    const anchorModules = [...modules, prelude];
     const { value, diagnostics: merged } = checkProject(modules, {
         requireQuery,
         // Strict main by default for render/check; `build` opts in via
@@ -186,16 +197,21 @@ export function compileModuleText(
         importsByModule,
         reexportsByModule: exportsByModule,
         entryBinding: binding,
-        prelude: standardPrelude(services),
+        prelude,
     });
 
     const all: CompileDiagnostic[] = [];
     for (const d of [...treeDiagnostics, ...merged]) {
-        const m = moduleOf(d.node, modules) ?? main;
+        const m = moduleOf(d.node, anchorModules) ?? main;
         all.push(diagnostic(d, m.uri ?? rootUri));
     }
+    // Unknown string escapes stay verbatim in the value but warn — the CLI
+    // prints them, the LSP squiggles them.
+    for (const warning of stringEscapeWarningsFor(main.model)) {
+        all.push(diagnostic(warning, main.uri ?? rootUri, 'warning'));
+    }
 
-    if (all.length > 0 || value.kind === 'error') {
+    if (all.some(d => (d.severity ?? 'error') === 'error') || value.kind === 'error') {
         return { ok: false, diagnostics: all };
     }
     if (value.kind !== 'query') {
@@ -209,5 +225,10 @@ export function compileModuleText(
             diagnostics: rendered.diagnostics.map(d => renderDiagnostic(d, rootUri, modules, main)),
         };
     }
-    return { ok: true, sql: rendered.sql, parameters: rendered.parameters };
+    return {
+        ok: true,
+        sql: rendered.sql,
+        parameters: rendered.parameters,
+        diagnostics: all.filter(d => d.severity === 'warning'),
+    };
 }

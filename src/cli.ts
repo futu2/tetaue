@@ -82,7 +82,8 @@ function msg(err: unknown): string {
 
 function printCompileDiagnostics(diagnostics: CompileDiagnostic[]): void {
     for (const d of diagnostics) {
-        console.error(`${d.uri}:${d.line + 1}:${d.character + 1}: error: ${d.message}`);
+        const severity = d.severity ?? 'error';
+        console.error(`${d.uri}:${d.line + 1}:${d.character + 1}: ${severity}: ${d.message}`);
     }
 }
 
@@ -140,6 +141,10 @@ async function cmdRenderCheck(command: 'render' | 'check', args: string[]): Prom
         printCompileDiagnostics(outcome.diagnostics);
         return 1;
     }
+    // Warnings do not block a successful compile — print them, then the
+    // normal result (or JSON payload).
+    const warnings = outcome.diagnostics.filter(d => d.severity === 'warning');
+    if (warnings.length > 0) printCompileDiagnostics(warnings);
     if (command === 'render') {
         console.log(json
             ? JSON.stringify({ sql: outcome.sql, parameters: outcome.parameters }, null, 2)

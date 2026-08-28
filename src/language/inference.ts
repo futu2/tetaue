@@ -122,6 +122,22 @@ function isNumericPrim(t: Type): boolean {
 }
 
 /**
+ * A binding whose whole value is a bare `mempty` reference (still the prelude
+ * builtin, not shadowed). Its annotation DEFINES the monoid instance instead
+ * of being checked against an inferred one — same convention as a bare
+ * `table`'s schema annotation. The grammar wraps a bare identifier in a
+ * zero-argument Application, so unwrap those first.
+ */
+function isBareMempty(v: Expr): boolean {
+    let cur: Expr = v;
+    while (isApplication(cur) && cur.arguments.length === 0) cur = cur.func;
+    return isIdentifier(cur) && cur.name === 'mempty';
+}
+
+/** The set-operation primitives whose SQL form needs known schemas. */
+const SET_OP_BUILTINS: ReadonlySet<string> = new Set(['union', 'union_all', 'intersect', 'except']);
+
+/**
  * Scope-collision message helpers — worded identically to the interpreter's
  * (`interpreter.ts`) so `mergeDiagnostics` dedupes the pair.
  */
@@ -171,6 +187,13 @@ export class Inferencer {
      * row-field variable at the point the list is inferred).
      */
     private deferred: { node: AstNode | undefined; a: Type; b: Type; message: string }[] = [];
+
+    /**
+     * `mempty` uses whose instance is decided by later unification (an
+     * ascription, a `<>` operand, a concat/greatest argument, ...). Checked
+     * in flushDeferred once the surrounding constraints have bound the type.
+     */
+    private pendingMempty: { node: AstNode; type: Type; application: import('./generated/ast.js').Application }[] = [];
     /** Static type recorded for every expression / binding node (hover, completion). */
     nodeTypes = new Map<AstNode, Type>();
     /**
@@ -210,12 +233,36 @@ export class Inferencer {
             }
         }
         this.deferred = [];
+        // `mempty` instance resolution: the use site has unified the type by
+        // now (annotation, `<>` operand, list-argument element check, ...).
+        for (const use of this.pendingMempty) {
+            this.checkMemptyResolved(use);
+        }
+        this.pendingMempty = [];
+    }
+
+    /** Validate one resolved `mempty` use against the closed Monoid instances. */
+    private checkMemptyResolved(use: { node: AstNode; type: Type; application: import('./generated/ast.js').Application }): void {
+        const r = this.u.peel(use.type);
+        const ok = r.kind === 'prim' && r.name === 'string'
+            || r.kind === 'list'
+            || (r.kind === 'row' && this.u.resolveRow(r).tail === null)
+            || r.kind === 'var'; // still unsolved (hole/signature) — other checks own it
+        if (ok) return;
+        this.diag(use.node, `mempty has no instance for ${this.u.pretty(use.type, true)} — the closed Monoid instances are string, [a], and records (annotate the use site, e.g. (mempty : [int]))`);
     }
 
     /** True when `name` in `env` is still the prelude scheme, not a local/import shadow. */
     private isPreludeBuiltin(name: string, env: Map<string, Scheme>): boolean {
         const scheme = env.get(name);
         return scheme !== undefined && scheme === this.preludeEnv.get(name);
+    }
+
+    /** Whether the application is the prelude `mempty` builtin (no shadowing). */
+    private isMemptyApplication(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): boolean {
+        return isIdentifier(e.func)
+            && e.func.name === 'mempty'
+            && this.isPreludeBuiltin('mempty', env);
     }
 
     // -----------------------------------------------------------------------
@@ -471,6 +518,24 @@ export class Inferencer {
                     if (!(err instanceof UnifyError)) throw err;
                     ok = false;
                 }
+            } else if (isBareMempty(v)) {
+                // `x: [int] = mempty` — the annotation DEFINES the instance
+                // (the identity is unconstrained on its own). Same rule as a
+                // bare table's schema annotation — but the annotation must be
+                // one of the closed Monoid instances (string, list, record).
+                try {
+                    this.u.unify(ann, inferred);
+                } catch (err) {
+                    if (!(err instanceof UnifyError)) throw err;
+                }
+                const r = this.u.peel(ann);
+                const monoid = r.kind === 'prim' && r.name === 'string'
+                    || r.kind === 'list'
+                    || r.kind === 'row';
+                if (!monoid) {
+                    this.diag(b, `mempty has no instance for ${this.u.pretty(ann, true)} — the closed Monoid instances are string, [a], and records`);
+                }
+                ok = true;
             } else {
                 const sk = this.u.skolemize(inferred);
                 try {
@@ -564,11 +629,15 @@ export class Inferencer {
             try {
                 this.u.unify(operand, ann);
             } catch (err) {
-                if (err instanceof UnifyError) {
-                    this.diag(e, `annotation type ${this.u.pretty(ann)} does not match inferred type ${this.u.pretty(operand)}`);
-                } else {
-                    throw err;
+                if (!(err instanceof UnifyError)) throw err;
+                // An ascription ON `mempty` picks the instance (`mempty :
+                // [int]`); when the annotation cannot match a monoid, point
+                // at the instance problem instead of a bare unify mismatch.
+                if (isApplication(e.operand) && this.isMemptyApplication(e.operand, env)) {
+                    this.diag(e, `mempty has no instance for ${this.u.pretty(ann, true)} — the closed Monoid instances are string, [a], and records`);
+                    return ann;
                 }
+                this.diag(e, `annotation type ${this.u.pretty(ann)} does not match inferred type ${this.u.pretty(operand)}`);
             }
             return operand;
         }
@@ -1255,6 +1324,7 @@ export class Inferencer {
         }
         if (funcName === 'over') return this.inferOver(e, env);
         if (funcName === 'cast' && e.arguments.length === 2) return this.inferCast(e, env, funcName);
+        if (funcName === 'mempty') return this.inferMempty(e, env);
         let f = this.u.peel(rawF);
         const argTypes: Type[] = [];
         for (let i = 0; i < e.arguments.length; i++) {
@@ -1342,6 +1412,9 @@ export class Inferencer {
         }
         if (funcName && LIST_BUILTINS.has(funcName) && e.arguments.length > 0) {
             this.checkListBuiltin(funcName, e, env);
+        }
+        if (funcName && SET_OP_BUILTINS.has(funcName)) {
+            this.checkSetOpOperand(funcName, e, env);
         }
         return f;
     }
@@ -1711,6 +1784,43 @@ export class Inferencer {
         }
         this.diag(targetExpr, `${name} expects a target type as a string literal — one of: ${CAST_TYPES.join(', ')}`);
         return this.u.fresh();
+    }
+
+    /**
+     * `mempty` — the monoid identity, resolved by the use site (no
+     * user-definable instances, so the closed instance table is complete):
+     *   - `mempty : string` (the concrete fallback, also the standalone value)
+     *   - `mempty : [a]` (any element type)
+     *   - `mempty : { ... }` (a closed record; fields stay unknown here and
+     *     are pinned by unification against the other `<>` operand)
+     * Anything else is an instance error. Ascriptions and inference both
+     * funnel through `checkMemptyInstance`, so the annotation IS the lookup.
+     */
+    private inferMempty(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
+        for (const arg of e.arguments) this.inferArg(arg, env); // arity errors flow below
+        const result = this.u.fresh();
+        if (e.arguments.length === 1) {
+            const t = this.inferExpr(e.func as unknown as Expr, env);
+            try {
+                this.u.unify(t, fun(result, result));
+                return result;
+            } catch (err) {
+                if (!(err instanceof UnifyError)) throw err;
+                this.diag(e, `mempty applied as a function takes exactly one argument — write (mempty : T), e.g. (mempty : (maybe string))`);
+                return this.u.fresh();
+            }
+        }
+        if (e.arguments.length > 1) {
+            this.diag(e, `mempty takes no arguments — write (mempty : T) to pick the instance, e.g. (mempty : [int])`);
+            return this.u.fresh();
+        }
+        this.checkMemptyInstance(result, e.func, e);
+        return result;
+    }
+
+    /** Pin a mempty result to the annotated/unified instance; reject non-monoids. */
+    private checkMemptyInstance(result: Type, at: AstNode | undefined, e: import('./generated/ast.js').Application): void {
+        this.pendingMempty.push({ node: at ?? e, type: result, application: e });
     }
 
     /**
@@ -2126,6 +2236,47 @@ export class Inferencer {
                 break;
             }
         }
+    }
+
+    /**
+     * Set operations (`union`/`intersect`/`except`/`union_all`) match columns
+     * POSITIONALLY in SQL, while tetaue rows are unordered records — so the
+     * renderer projects an explicit shared column order and rejects operands
+     * whose schema is not fully known. Report that here, at the set call,
+     * instead of as a render-time surprise.
+     */
+    private checkSetOpOperand(name: string, e: import('./generated/ast.js').Application, env: Map<string, Scheme>): void {
+        const isDynamic = (t: Type | undefined): boolean => {
+            if (!t) return true;
+            const r = this.u.peel(t);
+            if (r.kind === 'builtin') return this.isDynamicSetOperand(this.u.peel(r.of));
+            return this.isDynamicSetOperand(r);
+        };
+        const right = e.arguments[0];
+        const rightT = right ? this.nodeTypes.get(right) : undefined;
+        if (isDynamic(rightT)) {
+            this.diag(right ?? e, `${name} requires known schemas on both operands — annotate each table or project it with map first`);
+            return;
+        }
+        // The LEFT operand arrives through the `_&_` pipeline lambda
+        // (`a & union b` evaluates as `union b a`); reach it through the
+        // section application when present.
+        const section = e.$container;
+        const leftArg = section && isApplication(section) && section.arguments[0]
+            ? section.arguments[0]
+            : null;
+        if (!leftArg) return;
+        const leftT = this.nodeTypes.get(leftArg);
+        if (isDynamic(leftT)) {
+            this.diag(leftArg, `${name} requires known schemas on both operands — annotate each table or project it with map first`);
+        }
+    }
+
+    /** Whether a peeled type is an unknown-schema query row (`query ?table`). */
+    private isDynamicSetOperand(r: Type): boolean {
+        if (r.kind !== 'query') return false;
+        const row = this.u.peel(r.row);
+        return row.kind === 'var';
     }
 
     /**
@@ -2828,7 +2979,45 @@ export function infer(model: Model, prelude?: ProjectModule): { diagnostics: Inf
  * key includes the owning module's URI, so identical errors at the same
  * offset in DIFFERENT modules are not collapsed into one (this matters in
  * the CLI/LSP render path, where parsed nodes carry no `$document`).
+ *
+ * The merged list is also ORDERED so the root cause of a failure comes
+ * first: the two passes walk bindings in dependency order and both sides
+ * anchor pipeline (`&`) failures at the same prelude `_&_` node, so raw
+ * emission order is not cause-first. Diagnostics are bucketed per module —
+ * cause/scope-entry diagnostics, then shape/aggregate follow-ons, then
+ * error-propagation echoes — and each bucket keeps source order, so an
+ * imported module's errors never displace the root module's own ordering.
+ *
+ * Suppression of echoes ("got an error", "cannot apply"):
+ *  - "got an error" (the interpreter describing an ERROR value) is dropped
+ *    when its module holds no cause — typically the prelude's
+ *    `_&_ = x => f => f x` restating the caller's failure;
+ *  - "cannot apply" is ambiguous: it is the primary error for a genuinely
+ *    mismatched application (e.g. `union` over different rows) AND the
+ *    downstream shape of a poisoned inner type. It is dropped only when
+ *    another diagnostic's node sits strictly INSIDE its node — a cause
+ *    beneath the application proves the failure came from within.
  */
+const ECHO_PATTERNS = ['got an error', 'cannot apply'];
+
+const SHAPE_PATTERNS = ['must be', 'cannot contain', 'must produce'];
+
+function bucketOf(message: string): number {
+    if (ECHO_PATTERNS.some(pattern => message.includes(pattern))) return 2;
+    if (SHAPE_PATTERNS.some(pattern => message.includes(pattern))) return 1;
+    return 0;
+}
+
+/** Whether `node` sits strictly inside `ancestor` (by $container chains). */
+function isStrictDescendant(node: AstNode | undefined, ancestor: AstNode): boolean {
+    let current = node?.$container;
+    while (current) {
+        if (current === ancestor) return true;
+        current = current.$container;
+    }
+    return false;
+}
+
 export function mergeDiagnostics<T extends { node: AstNode | undefined; message: string }>(
     modules: readonly ProjectModule[],
     ...lists: readonly (readonly T[])[]
@@ -2849,5 +3038,49 @@ export function mergeDiagnostics<T extends { node: AstNode | undefined; message:
             out.push(d);
         }
     }
-    return out;
+    // Per-module cause-first bucketing; unanchored diagnostics keep raw order.
+    const byModule = new Map<string, T[]>();
+    const unanchored: T[] = [];
+    for (const d of out) {
+        const moduleUri = d.node ? (moduleOf(d.node, modules)?.uri ?? '') : '';
+        if (!moduleUri) {
+            unanchored.push(d);
+            continue;
+        }
+        let bucket = byModule.get(moduleUri);
+        if (!bucket) byModule.set(moduleUri, bucket = []);
+        bucket.push(d);
+    }
+    const result: T[] = [];
+    for (const bucket of byModule.values()) {
+        const kept: T[] = [];
+        for (const d of bucket) {
+            if (bucketOf(d.message) !== 2) {
+                kept.push(d);
+                continue;
+            }
+            // An echo survives only when nothing explains it: no "got an
+            // error"-family cause elsewhere in the module, and no cause
+            // nested inside the echo's own node.
+            const isGotError = d.message.includes('got an error');
+            const explained = bucket.some(other => {
+                if (other === d || bucketOf(other.message) === 2) return false;
+                if (isGotError) return true; // any local cause explains it away
+                return other.node?.$cstNode && d.node?.$cstNode
+                    ? isStrictDescendant(other.node, d.node)
+                    : false;
+            });
+            if (!explained) kept.push(d);
+        }
+        const cause: T[] = [];
+        const shape: T[] = [];
+        const echo: T[] = [];
+        for (const d of kept) {
+            const rank = bucketOf(d.message);
+            (rank === 0 ? cause : rank === 1 ? shape : echo).push(d);
+        }
+        result.push(...cause, ...shape, ...echo);
+    }
+    result.push(...unanchored);
+    return result;
 }

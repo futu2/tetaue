@@ -115,6 +115,7 @@ export rank = @rank
 export dense_rank = @dense_rank
 export percent_rank = @percent_rank
 export ntile = @ntile
+export mempty = @mempty
 export is_not_in = @is_not_in
 export right_substring = @right_substring
 export least = @least

@@ -117,22 +117,37 @@ The whole CLI — `render`, `check`, `parse`, `format`, `build`, `watch`, and
 runtime, so it runs on machines with neither bun nor node installed:
 
 ```sh
-bun run build:standalone            # one binary for THIS platform → dist/tetaue
-bun run build:standalone:all        # all five platforms (Linux can build for all)
-bun run build:standalone:windows    # or: linux, linux-arm, macos, macos-arm
+bun run build:standalone              # one binary for THIS platform → dist/
+bun run build:standalone:all          # all five platforms (Linux can build for all)
+bun run build:standalone:portable     # every platform, official bun runtime
+bun run build:standalone:windows      # or: linux, linux-arm, macos, macos-arm
 ```
 
 Output in `dist/` (git-ignored):
 
-| Platform        | File                        |
-|-----------------|-----------------------------|
-| Linux x64/arm64 | `tetaue-linux-x64` / `tetaue-linux-arm64` |
-| macOS x64/arm64 | `tetaue-darwin-x64` / `tetaue-darwin-arm64` |
-| Windows x64     | `tetaue-windows-x64.exe`    |
+| Platform             | File                                          |
+|----------------------|-----------------------------------------------|
+| Linux x64 (musl)     | `tetaue-linux-x64-musl`                       |
+| Linux arm64 (musl)   | `tetaue-linux-arm64-musl`                     |
+| macOS x64/arm64      | `tetaue-darwin-x64` / `tetaue-darwin-arm64`   |
+| Windows x64          | `tetaue-windows-x64.exe`                      |
 
-The first cross-compile for a platform downloads that platform's bun runtime
-once (cached afterwards); on the current platform the build is offline. Zip
-`dist/` and attach the binaries to a release — they need no dependencies
+Linux binaries are musl-based: they run on Alpine out of the box (`apk add
+libstdc++` if it is missing) and anywhere else musl is installed, with no
+distro-library coupling.
+
+By default the build embeds the bun runtime **installed on this machine**. A
+distro-built bun is dynamically linked against that distro's libraries — on
+Arch, for example, the result silently requires `libicuuc.so.78`, so the
+binary only runs on Arch systems with that exact ICU. Pass
+`--official-runtime` (or use `build:standalone:portable`) to embed the
+matching release from [oven-sh/bun](https://github.com/oven-sh/bun) instead;
+it statically links ICU and needs nothing beyond libc (gnu) or musl +
+`libstdc++.so.6` (musl). The release zips are cached under
+`~/.cache/tetaue/bun-runtime/` and reused offline afterwards; the first
+download needs `curl` and `unzip`.
+
+Zip `dist/` and attach the binaries to a release — they need no dependencies
 beyond the OS itself. (The VS Code extension's `lsp` command and the
 standalone binary serve the same language server; each editor keeps working
 with the extension's own bundled server.)
@@ -638,10 +653,13 @@ over (lag u.salary 1 nothing) { order = [asc u.joined] }   # lag / lead — offs
 over (sum u.salary) { partition = [u.dept] }        # windowed aggregates
 ```
 
-Operator precedence (tightest first): `>>> <<<` (function composition,
-PureScript-style) → `* /` → `+ - <>` (`<>` is the record-merge monoid) →
-`== != < <= > >=` → `&&` → `||` → `&`
-(pipeline: `a & f` ⇔ `f a`) → `$` (application: `f $ a` ⇔ `f a`, right-assoc).
+Operator precedence (tightest first, matching the grammar):
+`>>> <<<` (function composition, PureScript-style, right-assoc)
+→ `<$>` `<$` `<*` `*>` `<*>` (Functor/Applicative)
+→ `<|>` (Alternative) → `* /` → `+ - <>` (`<>` is the record-merge monoid)
+→ `== != < <= > >=` → `&&` → `||` → `&`
+(pipeline: `a & f` ⇔ `f a`) → `?` (unwrap-with-default: `u.email ? "n/a"`)
+→ `>>=` `>>` (Monad) → `$` (application: `f $ a` ⇔ `f a`, right-assoc).
 Application binds tightest: `upper u.name` is `upper (u.name)`.
 
 ### Local bindings

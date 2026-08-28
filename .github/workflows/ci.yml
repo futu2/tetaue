@@ -30,6 +30,9 @@ jobs:
       - name: Check examples
         run: bun run check:examples
 
+      - name: Render and execute on SQLite (in-process)
+        run: bun run validate:sqlite
+
   dialects:
     runs-on: ubuntu-latest
     services:

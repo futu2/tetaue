@@ -262,6 +262,15 @@ export const BUILTIN_SPECS = [
     { name: 'dense_rank', category: 'window', doc: 'DENSE_RANK — window-only', scheme: () => mono(windowOf(p('int'))) },
     { name: 'percent_rank', category: 'window', doc: 'PERCENT_RANK — window-only', scheme: () => mono(windowOf(p('int'))) },
     { name: 'ntile', category: 'window', doc: 'NTILE — window-only', scheme: () => mono(fun(p('int'), windowOf(p('int')))) },
+
+    // --- monoid identity ---------------------------------------------------
+    // Type-directed: inference resolves the instance at the use site (string,
+    // list, record) and the interpreter produces the matching empty value.
+    // A BARE flexible variable: the kind adapts to the use site (row for
+    // records, type for string/list), and the closed Monoid instance table is
+    // enforced by the pending-use check in inference.ts (checkMemptyResolved),
+    // not by a static constraint (which could not express row-kind instances).
+    { name: 'mempty', category: 'constant', doc: 'monoid identity — "" for string, [] for lists, {} for records', scheme: u => mono(u.fresh()) },
 ] as const satisfies readonly BuiltinSpec[];
 
 /**

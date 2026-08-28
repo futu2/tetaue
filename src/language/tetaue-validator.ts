@@ -11,6 +11,7 @@ import * as path from 'node:path';
 import type { Import, TetaueAstType, Model } from './generated/ast.js';
 import { parseStringLiteral, type Diagnostic } from './interpreter.js';
 import { mergeDiagnostics } from './inference.js';
+import { stringEscapeWarningsFor } from './strings.js';
 import { checkedProjectFor } from './lsp/document-analysis.js';
 import type { TetaueServices } from './tetaue-module.js';
 import { moduleOf } from './imports.js';
@@ -42,6 +43,13 @@ export function checkModel(model: Model, accept: ValidationAcceptor, services: T
     // Tree diagnostics (unresolved imports, cycles, parse errors) are not
     // produced by the checker, so fold them into the same exact-deduped list.
     const merged = mergeDiagnostics(modules, diagnostics, checked.diagnostics);
+
+    // Escape warnings come from the parser (`parseStringLiteral`); re-derive
+    // them per literal node so they anchor to the exact string in THIS
+    // document (the collector may also hold warnings from earlier parses).
+    for (const warning of stringEscapeWarningsFor(model)) {
+        accept('warning', warning.message, { node: warning.node });
+    }
 
     for (const diagnostic of merged) acceptFolded(diagnostic, 'error', model, modules, accept);
 }

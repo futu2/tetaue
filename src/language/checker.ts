@@ -93,6 +93,9 @@ export function checkProject(
     const root = modules[modules.length - 1];
     // The prelude is a real module, but it is not part of the user's import
     // graph. Process it first and inject only its exports into user scopes.
+    // `allModules` (prelude included) is also the diagnostic-anchor universe:
+    // an error inside a prelude lambda (e.g. `_&_ = x => f => f x`) must carry
+    // the PRELUDE's uri, not the importing file's.
     const allModules = prelude ? [prelude, ...modules] : [...modules];
     let standardValues = new Map<string, Value>();
     let standardSchemes = new Map<string, Scheme>();
@@ -251,10 +254,18 @@ export function checkProject(
         if (!mainBinding) {
             value = ERROR;
             if (requireQuery) {
-                interpreterDiagnostics.push({
-                    node: root.model,
-                    message: "a module's query is its `main` binding — this module has none (it is a library and does not compile to SQL; add a `main` binding or pass --binding to render a specific one)",
-                });
+                // The no-main hint is only useful on an otherwise-clean
+                // module: when the module has real diagnostics, the missing
+                // `main` is noise (and a broken module is not a useful
+                // library anyway). No entry-point hint has been pushed yet,
+                // so any diagnostic here is a real problem.
+                const noisy = interpreterDiagnostics.length > 0;
+                if (!noisy) {
+                    interpreterDiagnostics.push({
+                        node: root.model,
+                        message: "a module's query is its `main` binding — this module has none (it is a library and does not compile to SQL; add a `main` binding or pass --binding to render a specific one)",
+                    });
+                }
             }
         } else if (requireQuery && !(value.kind === 'error') && value.kind !== 'query') {
             interpreterDiagnostics.push({
@@ -271,7 +282,11 @@ export function checkProject(
                     ? `module has no binding named '${entryBinding}'`
                     : `a module must have at least one binding — ${mainBinding ? 'its `main` binding is the query' : "its last binding is the module's query"}`,
             });
-        } else if (!(value.kind === 'error') && value.kind !== 'query') {
+        } else if (value.kind === 'error') {
+            // The binding already failed with its own diagnostics — a "must
+            // be a query" line would only repeat the cascade.
+            value = ERROR;
+        } else if (value.kind !== 'query') {
             interpreterDiagnostics.push({
                 node: selectedBinding,
                 message: entryBinding
