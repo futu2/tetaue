@@ -134,8 +134,18 @@ tail       ::= lowercase-row-variable | '?hole_name'
 The current runtime uses a deliberately closed instance table:
 
 - `Num`: `int`, `float`, `decimal`.
+- `Frac`: `float`, `decimal`.
 - `Eq`: `int`, `float`, `decimal`, `string`, `bool`, `date`, `timestamp`.
 - `Ord`: the same scalar set as `Eq`.
+- `DateTime`: `date`, `timestamp` — the calendar-valued class of the date
+  family (`year`…`second`, `extract`, `date_add`, `date_diff`, `date_trunc`,
+  `date_format`, `to_unixtime`). Their schemes state the constraint — e.g.
+  `year : DateTime t => t -> int` and `date_trunc : DateTime t => t -> string
+  -> t` — so hovers show the real shape, and concrete non-date arguments are
+  rejected by the ordinary constraint machinery (`year o.note` in a lambda,
+  a bound `f = year` applied to a string). Numeric literals still need the
+  post-check: they type as defaulted `Num` variables, so no constraint
+  fails until after defaulting.
 - `Semigroup` and `Monoid`: `string` and lists (list concatenation does not
   require a constraint on the element type).
 - `Functor`: `(maybe a)`, `[a]`, and `query r` through `fmap`.

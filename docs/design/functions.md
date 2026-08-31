@@ -132,7 +132,12 @@ Constants `current_date` → `CURRENT_DATE` and `current_timestamp` →
 Units for `date_add`/`date_diff`/`date_trunc` (string literal): `year`,
 `month`, `week`, `day`, `hour`, `minute`, `second`. Dialects that lack a
 calendar primitive use elapsed-time or formatting fallbacks, so all validated
-units remain renderable. Date parts: `year`, `month`, `day`,
+units remain renderable. The date family carries a `DateTime` typeclass constraint
+(`date`/`timestamp` only) on its calendar-valued inputs and outputs, so the
+static schemes match the runtime checks — see `docs/design/type-system.md`
+§7. `date_trunc` preserves its input's date-ness
+(`date` truncates to `date`, `timestamp` to `timestamp`), like `date_add`, so
+a truncated date compares with `current_date`. Date parts: `year`, `month`, `day`,
 `day_of_week`, `hour`, `minute`, `second` — `day_of_week` follows each
 dialect's convention (PG `DOW` 0=Sunday, Trino `DAY_OF_WEEK` 1=Monday, SQLite
 `%w` 0=Sunday, MySQL/Hive `DAYOFWEEK` 1=Sunday). `date_format`/`date_parse`

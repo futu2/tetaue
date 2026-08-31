@@ -39,7 +39,7 @@
  *     list.
  ******************************************************************************/
 import {
-    type PrimName, type Scheme, type Type, type TypeUniverse, type VarKind,
+    type PrimName, type Scheme, type Type, type TypeClass, type TypeUniverse, type VarKind,
     aggOf, fun, groupOf, listOf, maybeOf, prim, queryOf, rowOf, truthType, windowOf,
 } from './types.js';
 
@@ -78,11 +78,13 @@ export type CoreTypeName = (typeof CORE_TYPE_NAMES)[number];
 
 export const coreTypeName = (name: CoreTypeName): string => `@${name}`;
 
-/** Build a polymorphic scheme: named free variables, generalized. */
-function poly(u: TypeUniverse, vars: [string, VarKind][], build: (...types: Type[]) => Type): Scheme {
+/** Build a polymorphic scheme: named free variables, generalized.
+ *  `constraints` attach type classes to the variables by position
+ *  (`['DateTime']` on the first variable makes it `DateTime t => ...`). */
+function poly(u: TypeUniverse, vars: [string, VarKind][], build: (...types: Type[]) => Type, constraints: Record<number, TypeClass> = {}): Scheme {
     const types: Type[] = [];
-    for (const [name, kind] of vars) {
-        types.push(u.fresh(kind === 'row' ? 'row' : 'flex', name));
+    for (const [i, [name, kind]] of vars.entries()) {
+        types.push(u.fresh(kind === 'row' ? 'row' : 'flex', name, i in constraints ? [constraints[i]!] : []));
     }
     return u.generalize([], build(...types));
 }
@@ -166,6 +168,15 @@ export const BUILTIN_SPECS = [
 
     // --- records ---------------------------------------------------------
     { name: 'merge', category: 'record', doc: 'record union — the right record wins on overlap', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, u.fresh('row')))) },
+    // Record transformers (teta-style pure record helpers), used inside map:
+    //   map (rename (k => "user_" <> k))  — rename every field via a rule
+    //   map (pick ["id", "email"])        — keep the listed fields in order
+    //   map (omit ["password_hash"])      — remove the listed fields
+    // `rename` is fully generic; `pick`/`omit` get a precise special case in
+    // inference.ts (inferRecordPicker) so their static output row is known.
+    { name: 'rename', category: 'record', doc: 'rename every record field with a key rule — map (rename (k => "user_" <> k))', scheme: u => poly(u, [rowVar], r => fun(fun(p('string'), p('string')), fun(r, u.fresh('row')))) },
+    { name: 'pick', category: 'record', doc: 'keep only the listed record fields, in order — map (pick ["id", "email"])', scheme: u => poly(u, [rowVar], r => fun(listOf(p('string')), fun(r, u.fresh('row')))) },
+    { name: 'omit', category: 'record', doc: 'remove the listed record fields — map (omit ["password_hash"])', scheme: u => poly(u, [rowVar], r => fun(listOf(p('string')), fun(r, u.fresh('row')))) },
 
     // --- logic -----------------------------------------------------------
     { name: 'exists', category: 'logic', doc: 'exists query — correlated EXISTS subquery', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), p('bool'))) },
@@ -187,20 +198,20 @@ export const BUILTIN_SPECS = [
     { name: 'timestamp', category: 'constant', doc: 'timestamp "2024-01-01 12:00:00" — ISO timestamp literal', scheme: () => mono(fun(p('string'), p('timestamp'))) },
     { name: 'current_date', category: 'date', doc: 'CURRENT_DATE', scheme: () => mono(p('date')) },
     { name: 'current_timestamp', category: 'constant', doc: 'CURRENT_TIMESTAMP', scheme: () => mono(p('timestamp')) },
-    { name: 'extract', category: 'date', doc: 'extract x "month"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('int')))) },
-    { name: 'year', category: 'date', doc: 'year of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
-    { name: 'month', category: 'date', doc: 'month of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
-    { name: 'day', category: 'date', doc: 'day of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
-    { name: 'day_of_week', category: 'date', doc: 'day of week of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
-    { name: 'hour', category: 'date', doc: 'hour of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
-    { name: 'minute', category: 'date', doc: 'minute of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
-    { name: 'second', category: 'date', doc: 'second of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
-    { name: 'date_add', category: 'date', doc: 'date_add x "day" 1', scheme: u => poly(u, [tVar, aVar], (t, n) => fun(t, fun(p('string'), fun(n, t)))) },
-    { name: 'date_diff', category: 'date', doc: 'date_diff x "day" other', scheme: u => poly(u, [tVar, aVar], (t, other) => fun(t, fun(p('string'), fun(other, p('int'))))) },
-    { name: 'date_trunc', category: 'date', doc: 'date_trunc x "month"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('timestamp')))) },
-    { name: 'date_format', category: 'date', doc: 'date_format x "%Y-%m-%d"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('string')))) },
+    { name: 'extract', category: 'date', doc: 'extract x "field"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('int'))), { 0: 'DateTime' }) },
+    { name: 'year', category: 'date', doc: 'year of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
+    { name: 'month', category: 'date', doc: 'month of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
+    { name: 'day', category: 'date', doc: 'day of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
+    { name: 'day_of_week', category: 'date', doc: 'day of week of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
+    { name: 'hour', category: 'date', doc: 'hour of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
+    { name: 'minute', category: 'date', doc: 'minute of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
+    { name: 'second', category: 'date', doc: 'second of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
+    { name: 'date_add', category: 'date', doc: 'date_add x "day" 1', scheme: u => poly(u, [tVar, aVar], (t, n) => fun(t, fun(p('string'), fun(n, t))), { 0: 'DateTime', 1: 'Num' }) },
+    { name: 'date_diff', category: 'date', doc: 'date_diff x "day" other', scheme: u => poly(u, [tVar, aVar], (t, other) => fun(t, fun(p('string'), fun(other, p('int')))), { 0: 'DateTime', 1: 'DateTime' }) },
+    { name: 'date_trunc', category: 'date', doc: 'date_trunc x "month" — date stays date, timestamp stays timestamp', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), t)), { 0: 'DateTime' }) },
+    { name: 'date_format', category: 'date', doc: 'date_format x "%Y-%m-%d"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('string'))), { 0: 'DateTime' }) },
     { name: 'date_parse', category: 'date', doc: 'date_parse x "%Y-%m-%d"', scheme: () => mono(fun(p('string'), fun(p('string'), p('date')))) },
-    { name: 'to_unixtime', category: 'date', doc: 'date to unix seconds', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'to_unixtime', category: 'date', doc: 'date to unix seconds', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
     { name: 'from_unixtime', category: 'date', doc: 'unix seconds to timestamp', scheme: u => poly(u, [tVar], t => fun(p('int'), p('timestamp'))) },
 
     // --- math ------------------------------------------------------------

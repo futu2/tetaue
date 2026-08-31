@@ -288,6 +288,44 @@ function stringValue(v: Value): string | null {
     return null;
 }
 
+/**
+ * The string a rename key-rule result denotes, constant-folding literal
+ * `concat` chains (`"user_" <> k` with k a string literal folds to
+ * "user_id"). A column NAME is a compile-time string — a rule that still
+ * contains a non-literal SQL expression cannot name a column, so its caller
+ * diagnoses it.
+ */
+function foldableStringValue(v: Value): string | null {
+    const direct = stringValue(v);
+    if (direct !== null) return direct;
+    const node = exprNode(v);
+    if (node?.kind !== 'call' || node.name !== 'concat') return null;
+    let out = '';
+    for (const arg of node.args) {
+        if (arg.kind !== 'lit' || typeof arg.value !== 'string') return null;
+        out += arg.value;
+    }
+    return out;
+}
+
+/** Evaluate a list-of-strings argument (`pick ["id", "name"]`), or diagnose. */
+function stringListValue(v: Value, at: AstNode | undefined, ctx: Ctx, what: string): { name: string; node?: AstNode }[] | null {
+    if (v.kind !== 'list') {
+        ctx.diagnostics.push({ node: at ?? v.ast, message: `${what} expects a list of field-name strings, e.g. ${what} ["id", "name"]` });
+        return null;
+    }
+    const names: { name: string; node?: AstNode }[] = [];
+    for (const item of v.items) {
+        const name = stringValue(item);
+        if (name === null) {
+            ctx.diagnostics.push({ node: item.ast ?? at, message: `${what} entries must be string literals, got ${describe(item)}` });
+            return null;
+        }
+        names.push({ name, node: item.ast });
+    }
+    return names;
+}
+
 function numberValue(v: Value): number | null {
     const node = exprNode(v);
     if (node?.kind === 'lit' && typeof node.value === 'number') return node.value;
@@ -645,7 +683,7 @@ function recordFields(rec: Value, at: AstNode | undefined, ctx: Ctx): { key: str
     // table) has nothing to enumerate; an empty record literal `{}` is a
     // valid (empty) materialized record.
     if (rec.open) {
-        ctx.diagnostics.push({ node: at ?? rec.ast, message: `cannot merge a row with an unknown schema — annotate the table, e.g. users: query { id: int } = table "users"` });
+        ctx.diagnostics.push({ node: at ?? rec.ast, message: `cannot enumerate a row with an unknown schema — annotate the table, e.g. users: query { id: int } = table "users"` });
         return null;
     }
     const out: { key: string; value: Value }[] = [];
@@ -668,6 +706,70 @@ function mergeValues(l: Value, r: Value, at: AstNode | undefined, ctx: Ctx): Val
     for (const f of lFields) byKey.set(f.key, f);
     for (const f of rFields) byKey.set(f.key, f); // right wins on overlap
     return recordValue([...byKey.values()], at);
+}
+
+// ---------------------------------------------------------------------------
+// Record transformers (`rename`, `pick`, `omit`) — teta-style pure record
+// helpers used inside map: `map (rename (k => "user_" <> k))`,
+// `map (pick ["id", "email"])`, `map (omit ["password_hash"])`.
+//
+// A record here is the row the map lambda receives: an unknown-schema row
+// (an un-annotated table) cannot enumerate its fields, which recordFields
+// already diagnoses with the shared annotate-the-table wording — the same
+// restriction `merge` has. The transformer is applied to the row at map STEP
+// construction time, and the result materializes every output field as a
+// plain column expression, so it flows through rowFromRecord like any map
+// projection. A rename key rule must return a string literal per key: a SQL
+// expression cannot compute a column NAME.
+// ---------------------------------------------------------------------------
+
+/**
+ * Evaluate the transformer's key function against one record of every input
+ * key and return the `key -> newKey` mapping. The row's keys are known here
+ * (the row record materialized them), so a pure string -> string rule such
+ * as `k => "user_" <> k` is applied by CALLING the function per key.
+ */
+function renameKeyMapping(
+    keys: readonly string[],
+    keyFn: Value,
+    at: AstNode | undefined,
+    ctx: Ctx,
+): Map<string, string> | null {
+    const mapping = new Map<string, string>();
+    for (const key of keys) {
+        const mapped = applyWith(keyFn, mkExpr(lit(key, 'string'), at), at, ctx);
+        if (isError(mapped)) return null;
+        const name = foldableStringValue(mapped);
+        if (name === null) {
+            ctx.diagnostics.push({ node: at ?? keyFn.ast, message: `rename key rule must compute a column name from the field name (e.g. k => "user_" <> k) — got a non-literal result for '${key}'` });
+            return null;
+        }
+        mapping.set(key, name);
+    }
+    return mapping;
+}
+
+/** Apply a rename mapping, rejecting duplicate output columns. */
+function applyRenameMapping(
+    fields: readonly { key: string; value: Value }[],
+    mapping: Map<string, string>,
+    at: AstNode | undefined,
+    ctx: Ctx,
+): Value | null {
+    const out: { key: string; value: Value }[] = [];
+    const seen = new Set<string>();
+    for (const { key, value } of fields) {
+        const newKey = mapping.get(key) ?? key;
+        // A renamed key colliding with an UNCHANGED key is a duplicate too,
+        // so every output key joins `seen`.
+        if (seen.has(newKey)) {
+            ctx.diagnostics.push({ node: at, message: `rename would produce a duplicate column '${newKey}'` });
+            return null;
+        }
+        seen.add(newKey);
+        out.push({ key: newKey, value });
+    }
+    return recordValue(out, at);
 }
 
 /**
@@ -1893,6 +1995,90 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         });
     }),
 
+    // --- record transformers (teta-style pure record helpers) ------------
+    // `rename keyFn` — every field renamed by the key rule. The rule runs on
+    // the row's KEYS (strings), so `map (rename (k => "user_" <> k))` turns
+    // { id, name } into { user_id, user_name }; a key rule returning the key
+    // itself keeps the field's name.
+    rename: () => fn('rename', (keyFn, at, ctx) => {
+        if (!isApplicable(keyFn)) {
+            ctx.diagnostics.push({ node: at ?? keyFn.ast, message: `rename expects a key rule, e.g. map (rename (k => "user_" <> k))` });
+            return ERROR;
+        }
+        return fn('rename', (rec, at2, ctx2) => {
+            const fields = recordFields(rec, at2, ctx2);
+            if (fields === null) return ERROR;
+            const mapping = renameKeyMapping(fields.map(f => f.key), keyFn, at2 ?? at, ctx2);
+            if (mapping === null) return ERROR;
+            return applyRenameMapping(fields, mapping, at2 ?? at, ctx2) ?? ERROR;
+        });
+    }),
+
+    // `pick names` — keep only the listed fields, in list order (teta's
+    // pick, which also fixes the output column order). An empty list is an
+    // invalid projection; unknown names are diagnosed with the row's fields.
+    pick: () => fn('pick', (namesArg, at, ctx) => {
+        const picked = stringListValue(namesArg, at, ctx, 'pick');
+        if (picked === null) return ERROR;
+        return fn('pick', (rec, at2, ctx2) => {
+            const fields = recordFields(rec, at2, ctx2);
+            if (fields === null) return ERROR;
+            const byKey = new Map(fields.map(f => [f.key, f.value] as const));
+            const out: { key: string; value: Value }[] = [];
+            const seen = new Set<string>();
+            for (const { name, node } of picked) {
+                // Anchor a duplicate on the string item like the static pass,
+                // so the two passes' diagnostics dedupe (the select pattern).
+                const anchor = node ?? at2 ?? at;
+                const value = byKey.get(name);
+                if (value === undefined) {
+                    ctx2.diagnostics.push({ node: at2 ?? at, message: `pick has no field '${name}' — available: ${fields.map(f => f.key).join(', ')}` });
+                    return ERROR;
+                }
+                if (seen.has(name)) {
+                    ctx2.diagnostics.push({ node: anchor, message: `duplicate field '${name}' in pick` });
+                    return ERROR;
+                }
+                seen.add(name);
+                out.push({ key: name, value });
+            }
+            if (out.length === 0) {
+                ctx2.diagnostics.push({ node: at2 ?? at, message: `pick expects at least one field, e.g. pick ["id"]` });
+                return ERROR;
+            }
+            return recordValue(out, at2);
+        });
+    }),
+
+    // `omit names` — remove the listed fields, keeping the rest in row order
+    // (teta's record-level drop; named `omit` instead of `drop` because
+    // `drop n` is the OFFSET query step).
+    omit: () => fn('omit', (namesArg, at, ctx) => {
+        const names = stringListValue(namesArg, at, ctx, 'omit');
+        if (names === null) return ERROR;
+        return fn('omit', (rec, at2, ctx2) => {
+            const fields = recordFields(rec, at2, ctx2);
+            if (fields === null) return ERROR;
+            const dropped = new Set(names.map(n => n.name));
+            if (dropped.size !== names.length) {
+                ctx2.diagnostics.push({ node: at2 ?? at, message: `duplicate field in omit` });
+                return ERROR;
+            }
+            const available = fields.map(f => f.key);
+            const unknown = names.map(n => n.name).filter(n => !available.includes(n));
+            if (unknown.length > 0) {
+                ctx2.diagnostics.push({ node: at2 ?? at, message: `omit has no field '${unknown[0]}' — available: ${available.join(', ')}` });
+                return ERROR;
+            }
+            const out = fields.filter(f => !dropped.has(f.key));
+            if (out.length === 0) {
+                ctx2.diagnostics.push({ node: at2 ?? at, message: `omit would remove every field` });
+                return ERROR;
+            }
+            return recordValue(out, at2);
+        });
+    }),
+
     fold: () => fn('fold', (sel, at, ctx) => {
         if (!isApplicable(sel) || (sel.kind === 'lambda' && sel.params.length !== 1)) {
             ctx.diagnostics.push({ node: at ?? sel.ast, message: `fold expects a projection function, e.g. fold (o => { user_id = group o.user_id, total = sum o.total })` });
@@ -2859,7 +3045,10 @@ function dateTruncBuiltin(): () => Value {
         return fn('date_trunc', (unitArg, at2, ctx2) => {
             const unit = datePartArg('date_trunc', unitArg, DATE_UNITS, at2, ctx2);
             if (unit === null) return ERROR;
-            return mkExpr({ kind: 'call', name: 'date_trunc', args: [node!, lit(unit, 'string')], type: 'timestamp' }, at2);
+            // Truncating keeps the input's date-ness: date to date, timestamp
+            // (or unknown) to timestamp — same rule as `date_add`.
+            const t: SqlType = node!.type === 'date' ? 'date' : 'timestamp';
+            return mkExpr({ kind: 'call', name: 'date_trunc', args: [node!, lit(unit, 'string')], type: t }, at2);
         });
     });
 }

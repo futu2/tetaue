@@ -431,6 +431,19 @@ u & filter ...        # pipeline: apply the step to the query
   concatenates strings and lists as closed Semigroup/Monoid instances; string
   concatenation uses the dialect-aware `concat` lowering. Merging a row with
   an unknown schema (an un-annotated table) is an error — annotate the table.
+- `rename`, `pick`, and `omit` are pure record transformers (teta's
+  `pick`/`drop`/`rename` helpers) applied to the whole row inside `map`:
+  ```
+  users & map (rename (k => "user_" <> k))   # every field: id AS user_id, ...
+  users & map (pick ["id", "email"])          # only the listed fields, in list order
+  users & map (omit ["password_hash"])        # everything except the listed fields
+  ```
+  A key rule must compute a column NAME from the field name — a compile-time
+  string, so `"user_" <> k` is folded statically while `upper k` is rejected.
+  They are ordinary curried functions: bind one first-class
+  (`strip = omit ["password_hash"]`) and compose with the rest of the
+  pipeline. Renaming requires a known schema (annotate the table); `drop n`
+  stays the OFFSET query step, so the record-level helper is `omit`.
 - `<<<`/`>>>` compose **functions** point-free (`f <<< g` = `x => f (g x)`),
   so bound predicates are reusable: `adult = u => u.age >= 18` then
   `filter (adult)`. Query steps compose too:
@@ -634,6 +647,9 @@ greatest [u.a, u.b]  least [u.a, u.b]  # any number of arguments, one list
 concat [u.first, u.last]             # sqlite renders || — joins
 merge u { active = true }              # record union — right record wins on overlap
 u <> { active = true }                 # infix form of merge (a monoid: {} is the identity)
+map (rename (k => "user_" <> k))       # rename EVERY field via a key rule (inside map)
+map (pick ["id", "email"])             # keep only the listed fields, in list order (inside map)
+map (omit ["password_hash"])           # remove the listed fields (inside map); `drop n` is OFFSET
 trim u.name  reverse u.name  replace u.name "x" "y"
 substring u.name 1 (just 3)          # optional length (nothing omits); sqlite renders SUBSTR
 position u.name "a"                    # POSITION / LOCATE / INSTR, per dialect

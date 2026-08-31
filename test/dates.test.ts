@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { render, errors, typeErrors } from './helpers.ts';
+import { render, errors, typeErrors, parseModel, services } from './helpers.ts';
+import { inferProject } from '../src/language/inference.ts';
+import { standardPrelude } from '../src/language/prelude.ts';
 
 // Schema with date, timestamp and string columns for the date/time builtins.
 const ORDERS = `orders: query {
@@ -136,6 +138,26 @@ describe('date_trunc', () => {
         expect(render(src, 'trino')).toContain(`DATE_TRUNC('month', created_at) AS ms`);
         expect(render(src, 'postgresql')).toContain(`DATE_TRUNC('month', created_at) AS ms`);
     });
+    test('date_trunc preserves the input date-ness (date to date, timestamp to timestamp)', () => {
+        const src = `${ORDERS}\nq = orders & map (o => { d = date_trunc o.order_date "month", ts = date_trunc o.created_at "month" })`;
+        expect(typeErrors(src)).toEqual([]);
+        const model = parseModel(src);
+        const result = inferProject([{ model, uri: undefined, imports: [] }], new Map(), standardPrelude(services));
+        const q = model.bindings.find(b => b.name === 'q');
+        expect(q && result.typeOf(q)).toBe('query { d: date, ts: timestamp }');
+    });
+
+    test('a truncated date compares with current_date; a truncated timestamp does not', () => {
+        // `date_trunc` keeps the input's date-ness, so a truncated date aligns
+        // with CURRENT_DATE (month-start bucketing), while a truncated
+        // timestamp only aligns with CURRENT_TIMESTAMP.
+        const mapThenFilter = (col: string, rhs: string) =>
+            `${ORDERS}\nq = orders & map (o => { m = date_trunc o.${col} "month" }) & filter (r => r.m == ${rhs})`;
+        expect(typeErrors(mapThenFilter('order_date', 'current_date'))).toEqual([]);
+        expect(typeErrors(mapThenFilter('created_at', 'current_timestamp'))).toEqual([]);
+        expect(typeErrors(mapThenFilter('created_at', 'current_date'))).not.toEqual([]);
+    });
+
     test('sqlite — STRFTIME fallback', () => {
         expect(render(src, 'sqlite')).toContain(`STRFTIME('%Y-%m-01', created_at) AS ms`);
     });

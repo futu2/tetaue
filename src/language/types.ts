@@ -18,7 +18,7 @@
  ******************************************************************************/
 
 export type PrimName = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' | 'timestamp';
-export type ScalarTypeClass = 'Num' | 'Frac' | 'Eq' | 'Ord' | 'Semigroup' | 'Monoid';
+export type ScalarTypeClass = 'Num' | 'Frac' | 'Eq' | 'Ord' | 'DateTime' | 'Semigroup' | 'Monoid';
 export type ContainerTypeClass = 'Functor' | 'Applicative' | 'Alternative' | 'Monad';
 export type TypeClass = ScalarTypeClass | ContainerTypeClass;
 
@@ -27,6 +27,9 @@ const TYPE_CLASS_INSTANCES: Readonly<Record<ScalarTypeClass, ReadonlySet<PrimNam
     Frac: new Set(['float', 'decimal']),
     Eq: new Set(['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']),
     Ord: new Set(['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']),
+    // Calendar-valued scalars: the input/output class of the date family
+    // (extract, date_add, date_diff, date_trunc, date_format, to_unixtime).
+    DateTime: new Set(['date', 'timestamp']),
     Semigroup: new Set(['string']),
     Monoid: new Set(['string']),
 };

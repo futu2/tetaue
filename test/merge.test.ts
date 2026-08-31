@@ -160,7 +160,7 @@ describe('merge', () => {
             t = table "t"
             q = t & map (u => merge u { x = 1 })
         `;
-        expect(errors(src).join('\n')).toContain('cannot merge a row with an unknown schema');
+        expect(errors(src).join('\n')).toContain('cannot enumerate a row with an unknown schema');
     });
 
     test('duplicate fields within one literal are still caught', () => {

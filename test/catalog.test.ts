@@ -64,4 +64,22 @@ describe('builtin catalog', () => {
             expect(names).not.toContain(removed);
         }
     });
+
+    test('the date family carries the DateTime class on its calendar variables', async () => {
+        const { TypeUniverse } = await import('../src/language/types.js');
+        const spec = new Map(BUILTIN_SPECS.map(s => [s.name, s]));
+        const u = new TypeUniverse();
+        // Schemes state the constraint, so hovers show the real shape.
+        expect(u.pretty(spec.get('year')!.scheme(u).type)).toBe('DateTime t => t -> int');
+        expect(u.pretty(spec.get('extract')!.scheme(u).type)).toBe('DateTime t => t -> string -> int');
+        expect(u.pretty(spec.get('date_trunc')!.scheme(u).type)).toBe('DateTime t => t -> string -> t');
+        expect(u.pretty(spec.get('date_format')!.scheme(u).type)).toBe('DateTime t => t -> string -> string');
+        expect(u.pretty(spec.get('to_unixtime')!.scheme(u).type)).toBe('DateTime t => t -> int');
+        // date_diff keeps two independent variables (no type pollution).
+        expect(u.pretty(spec.get('date_diff')!.scheme(u).type)).toBe('DateTime t, DateTime a => t -> string -> a -> int');
+        // date_add's amount is Num-constrained in the scheme, so even a
+        // partially-applied `date_add current_date "day"` rejects non-numeric
+        // amounts statically.
+        expect(u.pretty(spec.get('date_add')!.scheme(u).type)).toBe('DateTime t, Num a => t -> string -> a -> t');
+    });
 });

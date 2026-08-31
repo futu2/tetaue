@@ -1,0 +1,42 @@
+# Key rename — teta-style pure record helpers.
+#
+# teta ships pick / drop / rename as pure record helpers composed inside
+# map(...). tetaue exposes the same idea as curried record transformers:
+#
+#   rename keyFn    renames EVERY field via a key rule: map (rename (k => "user_" <> k))
+#   pick names      keeps only the listed fields, in list order
+#   omit names      removes the listed fields (teta's record-level drop;
+#                   named `omit` here because `drop n` is the OFFSET step)
+#
+# A key rule must compute a column NAME from the field name — a compile-time
+# string, so `"user_" <> k` is folded statically while `upper k` is rejected.
+
+users: query {
+    id: int,
+    email: string,
+    password_hash: string,
+    age: int,
+} = table "users"
+
+# rename: every output column keeps its value and gains the rule's prefix.
+public_users = users
+    & map (rename (k => "user_" <> k))
+
+# pick: output columns exactly the listed fields, in list order.
+brief = users
+    & map (pick ["id", "email"])
+
+# omit: everything except the listed fields, in row order.
+safe = users
+    & map (omit ["password_hash"])
+
+# Transformers are ordinary curried functions, so they bind first-class and
+# compose with the rest of the pipeline.
+strip_secret = omit ["password_hash"]
+renamed = users
+    & map (strip_secret)
+    & map (rename (k => k <> "_v2"))
+    & filter (u => u.id_v2 >= 0)
+
+# public_users is this module's query.
+main = public_users

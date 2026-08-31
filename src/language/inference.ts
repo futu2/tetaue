@@ -1195,6 +1195,31 @@ export class Inferencer {
         return current;
     }
 
+    /** Human wording for a failed type-class constraint, or null to stay
+     *  silent. `fnName` is the builtin being applied (when known) and lets
+     *  the date family keep its established "expects a date or timestamp
+     *  expression" message. A DateTime failure against a non-prim argument
+     *  (an unannotated lambda whose row fields fail later) returns null: the
+     *  constraint only surfaces there after deferred row unification, where
+     *  the interpreter already reports the exact field precisely — a static
+     *  echo would just print the whole lambda type as noise. */
+    private constraintMessage(err: ConstraintError, arg: Type, fnName: string | null): string | null {
+        if (err.constraint === 'Num') {
+            // `date_add`'s amount keeps its established wording (a test pins it).
+            return fnName === 'date_add'
+                ? `date_add expects a numeric amount, got type ${this.u.pretty(arg)}`
+                : `${err.constraint} requires a numeric type, got ${this.u.pretty(arg)}`;
+        }
+        if (err.constraint === 'Frac') return `a float/decimal literal cannot fit the type required here — write a literal of the matching type (e.g. 18 for an int)`;
+        if (err.constraint === 'DateTime') {
+            if (this.u.peel(arg).kind !== 'prim') return null;
+            return fnName
+                ? `${fnName} expects a date or timestamp expression, got type ${this.u.pretty(arg)}`
+                : `cannot apply — expects a date or timestamp value, got ${this.u.pretty(arg)}`;
+        }
+        return `${err.constraint} requires a supported instance, got ${this.u.pretty(arg)}`;
+    }
+
     private applyInferredFunction(f: Type, arg: Type, node: AstNode, name: string | null): Type {
         const param = this.u.fresh();
         const result = this.u.fresh();
@@ -1203,11 +1228,8 @@ export class Inferencer {
             this.u.unify(param, arg);
         } catch (err) {
             if (err instanceof ConstraintError) {
-                this.diag(node, err.constraint === 'Num'
-                    ? `${err.constraint} requires a numeric type, got ${this.u.pretty(arg)}`
-                    : err.constraint === 'Frac'
-                        ? `a float/decimal literal cannot fit the type required here — write a literal of the matching type (e.g. 18 for an int)`
-                        : `${err.constraint} requires a supported instance, got ${this.u.pretty(arg)}`);
+                const message = this.constraintMessage(err, arg, name);
+                if (message !== null) this.diag(node, message);
                 return this.u.fresh();
             }
             if (err instanceof UnifyError) {
@@ -1317,6 +1339,12 @@ export class Inferencer {
         if (funcName === 'merge' && e.arguments.length === 1) {
             return this.inferMergePartial(e.arguments[0]!, e, env);
         }
+        // `pick names` / `omit names` — record transformers with a precise
+        // static output row (see inferRecordPicker). Fully-applied two-arg
+        // forms stay on the generic scheme (sound, imprecise).
+        if ((funcName === 'pick' || funcName === 'omit') && e.arguments.length === 1) {
+            return this.inferRecordPicker(e, env, funcName);
+        }
         if (funcName === 'merge' && e.arguments.length === 2) {
             const a = this.inferArg(e.arguments[0]!, env);
             const b = this.inferArg(e.arguments[1]!, env);
@@ -1369,11 +1397,8 @@ export class Inferencer {
                 this.u.unify(param, argType);
             } catch (err) {
                 if (err instanceof ConstraintError) {
-                    this.diag(argExpr, err.constraint === 'Num'
-                        ? `${err.constraint} requires a numeric type, got ${this.u.pretty(argType)}`
-                        : err.constraint === 'Frac'
-                            ? `a float/decimal literal cannot fit the type required here — write a literal of the matching type (e.g. 18 for an int)`
-                            : `${err.constraint} requires a supported instance, got ${this.u.pretty(argType)}`);
+                    const message = this.constraintMessage(err, argType, funcName);
+                    if (message !== null) this.diag(argExpr, message);
                     return this.u.fresh();
                 } else if (err instanceof UnifyError) {
                     // Blindly unifying failed (the transactional unify already
@@ -1966,6 +1991,64 @@ export class Inferencer {
         return prim('bool');
     }
 
+    /**
+     * `pick ["id", "name"]` / `omit ["x"]` — record transformers used inside
+     * map. The static output row needs the INPUT row's field types, which at
+     * this point is the transformer's own fresh row variable: extend it with
+     * the listed fields via `fieldOf` (mirroring inferSelect's closed-row
+     * trick) and build the output row from those exact types. `pick` closes
+     * the output (a downstream typo is a static error, like select);
+     * `omit` keeps an open tail (the remaining fields stay accessible).
+     */
+    private inferRecordPicker(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, kind: 'pick' | 'omit'): Type {
+        const listExpr = e.arguments[0]!;
+        this.inferArg(listExpr, env);
+        if (!isListLiteral(listExpr)) {
+            this.diag(listExpr, `${kind} expects a list of field-name strings, e.g. ${kind} ["id", "name"]`);
+            return this.u.fresh();
+        }
+        const names: string[] = [];
+        const seen = new Set<string>();
+        for (const item of listExpr.elements) {
+            let strNode: AstNode | undefined = item;
+            while (strNode && isApplication(strNode) && strNode.arguments.length === 0) strNode = strNode.func;
+            if (!isStringLiteral(strNode)) {
+                this.diag(item, `${kind} entries must be string literals`);
+                continue;
+            }
+            const label = parseStringLiteral(strNode.value);
+            if (kind === 'pick' && seen.has(label)) this.diag(item, `duplicate field '${label}' in pick`);
+            seen.add(label);
+            names.push(label);
+        }
+        if (names.length === 0) {
+            this.diag(listExpr, `${kind} expects at least one field name, e.g. ${kind} ["id"]`);
+        }
+        const r = this.u.fresh('row');
+        const byName = new Map<string, Type>();
+        for (const label of names) {
+            // fieldOf extends the fresh row, so repeated names share one type.
+            const field = this.u.fieldOf(r, label);
+            if (field) byName.set(label, field.type);
+        }
+        if (kind === 'pick') {
+            const fields: [string, Type][] = names.map(label => [label, byName.get(label) ?? this.u.fresh()]);
+            return fun(listOf(prim('string')), fun(r, rowOf(fields)));
+        }
+        // omit: the output is the input minus the listed fields. Add the
+        // listed fields to the row (fieldOf did), then build the output from
+        // the row's OTHER fields plus an open tail SHARED with the input's
+        // tail, so unification at the use site materializes the remaining
+        // fields into the output row too.
+        const resolved = this.u.resolve(r);
+        if (resolved.kind !== 'row') return this.u.fresh();
+        const row = this.u.resolveRow(resolved);
+        const fields: [string, Type][] = [...row.fields]
+            .filter(([label]) => !seen.has(label))
+            .map(([label, type]) => [label, type]);
+        return fun(listOf(prim('string')), fun(r, rowOf(fields, row.tail)));
+    }
+
     /** `select ["id", "name"]` — a projection narrowing to the listed fields. */
     private inferSelect(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
         const listExpr = e.arguments[0]!;
@@ -2072,6 +2155,27 @@ export class Inferencer {
     }
 
     /**
+     * The inner row -> row projection behind a record transformer
+     * constructor (`pick [...]` / `omit [...]` / `rename rule` partially
+     * applied to their key configuration). Null when the type is not that
+     * shape — then map uses the argument type unchanged.
+     */
+    private recordTransformerOf(t: Type): Type | null {
+        const f = this.u.peel(t);
+        if (f.kind !== 'fun') return null;
+        const from = this.u.peel(f.from);
+        const to = this.u.peel(f.to);
+        if (to.kind !== 'fun') return null;
+        // pick/omit: `[string] -> {r} -> {s}`; rename: `(string -> string) -> {r} -> {s}`.
+        if (from.kind === 'list' || (from.kind === 'fun'
+            && this.u.peel(from.from).kind === 'prim' && (this.u.peel(from.from) as { name: string }).name === 'string'
+            && this.u.peel(from.to).kind === 'prim' && (this.u.peel(from.to) as { name: string }).name === 'string')) {
+            return to;
+        }
+        return null;
+    }
+
+    /**
      * `map (u => { ... })` — projection mode check: the result row must not
      * contain `group` keys or `order` items (SQL cannot select a GROUP BY key
      * or an ORDER BY item as a value), mirroring the interpreter's
@@ -2083,7 +2187,14 @@ export class Inferencer {
     private inferMap(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
         const argExpr = e.arguments[0]!;
         const argType = this.inferArg(argExpr, env);
-        const r = this.u.peel(argType);
+        // A record transformer (`pick [...]` / `omit [...]` / `rename rule`)
+        // is a curried constructor ([string] -> {r} -> {s}, or
+        // (string -> string) -> {r} -> {s}); as map's projection it is the
+        // INNER row -> row function — the interpreter applies it to the row
+        // (exactly like a partially-applied `merge`, whose leftover is
+        // already row -> row).
+        const projection = this.recordTransformerOf(argType) ?? argType;
+        const r = this.u.peel(projection);
         if (r.kind !== 'fun') {
             this.argError('map', 0, argExpr, argType, undefined, undefined);
             return this.u.fresh();
@@ -2594,7 +2705,10 @@ export class Inferencer {
         const isNumericLiteralVar = (rs: Type): boolean => rs.kind === 'var'
             && (this.u.varInfo(rs.id).classes.has('Num') || this.u.varInfo(rs.id).classes.has('Frac'));
         if (DATE_VALUE_ARGUMENTS.has(name) && index === 0) {
-            if ((r.kind === 'prim' && r.name !== 'date' && r.name !== 'timestamp') || isNumericLiteralVar(r)) {
+            // The DateTime class constraint catches concrete non-date prims
+            // during unification; a numeric *literal* is an unconstrained
+            // Nat variable until defaulted, so it is rejected here instead.
+            if (isNumericLiteralVar(r)) {
                 this.diag(node, `${name} expects a date or timestamp expression, got type ${this.u.pretty(argType)}`);
             }
             return;
@@ -2606,7 +2720,9 @@ export class Inferencer {
             return;
         }
         if (name === 'date_diff' && index === 2) {
-            if ((r.kind === 'prim' && r.name !== 'date' && r.name !== 'timestamp') || isNumericLiteralVar(r)) {
+            // Same as index 0: the DateTime constraint handles prims; only
+            // numeric literals need the explicit rejection here.
+            if (isNumericLiteralVar(r)) {
                 this.diag(node, `date_diff expects a date or timestamp expression, got type ${this.u.pretty(argType)}`);
             }
             return;
