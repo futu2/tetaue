@@ -101,11 +101,13 @@ primitives the SQL prelude composes (implemented):
 ```
 sql_func name [args]        # emit FUNC(args) — the generic call node
 sql_infix op left right     # emit `left op right` (e.g. POSITION(n IN x))
+sql_cast value "target"     # emit CAST(value AS target) via the cast renderer
 sql_dialect                 # the record above (branch on sql_dialect.name)
 ```
 
-`sql_cast x "target"` is planned but not implemented — `cast` remains a core
-builtin.
+`sql_cast` reuses the existing per-dialect CAST lowering, so a prelude
+definition can compose it (e.g. SQLite's `CAST(STRFTIME('%Y', x) AS INTEGER)`
+for `year`).
 
 `render.ts`'s `call` case already falls through to `NAME(args)` via
 `ctx.dialect.functions`, so `sql_func` produces the existing IR node and

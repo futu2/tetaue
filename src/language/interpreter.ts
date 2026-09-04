@@ -3063,6 +3063,24 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         }));
     }),
 
+    sql_cast: () => fn('sql_cast', (valueArg, at, ctx) => {
+        const value = exprNode(valueArg);
+        if (!value) {
+            ctx.diagnostics.push({ node: at ?? valueArg.ast, message: `sql_cast expects a value expression and a target type, e.g. sql_cast x "int"` });
+            return ERROR;
+        }
+        return fn('sql_cast', (typeArg, at2, ctx2) => {
+            const type = stringValue(typeArg);
+            if (type === null || !(CAST_TYPES as readonly string[]).includes(type)) {
+                ctx2.diagnostics.push({ node: at2 ?? typeArg.ast, message: `sql_cast expects a target type as a string literal — one of: ${CAST_TYPES.join(', ')}` });
+                return ERROR;
+            }
+            // Same IR node as the `cast` builtin, so the renderer's existing
+            // per-dialect CAST lowering applies.
+            return mkExpr({ kind: 'call', name: 'cast', args: [value, lit(type, 'string')], type: type as SqlType }, at2 ?? at);
+        });
+    }),
+
     // --- list-argument builtins (homogeneous variadic) -------------------
     // concat [a, b], greatest [a, b], least [a, b] take a single list
     // argument — the sound encoding for variadic functions with ONE element

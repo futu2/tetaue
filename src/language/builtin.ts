@@ -251,6 +251,10 @@ export const BUILTIN_SPECS = [
     // sql_func it expresses argument-reordered forms such as `position`'s
     // `POSITION(needle IN value)` for postgresql/trino.
     { name: 'sql_infix', category: 'scalar', doc: 'sql_infix op left right — an uninterpreted infix SQL expression (left op right)', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(p('string'), fun(a, fun(b, p('bool'))))) },
+    // `sql_cast value "target"` emits an uninterpreted CAST(value AS target).
+    // The result type is left open (`b`) — the prelude definition pins it via
+    // its annotation (e.g. `year: date -> int`).
+    { name: 'sql_cast', category: 'scalar', doc: 'sql_cast value "target" — an uninterpreted CAST(value AS target)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))) },
 
     // --- strings ---------------------------------------------------------
     // `trim` lives in prelude.tetaue (a plain `sql_func "TRIM"` wrapper).
