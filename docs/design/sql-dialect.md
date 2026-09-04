@@ -171,21 +171,43 @@ acceptance check.
    only the genuinely query-shaped lowering (joins, sets, windows, `case`,
    recursive CTEs) in TS.
 
-## Still in the TS core: the date-part helpers
+## Still in the TS core: the remaining scalar family
 
-The date parts (`year`, `month`, `day`, `day_of_week`, `hour`, `minute`,
-`second`) and `extract` are **not** migrated yet, even though `sql_bare`
-removed the EXTRACT blocker. Their per-dialect lowering exceeds what the
-current prelude primitives express cleanly: SQLite needs
-`CAST(STRFTIME('%Y', x) AS INTEGER)` (a `sql_func` + `sql_cast` chain),
-MySQL/Trino disagree on `day_of_week` (`DAYOFWEEK(x)` vs
-`EXTRACT(DAY_OF_WEEK FROM x)`), Hive uses a direct `YEAR(x)` call, and the
-EXTRACT forms require the double-paren `((sql_infix) "FROM") ((sql_bare)
-"YEAR") x` grouping. The renderer's `renderDatePart` table handles all five
-dialects today and the existing `test/dates.test.ts` suite is the acceptance
-harness. Migration is worthwhile once the prelude's lowering vocabulary grows
-(e.g. a `sql_call "STRFTIME" ...` form that also covers `sqlite` format
-strings), not before.
+The migrated set is the surface whose lowering a prelude `case sql_dialect.name
+{ ... }` over `sql_func`/`sql_infix`/`sql_bare` expresses faithfully. The rest
+of `BUILTIN_SPECS`/`renderCall` stays in TS because each member needs prelude
+vocabulary the language does not have yet:
+
+- **Date parts** (`year`, `month`, `day`, `day_of_week`, `hour`, `minute`,
+  `second`) and `extract`. `sql_bare` removed the EXTRACT blocker, but their
+  per-dialect lowering still exceeds the current primitives: SQLite needs
+  `CAST(STRFTIME('%Y', x) AS INTEGER)` (a `sql_func` + `sql_cast` chain),
+  MySQL/Trino disagree on `day_of_week` (`DAYOFWEEK(x)` vs
+  `EXTRACT(DAY_OF_WEEK FROM x)`), Hive uses a direct `YEAR(x)` call, and the
+  EXTRACT forms need the double-paren `((sql_infix) "FROM") ((sql_bare)
+  "YEAR") x` grouping. The renderer's `renderDatePart` table handles all five
+  dialects and `test/dates.test.ts` is the acceptance harness.
+- **Variadic-list** (`concat`, `greatest`, `least`). `greatest`/`least` rely
+  on bespoke inference diagnostics (`greatest requires matching types, got
+  float and string` — asserted in `test/functions.test.ts`) that a prelude
+  `[t] -> t` annotation cannot reproduce, plus sqlite's scalar
+  `MAX(a, b, ...)`/`MIN(a, b, ...)` lowering. `concat` needs sqlite's
+  per-element `COALESCE(x, '')` fold — a list-to-binary-operator mapping the
+  prelude has no primitive for.
+- **Heterogeneous / optional-argument** (`round x n`, `substring x s (just l)`,
+  `lpad`/`rpad`). These are curried position by position with `maybe`-typed
+  optional positions; the prelude has no `maybe`-branching lowering for the
+  SQLite `SUBSTR`/`PRINTF` compositions.
+- **Type-directed** (`cast`, `from_maybe`). These resolve at type level, not
+  name level, and stay core.
+- `reverse` (sqlite scalar recursive CTE) is query-shape, already documented
+  above.
+
+Migration resumes when the prelude gains new lowering vocabulary — e.g. a
+`sql_call` form that covers SQLite format strings, a list-fold over SQL
+arguments (for `concat`), or annotation-carried diagnostics (for
+`greatest`/`least`). Those are deliberate language additions, not mechanical
+moves.
 
 ## What stays in the TS core (the irreducible relational machinery)
 

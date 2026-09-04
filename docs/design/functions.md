@@ -436,9 +436,11 @@ inlining the `OVER` expression would be invalid SQL.
   `DialectView` is seeded as a first-class `sql_dialect` record
   (`{ name, functions }`) in every module's prelude environment. The prelude
   branches on `sql_dialect.name` at **analysis time** (literal `==` folds and
-  `case` short-circuits) and composes `sql_func` / `sql_infix` to emit the
-  dialect-specific SQL. Migrated functions: `upper`, `lower`, `length`,
-  `trim`, `position`. `reverse` stays a core builtin (sqlite's scalar
+  `case` short-circuits) and composes `sql_func` / `sql_infix` /
+  `sql_bare` to emit the dialect-specific SQL. Migrated functions: `upper`,
+  `lower`, `length`, `trim`, `replace`, `mod`, `like`, `div`,
+  `left_substring` / `right_substring`, `abs`, `ceil`, `floor`, `sqrt`,
+  `pow`, `position`. `reverse` stays a core builtin (sqlite's scalar
   recursive-CTE fallback is query-shape). See
   `docs/design/sql-dialect.md`.
 - `inference.ts` — the prelude is built from the builtin catalog
