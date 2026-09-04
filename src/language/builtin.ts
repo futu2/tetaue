@@ -250,6 +250,9 @@ export const BUILTIN_SPECS = [
     // The result type is left open (`b`) — the prelude definition pins it via
     // its annotation (e.g. `year: date -> int`).
     { name: 'sql_cast', category: 'scalar', doc: 'sql_cast value "target" — an uninterpreted CAST(value AS target)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))) },
+    // `sql_bare "YEAR"` emits an unquoted SQL identifier/word (EXTRACT(YEAR
+    // FROM x) needs a bare field name, not a quoted string).
+    { name: 'sql_bare', category: 'scalar', doc: 'sql_bare "YEAR" — an unquoted SQL word (e.g. an EXTRACT field)', scheme: () => mono(fun(p('string'), p('string'))) },
 
     // --- strings ---------------------------------------------------------
     // `trim` lives in prelude.tetaue (a plain `sql_func "TRIM"` wrapper).

@@ -20,7 +20,7 @@ function walkRow(row: RowNode, dialect: DialectSpec, diagnostics: CapabilityDiag
 
 function walkExpr(node: SqlNode, dialect: DialectSpec, diagnostics: CapabilityDiagnostic[], seen: Set<Query>): void {
     switch (node.kind) {
-        case 'col': case 'lit': case 'param':
+        case 'col': case 'bare': case 'lit': case 'param':
         case 'current-date': case 'date-literal':
         case 'timestamp-literal': case 'current-timestamp':
             return;

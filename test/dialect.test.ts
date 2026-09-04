@@ -88,4 +88,18 @@ describe('sql_dialect', () => {
         const src = USERS + `main = users & map (u => { n = (sql_func) "UPPER" [u.name] })`;
         expect(render(src, 'trino')).toContain(`UPPER(name)`);
     });
+
+    test('sql_bare emits an unquoted SQL word, unlike a string literal', () => {
+        // NOTE: (sql_bare) is an atom, so a nested application argument needs
+        // double parens — ((sql_bare) "YEAR") — or it binds to the enclosing
+        // application (same reason `(sql_infix) "IN" n x` needs identifier
+        // operands in the position/div prelude definitions).
+        const src = USERS + `
+            events: query { happened_at: date } = table "events"
+            main = events & map (e => { y = (sql_func) "EXTRACT" [((sql_infix) "FROM") ((sql_bare) "YEAR") e.happened_at] })
+        `;
+        expect(render(src, 'postgresql')).toContain(`EXTRACT(YEAR FROM happened_at)`);
+        expect(render(src, 'postgresql')).not.toContain(`'YEAR'`);
+        expect(render(src, 'postgresql')).not.toContain(`"YEAR"`);
+    });
 });

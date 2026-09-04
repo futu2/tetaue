@@ -347,6 +347,10 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
                 : '';
             return parenIf(`${q}${ctx.dialect.quoteIdentifier(node.name)}`, precOf('ATOM'), parentPrec);
         }
+        case 'bare':
+            // An unquoted SQL word (EXTRACT(YEAR FROM x) needs YEAR, not
+            // 'YEAR') emitted by the sql_bare lowering primitive.
+            return parenIf(node.name, precOf('ATOM'), parentPrec);
         case 'bin': {
             const prec = precOf(node.op) || 3;
             // Comparisons are non-associative in SQL: parenthesize nested comparisons.

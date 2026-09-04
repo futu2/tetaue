@@ -19,12 +19,17 @@ not leak" direction), while dialect differences stay a *library* concern.
   record scheme by the inferencer.
 - **`sql_func` primitive.** `sql_func "NAME" [args]` emits an uninterpreted SQL
   call node, the building block the prelude composes.
+- **`sql_bare` primitive.** `sql_bare "YEAR"` emits a **bare, unquoted SQL
+  word** (a distinct `bare` IR node rendered without `quoteIdentifier`), for
+  syntaxes that need a keyword-like field name: `EXTRACT(YEAR FROM x)` requires
+  `YEAR`, not `'YEAR'` or `"YEAR"`. Verified end-to-end (see the test in
+  `test/dialect.test.ts`).
 - **Analysis-time branching.** Literal `==`/`!=` comparisons constant-fold in
   `evalBinary`, and `case` short-circuits on a literal condition — so
   `case sql_dialect.name { "mysql" => sql_func "LOCATE" [n, x], ... }` picks
   the branch during evaluation instead of emitting a runtime SQL `CASE`.
 - **Tests** (`test/dialect.test.ts`): seeding, typing, per-dialect lowering,
-  and the short-circuit behavior.
+  the short-circuit behavior, and `sql_bare` (unquoted word, never `'YEAR'`).
 
 ## What has migrated
 
@@ -110,8 +115,21 @@ primitives the SQL prelude composes (implemented):
 sql_func name [args]        # emit FUNC(args) — the generic call node
 sql_infix op left right     # emit `left op right` (e.g. POSITION(n IN x))
 sql_cast value "target"     # emit CAST(value AS target) via the cast renderer
+sql_bare word               # emit an unquoted SQL word (EXTRACT(YEAR FROM x))
 sql_dialect                 # the record above (branch on sql_dialect.name)
 ```
+
+`sql_bare` is a separate `bare` IR node (not a `col`): `col` nodes go through
+`quoteIdentifier`, which would quote the reserved word and break `EXTRACT`.
+`bare` renders the word as-is.
+
+**Grammar gotcha (learned while wiring `sql_bare`).** A parenthesized
+expression is an *atom*, so a nested application argument does not group on its
+own: `(sql_infix) "FROM" (sql_bare) "YEAR" x` passes `(sql_bare)`, `"YEAR"`,
+and `x` as three separate arguments of `sql_infix`. Nested applications need
+double parens — `((sql_infix) "FROM") ((sql_bare) "YEAR") x` — or identifier
+operands, which is why the migrated `position`/`div` definitions pass plain
+lambda parameters into `sql_infix`.
 
 `sql_cast` reuses the existing per-dialect CAST lowering, so a prelude
 definition can compose it (e.g. SQLite's `CAST(STRFTIME('%Y', x) AS INTEGER)`
@@ -152,6 +170,22 @@ acceptance check.
 4. Finally, retire `SPECIAL_CALLS`/`DATE_FUNCTIONS` from `render.ts`, leaving
    only the genuinely query-shaped lowering (joins, sets, windows, `case`,
    recursive CTEs) in TS.
+
+## Still in the TS core: the date-part helpers
+
+The date parts (`year`, `month`, `day`, `day_of_week`, `hour`, `minute`,
+`second`) and `extract` are **not** migrated yet, even though `sql_bare`
+removed the EXTRACT blocker. Their per-dialect lowering exceeds what the
+current prelude primitives express cleanly: SQLite needs
+`CAST(STRFTIME('%Y', x) AS INTEGER)` (a `sql_func` + `sql_cast` chain),
+MySQL/Trino disagree on `day_of_week` (`DAYOFWEEK(x)` vs
+`EXTRACT(DAY_OF_WEEK FROM x)`), Hive uses a direct `YEAR(x)` call, and the
+EXTRACT forms require the double-paren `((sql_infix) "FROM") ((sql_bare)
+"YEAR") x` grouping. The renderer's `renderDatePart` table handles all five
+dialects today and the existing `test/dates.test.ts` suite is the acceptance
+harness. Migration is worthwhile once the prelude's lowering vocabulary grows
+(e.g. a `sql_call "STRFTIME" ...` form that also covers `sqlite` format
+strings), not before.
 
 ## What stays in the TS core (the irreducible relational machinery)
 

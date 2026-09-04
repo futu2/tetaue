@@ -51,6 +51,7 @@ export type Schema = ReadonlyMap<string, SqlColumn>;
 
 export type SqlNodeBase =
     | { readonly kind: 'col'; readonly name: string; readonly table: string | null; readonly type: SqlType }
+    | { readonly kind: 'bare'; readonly name: string; readonly type: SqlType }
     | { readonly kind: 'lit'; readonly value: number | string | boolean | null; readonly type: TypeOrNull }
     | { readonly kind: 'bin'; readonly op: string; readonly left: SqlNode; readonly right: SqlNode; readonly type: SqlType }
     | { readonly kind: 'is-null'; readonly expr: SqlNode; readonly negated: boolean; readonly type: 'bool' }
@@ -397,7 +398,7 @@ function lambdaParam(l: Lambda): string {
 function forEachNode(node: SqlNode, visit: (n: SqlNode) => void): void {
     visit(node);
     switch (node.kind) {
-        case 'col': case 'lit':
+        case 'col': case 'bare': case 'lit':
         case 'current-date': case 'current-timestamp':
         case 'date-literal': case 'timestamp-literal': break;
         case 'bin': forEachNode(node.left, visit); forEachNode(node.right, visit); break;
@@ -1645,7 +1646,7 @@ function sqlNodeReferences(node: SqlNode, target: SqlNode): boolean {
             return node.branches.some(branch => sqlNodeReferences(branch.cond, target) || sqlNodeReferences(branch.value, target))
                 || (node.elseValue ? sqlNodeReferences(node.elseValue, target) : false);
         case 'in-query': return sqlNodeReferences(node.expr, target);
-        case 'col': case 'lit': case 'param': case 'current-date': case 'date-literal':
+        case 'col': case 'bare': case 'lit': case 'param': case 'current-date': case 'date-literal':
         case 'timestamp-literal': case 'current-timestamp': case 'exists': case 'scalar':
             return false;
     }
@@ -2991,6 +2992,16 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         });
     }),
 
+    sql_bare: () => fn('sql_bare', (wordArg, at, ctx) => {
+        const word = stringValue(wordArg);
+        if (word === null || word.trim().length === 0 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
+            ctx.diagnostics.push({ node: at ?? wordArg.ast, message: `sql_bare expects a plain SQL word, e.g. sql_bare "YEAR"` });
+            return ERROR;
+        }
+        // A bare SQL word (EXTRACT(YEAR FROM x) needs YEAR, not 'YEAR').
+        return mkExpr({ kind: 'bare', name: word, type: 'unknown' }, at);
+    }),
+
     // --- list-argument builtins (homogeneous variadic) -------------------
     // concat [a, b], greatest [a, b], least [a, b] take a single list
     // argument — the sound encoding for variadic functions with ONE element
@@ -3674,7 +3685,7 @@ function validateWindowUses(fields: readonly { key: string; node: SqlNode }[], a
             bad = true;
         }
         switch (n.kind) {
-            case 'col': case 'lit': case 'current-date': case 'current-timestamp':
+            case 'col': case 'bare': case 'lit': case 'current-date': case 'current-timestamp':
             case 'date-literal': case 'timestamp-literal': break;
             case 'bin': visit(n.left, n, 'left'); visit(n.right, n, 'right'); break;
             case 'is-null': case 'not': case 'group': case 'order': visit(n.expr, n, 'expr'); break;

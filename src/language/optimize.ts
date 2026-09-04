@@ -26,7 +26,7 @@ function isBoolLiteral(node: SqlNode, value: boolean): boolean {
 function optimizeExpr(node: SqlNode, state: OptimizeState): SqlNode {
     let result: SqlNode;
     switch (node.kind) {
-        case 'col': case 'lit': case 'param':
+        case 'col': case 'bare': case 'lit': case 'param':
         case 'current-date': case 'date-literal':
         case 'timestamp-literal': case 'current-timestamp':
             return node;
