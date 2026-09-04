@@ -813,16 +813,25 @@ export class Inferencer {
             paramType = this.u.fresh('flex');
         }
         newEnv.set(p.name ?? '', { vars: [], type: paramType });
-        const body = this.inferExpr(e.body as unknown as UnaryExpression, newEnv);
-        // The binding annotation's codomain is also a signature: bind the
-        // body's fresh result (e.g. a `sql_func` call's open type) to the
-        // declared result, so `f: string -> int = x => sql_func "LENGTH" [x]`
-        // types the call as int.
-        if (expectedResult !== undefined) {
-            try {
-                this.u.unify(body, expectedResult);
-            } catch (err) {
-                if (!(err instanceof UnifyError)) throw err;
+        // A curried body (`x => y => ...`) is another lambda: descend into it
+        // with the NEXT annotation domain/codomain so every parameter is typed
+        // against the signature, not just the outer one.
+        const bodyCore = this.unwrapApplicationExpr(e.body as unknown as AstNode);
+        let body: Type;
+        if (expectedResult && expectedResult.kind === 'fun' && bodyCore && isLambda(bodyCore)) {
+            body = this.inferLambda(bodyCore, newEnv, expectedResult.from, expectedResult.to);
+        } else {
+            body = this.inferExpr(e.body as unknown as UnaryExpression, newEnv);
+            // The binding annotation's codomain is also a signature: bind the
+            // body's fresh result (e.g. a `sql_func` call's open type) to the
+            // declared result, so `f: string -> int = x => sql_func "LENGTH" [x]`
+            // types the call as int.
+            if (expectedResult !== undefined) {
+                try {
+                    this.u.unify(body, expectedResult);
+                } catch (err) {
+                    if (!(err instanceof UnifyError)) throw err;
+                }
             }
         }
         // Release the rigidity of annotated params: the body must only use the

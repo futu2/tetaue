@@ -2492,7 +2492,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     floor: numericUnaryBuiltin('floor'),
     sqrt: numericUnaryBuiltin('sqrt'),
     pow: numericBinaryBuiltin('pow', 'float'),
-    div: numericBinaryBuiltin('div', 'first'),
     mod: numericBinaryBuiltin('mod', 'first'),
 
     // --- pure list combinators (the list.* namespace) --------------------
@@ -2702,65 +2701,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
 
     // --- strings ----------------------------------------------------------
     reverse: stringFnBuiltin('reverse', 'string'),
-    replace: () => fn('replace', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `replace expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'replace', at ?? arg.ast, ctx)) return ERROR;
-        return fn('replace', (searchArg, at2, ctx2) => {
-            const search = exprNode(searchArg);
-            if (!search || (search.type !== 'string' && search.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? searchArg.ast, message: `replace expects a string search term, got ${search ? `type ${typeName(search.type)}` : describe(searchArg)}` });
-                return ERROR;
-            }
-            if (forbid(search, ['agg', 'group', 'order'], 'replace', at2 ?? searchArg.ast, ctx2)) return ERROR;
-            return fn('replace', (replArg, at3, ctx3) => {
-                const repl = exprNode(replArg);
-                if (!repl || (repl.type !== 'string' && repl.type !== 'unknown')) {
-                    ctx3.diagnostics.push({ node: at3 ?? replArg.ast, message: `replace expects a string replacement, got ${repl ? `type ${typeName(repl.type)}` : describe(replArg)}` });
-                    return ERROR;
-                }
-                if (forbid(repl, ['agg', 'group', 'order'], 'replace', at3 ?? replArg.ast, ctx3)) return ERROR;
-                return mkExpr({ kind: 'call', name: 'replace', args: [node, search, repl], type: 'string' }, at3);
-            });
-        });
-    }),
-    left_substring: () => fn('left_substring', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `left_substring expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'left_substring', at ?? arg.ast, ctx)) return ERROR;
-        return fn('left_substring', (lenArg, at2, ctx2) => {
-            const len = exprNode(lenArg);
-            if (!len || (!isNumeric(len.type) && len.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? lenArg.ast, message: `left_substring expects a numeric length, got ${len ? `type ${typeName(len.type)}` : describe(lenArg)}` });
-                return ERROR;
-            }
-            if (forbid(len, ['agg', 'group', 'order'], 'left_substring', at2 ?? lenArg.ast, ctx2)) return ERROR;
-            return mkExpr({ kind: 'call', name: 'left_substring', args: [node, len], type: 'string' }, at2);
-        });
-    }),
-    right_substring: () => fn('right_substring', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `right_substring expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'right_substring', at ?? arg.ast, ctx)) return ERROR;
-        return fn('right_substring', (lenArg, at2, ctx2) => {
-            const len = exprNode(lenArg);
-            if (!len || (!isNumeric(len.type) && len.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? lenArg.ast, message: `right_substring expects a numeric length, got ${len ? `type ${typeName(len.type)}` : describe(lenArg)}` });
-                return ERROR;
-            }
-            if (forbid(len, ['agg', 'group', 'order'], 'right_substring', at2 ?? lenArg.ast, ctx2)) return ERROR;
-            return mkExpr({ kind: 'call', name: 'right_substring', args: [node, len], type: 'string' }, at2);
-        });
-    }),
     // --- logical ----------------------------------------------------------
     like: () => fn('like', (arg, at, ctx) => {
         const node = exprNode(arg);
@@ -3059,7 +2999,11 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
                 ctx3.diagnostics.push({ node: at3 ?? leftArg.ast, message: `sql_infix operands must be SQL expressions, got ${describe(leftArg)} and ${describe(rightArg)}` });
                 return ERROR;
             }
-            return mkExpr({ kind: 'bin', op, left, right, type: 'bool' }, at3 ?? at);
+            // Numeric operators produce numeric SQL, comparisons produce bool.
+            const t: SqlType = op === '/' || op === '*' || op === '+' || op === '-' || op === 'DIV' || op === 'MOD'
+                ? (left.type === 'float' || right.type === 'float' || op === '/' ? 'float' : 'int')
+                : 'bool';
+            return mkExpr({ kind: 'bin', op, left, right, type: t }, at3 ?? at);
         }));
     }),
 

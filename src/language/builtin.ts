@@ -214,7 +214,8 @@ export const BUILTIN_SPECS = [
     { name: 'floor', category: 'math', doc: 'FLOOR', scheme: u => poly(u, [tVar], t => fun(t, t)) },
     { name: 'sqrt', category: 'math', doc: 'SQRT', scheme: u => poly(u, [tVar], t => fun(t, t)) },
     { name: 'pow', category: 'math', doc: 'POW', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, p('float')))) },
-    { name: 'div', category: 'math', doc: 'div a b — integral division (Haskell base)', scheme: () => mono(fun(p('int'), fun(p('int'), p('int')))) },
+    // `div` (integral division) and `mod` are Haskell base; `div` lives in
+    // prelude.tetaue (dialect-branching), `mod` stays a core builtin.
     { name: 'mod', category: 'math', doc: 'mod a b — integral modulo (Haskell base)', scheme: () => mono(fun(p('int'), fun(p('int'), p('int')))) },
 
     // --- pure list combinators (the list.* namespace) --------------------
@@ -247,10 +248,10 @@ export const BUILTIN_SPECS = [
     // definition that wraps it pins the type at its use site.
     { name: 'sql_func', category: 'scalar', doc: 'sql_func name [args] — an uninterpreted SQL function call', scheme: u => poly(u, [tVar], t => fun(p('string'), fun(listOf(t), u.fresh()))) },
     // `sql_infix op left right` emits an uninterpreted infix SQL expression
-    // (`left op right`, e.g. `sql_infix "IN" n x` -> `n IN x`). Composed with
-    // sql_func it expresses argument-reordered forms such as `position`'s
-    // `POSITION(needle IN value)` for postgresql/trino.
-    { name: 'sql_infix', category: 'scalar', doc: 'sql_infix op left right — an uninterpreted infix SQL expression (left op right)', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(p('string'), fun(a, fun(b, p('bool'))))) },
+    // (`left op right`, e.g. `sql_infix "IN" n x` -> `n IN x`). The result
+    // type is left open (`c`) — a comparison is bool, `div` is int, etc. —
+    // and the prelude annotation pins it at the use site.
+    { name: 'sql_infix', category: 'scalar', doc: 'sql_infix op left right — an uninterpreted infix SQL expression (left op right)', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(p('string'), fun(a, fun(b, u.fresh())))) },
     // `sql_cast value "target"` emits an uninterpreted CAST(value AS target).
     // The result type is left open (`b`) — the prelude definition pins it via
     // its annotation (e.g. `year: date -> int`).
@@ -261,8 +262,8 @@ export const BUILTIN_SPECS = [
     // `reverse` stays a core builtin: sqlite lowers it to a recursive CTE,
     // which sql_func cannot express yet (see sql-dialect.md).
     { name: 'reverse', category: 'string', doc: 'REVERSE (dialect fallback where needed)', scheme: () => mono(fun(p('string'), p('string'))) },
-    { name: 'replace', category: 'string', doc: 'REPLACE', scheme: () => mono(fun(p('string'), fun(p('string'), fun(p('string'), p('string'))))) },
-    { name: 'left_substring', category: 'string', doc: 'LEFT / SUBSTR', scheme: () => mono(fun(p('string'), fun(p('int'), p('string')))) },
+    // `replace`, `left_substring`/`right_substring` live in prelude.tetaue
+    // (dialect-branching over sql_func/sql_infix).
 
     // --- closed Functor / Applicative / Alternative / Monad operations ----
     // Catalog schemes keep a Maybe shape for tooling and fallback application;
@@ -327,7 +328,6 @@ export const BUILTIN_SPECS = [
  */
 export const BUILTIN_ALIASES = {
     is_not_in: 'is_in',
-    right_substring: 'left_substring',
     least: 'greatest',
     rpad: 'lpad',
     lead: 'lag',

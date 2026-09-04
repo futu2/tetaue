@@ -498,9 +498,9 @@ const SPECIAL_CALLS = new Set<BuiltinName>([
     'date_add', 'date_diff', 'date_trunc', 'date_format', 'date_parse',
     'to_unixtime', 'from_unixtime',
     // scalar family
-    'concat', 'greatest', 'least', 'substring', 'reverse', 'left_substring', 'right_substring',
+    'concat', 'greatest', 'least', 'substring', 'reverse',
     'lpad', 'rpad', 'cast',
-    'from_maybe', 'is_true', 'is_false', 'is_unknown', 'div',
+    'from_maybe', 'is_true', 'is_false', 'is_unknown',
 ]);
 
 function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): string | null {
@@ -542,10 +542,6 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
                     + `) SELECT value FROM __tetaue_reverse WHERE i = 0)`;
             }
             return `REVERSE(${x()})`;
-        case 'left_substring':
-            return d === 'sqlite' ? `SUBSTR(${x()}, 1, ${x(1)})` : `LEFT(${x()}, ${x(1)})`;
-        case 'right_substring':
-            return d === 'sqlite' ? `SUBSTR(${x()}, -${x(1)})` : `RIGHT(${x()}, ${x(1)})`;
         case 'lpad': case 'rpad':
             // SQLite has no LPAD/RPAD.  printf() produces a run of spaces and
             // replace() turns it into the requested pad string. CASE handles
@@ -577,12 +573,6 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
             // IS UNKNOWN is not accepted by every supported backend;
             // for a boolean expression SQL UNKNOWN is exactly NULL.
             return `${x()} IS NULL`;
-        case 'div':
-            // Haskell `div` is integral division. PostgreSQL, SQLite and
-            // Trino already integer-divide when both operands are ints;
-            // MySQL and Hive need the DIV operator.
-            if (d === 'mysql' || d === 'hive') return `${x()} DIV ${x(1)}`;
-            return `${x()} / ${x(1)}`;
         case 'cast': {
             const type = node.args[1]?.kind === 'lit' ? sqlTypeName(String(node.args[1]!.value), d) : 'INTEGER';
             return `CAST(${x()} AS ${type})`;

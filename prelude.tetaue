@@ -54,6 +54,24 @@ export trim: string -> string = x => (sql_func) "TRIM" [x]
 export upper = toUpper
 export lower = toLower
 
+# More monomorphic scalar lowerings. replace has no per-dialect variance;
+# div (integral division) and left_substring/right_substring vary by
+# dialect and branch on the hidden sql_dialect value.
+export replace: string -> string -> string -> string = s => f => r => (sql_func) "REPLACE" [s, f, r]
+export div: int -> int -> int = a => b => case sql_dialect.name {
+    "mysql" => (sql_infix) "DIV" a b,
+    "hive"  => (sql_infix) "DIV" a b,
+    _       => (sql_infix) "/" a b,
+}
+export left_substring: string -> int -> string = s => n => case sql_dialect.name {
+    "sqlite" => (sql_func) "SUBSTR" [s, 1, n],
+    _        => (sql_func) "LEFT" [s, n],
+}
+export right_substring: string -> int -> string = s => n => case sql_dialect.name {
+    "sqlite" => (sql_func) "SUBSTR" [s, (-n)],
+    _        => (sql_func) "RIGHT" [s, n],
+}
+
 # position varies per dialect in BOTH the function name and the argument
 # order, so its lowering branches on the hidden sql_dialect value. The
 # argument-reordered form (POSITION(needle IN value)) is expressed with the
