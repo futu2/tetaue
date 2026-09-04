@@ -43,16 +43,16 @@ export is_not_null = is_just
 # Scalar SQL functions with no per-dialect variance are ordinary prelude
 # definitions over the sql_func primitive, not core builtins. The precise
 # annotation keeps their type exact (length is int, not a fresh variable).
-export upper: string -> string = x => (sql_func) "UPPER" [x]
-export lower: string -> string = x => (sql_func) "LOWER" [x]
+# The public spellings are Haskell-flavored (toUpper/toLower); the SQL-named
+# exports remain as aliases for compatibility.
+export toUpper: string -> string = x => (sql_func) "UPPER" [x]
+export toLower: string -> string = x => (sql_func) "LOWER" [x]
 export length: string -> int = x => (sql_func) "LENGTH" [x]
 export trim: string -> string = x => (sql_func) "TRIM" [x]
 
-# Haskell-flavored spellings (Data.Char/Data.List style). These are aliases
-# for now, so the SQL-named exports stay available; whether they become
-# canonical is a naming decision left open.
-export toUpper = upper
-export toLower = lower
+# SQL-named aliases, kept for compatibility with existing code.
+export upper = toUpper
+export lower = toLower
 
 # position varies per dialect in BOTH the function name and the argument
 # order, so its lowering branches on the hidden sql_dialect value. The

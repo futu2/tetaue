@@ -165,28 +165,18 @@ function-name* surface.
   `prelude-sql.tetaue`; the base prelude never mentions a dialect, preserving
   the "no SQL leak" property.
 
-## Naming direction (open decision)
+## Naming direction (resolved)
 
 The user's direction is "use haskell base lib name rather than sql things,
-sql things should not leak." The migrated scalars still carry SQL-flavored
-public names (`upper`, `lower`, `position`), which is the acknowledged
-interpretation gap. Current state:
+sql things should not leak." The migrated scalars now carry Haskell-flavored
+public names:
 
-- `toUpper`/`toLower` are provided as prelude aliases of `upper`/`lower`
-  (non-destructive first step).
-- A full canonical rename has semantic friction, not just churn:
-  - base `toUpper`/`toLower` are `Char -> Char`, not whole-string.
-  - base `elemIndex` returns `Maybe Int`; SQL `position` returns `Int` (0
-    when absent).
-  - `length`/`trim` already match base spellings.
-
-Open options (needs the user's preference, not guessed):
-1. Make the Haskell spellings canonical and keep SQL names as deprecated
-   aliases.
-2. Keep SQL names as canonical; treat `toUpper`/`toLower` as the only
-   Haskell-flavored conveniences.
-3. Move the SQL surface under a `Sql.*` namespace so the base prelude is
-   purely functional and SQL names are qualified (strongest "no leak").
+- `toUpper`/`toLower` are the canonical definitions; `upper`/`lower` remain
+  as compatibility aliases.
+- `length`/`trim` already match base spellings.
+- `position` keeps its SQL name (its argument-reordered lowering has no
+  faithful base counterpart — `elemIndex` returns `Maybe Int`, SQL returns
+  `Int`).
 
 ## Success criteria
 
