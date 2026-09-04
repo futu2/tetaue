@@ -52,7 +52,7 @@ The standard meanings are defined in `prelude.tetaue`. SQL-aware operators use
 hidden intrinsics from the small core; pure operators are ordinary lambdas:
 
 ```
-export _+_ = @op_add
+export _+_ = op_add
 export _>>>_ = f => g => x => g (f x)
 export _<<<_ = f => g => x => f (g x)
 export _&_ = x => f => f x
@@ -111,6 +111,30 @@ Semantics and typing:
   (`t: query { id: int } = table "t"`).
 - **Not for aggregation.** `merge` inside `fold` produces non-grouped,
   non-aggregated entries, which `fold` rejects like any plain column.
+
+## The pure `list.*` namespace
+
+The Haskell `base` List vocabulary lives in a **built-in `list` namespace**,
+kept strictly separate from the unqualified relational/SQL vocabulary so the
+two never collide. Qualified access needs parens when applied (the same rule
+as `filter (p.adult)`):
+
+```
+(list.map)    (x => x * 2) [1, 2, 3]      # [2, 4, 6]
+(list.fold)   (acc => x => acc + x) 0 [1, 2, 3]   # 6
+(list.length) [1, 2, 3]                   # 3
+(list.elem)   2 [1, 2, 3]                 # true
+(list.isEmpty) []                         # true
+```
+
+Members: `map`, `filter`, `fold`, `foldr`, `sum`, `product`, `length`,
+`reverse`, `concat`, `append`, `take`, `drop`, `head`, `last`, `isEmpty`,
+`elem`. (`isEmpty` is used instead of `null` because `null` is a reserved
+keyword and cannot follow the namespace dot.)
+
+These operate on **in-memory `[...]` list values only** — they never touch
+SQL. `map`, `filter`, `take`, `drop`, `fold`, `sum`, `length`, `reverse`,
+`concat` keep their unqualified relational/scalar meanings.
 
 ## Date & time
 
@@ -357,9 +381,9 @@ SQLite 3.25+, Trino, Hive all support the standard `FN(...) OVER (...)` form):
 | `rank`, `dense_rank`, `percent_rank` | `RANK()` / `DENSE_RANK()` / `PERCENT_RANK()` |
 | `over (ntile 4) { ... }` | `NTILE(4) OVER (...)`, `ntile` takes a numeric bucket count |
 | `over (lag u.x 1 (just 0)) { ... }` | `LAG(x, 1, 0) OVER (...)`, `lead` — value, offset required, optional default |
-| `over (sum u.x) { ... }` | `SUM(x) OVER (...)`, windowed `avg`/`count`/`min`/`max`/`list` too |
+| `over (sum u.x) { ... }` | `SUM(x) OVER (...)`, windowed `avg`/`count`/`min`/`max`/`array` too |
 
-The wrapped expression must be an aggregate (`sum`/`avg`/`count`/`min`/`max`/`list`)
+The wrapped expression must be an aggregate (`sum`/`avg`/`count`/`min`/`max`/`array`)
 or a window-only function (`row_number`, `rank`, `dense_rank`,
 `percent_rank`, `ntile`, `lag`, `lead`) — anything else is rejected. The
 window-only functions are also rejected **outside** `over` (a bare
@@ -371,7 +395,7 @@ inlining the `OVER` expression would be invalid SQL.
 
 ## Not implemented (needs type-system / query machinery)
 
-- **Array functions** (§6) — `list` (aggregate into a list) and `[T]` column
+- **Array functions** (§6) — `array` (aggregate into a list) and `[T]` column
   annotations exist, but there are no array literals, indexing, or
   element-wise array functions yet.
 - **Query features** — none of the original gaps remain for the supported
@@ -398,7 +422,9 @@ inlining the `OVER` expression would be invalid SQL.
   (`catalog.ts`, the single source of truth for every scheme);
   `LIST_BUILTINS` applications get per-element kind and arity checks in
   `checkListBuiltin`; `pow`/`mod` use independent type variables so operands
-  never unify with each other; the query DSL's modes (`agg`, `group`, `order`)
-  are types enforced by the fold/map/sort checks.
+  never unify with each other; the query DSL's modes (`agg`, `group`,
+  `window`) are one `mode` type constructor (`types.ts`), enforced by the
+  fold/map/over checks — `order` is a separate atom consumed by `sort`.
+  See `docs/design/type-system-formal.md` for the formal core.
 - `compile.ts` — render-time capability errors surface as compile
   diagnostics.

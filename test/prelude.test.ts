@@ -4,20 +4,21 @@ import { readFileSync } from 'node:fs';
 import { createTetaueServices } from '../src/language/tetaue-module.js';
 import { standardPrelude, standardPreludeNames, STANDARD_PRELUDE_SOURCE } from '../src/language/prelude.js';
 import { BUILTINS, createPreludeEnv } from '../src/language/interpreter.js';
-import { BUILTIN_NAMES, CORE_TYPE_NAMES, coreBuiltinName } from '../src/language/builtin.js';
+import { BUILTIN_NAMES } from '../src/language/builtin.js';
+import { LIST_NAMESPACE } from '../src/language/list-namespace.js';
 import { checkProject } from '../src/language/checker.js';
 import { Inferencer } from '../src/language/inference.js';
 import type { Model } from '../src/language/generated/ast.js';
 
 const services = createTetaueServices(NodeFileSystem).tetaue;
 
-function checked(source: string) {
+function checked(source: string, options: { requireQuery?: boolean } = {}) {
     const parsed = services.parser.LangiumParser.parse(source);
     expect(parsed.lexerErrors).toEqual([]);
     expect(parsed.parserErrors).toEqual([]);
     return checkProject(
         [{ model: parsed.value as Model, uri: undefined, imports: [] }],
-        { prelude: standardPrelude(services) },
+        { prelude: standardPrelude(services), requireQuery: options.requireQuery ?? true },
     );
 }
 
@@ -57,7 +58,7 @@ describe('standard prelude', () => {
         const alternative = prelude.model.bindings.find(binding => binding.name === '_<|>_');
         const bind = prelude.model.bindings.find(binding => binding.name === '_>>=_');
         expect(plus?.export).toBe(true);
-        expect(plus?.$cstNode?.text).toBe('export _+_ = @op_add');
+        expect(plus?.$cstNode?.text).toBe('export _+_ = op_add');
         expect(forward?.$cstNode?.text).toBe('export _>>>_ = f => g => x => g (f x)');
         expect(pipeline?.$cstNode?.text).toBe('export _&_ = x => f => f x');
         expect(apply?.$cstNode?.text).toBe('export _$_ = f => x => f x');
@@ -65,30 +66,31 @@ describe('standard prelude', () => {
         expect(alternative?.$cstNode?.text).toBe('export _<|>_ = orElse');
         expect(bind?.$cstNode?.text).toBe('export _>>=_ = bind');
         const core = createPreludeEnv();
-        expect(core.has('@op_compose_forward')).toBe(false);
-        expect(core.has('@op_pipeline')).toBe(false);
-        expect(core.has('@op_apply')).toBe(false);
+        expect(core.has('op_compose_forward')).toBe(false);
+        expect(core.has('op_pipeline')).toBe(false);
+        expect(core.has('op_apply')).toBe(false);
     });
 
-    test('exports every primitive function and scalar type through aliases', () => {
+    test('builtin names are native — no @ prefix, no alias shims', () => {
         const prelude = standardPrelude(services);
-        const bindings = new Map(prelude.model.bindings.map(binding => [binding.name, binding]));
-        for (const name of BUILTIN_NAMES) {
-            expect(bindings.get(name)?.$cstNode?.text).toBe(`export ${name} = ${coreBuiltinName(name)}`);
-        }
-        const types = new Map(prelude.model.types.map(alias => [alias.name, alias]));
-        for (const name of CORE_TYPE_NAMES) {
-            expect(types.get(name)?.$cstNode?.text).toBe(`export type ${name} = @${name}`);
-        }
+        // The prelude no longer re-exports every builtin: builtins are native
+        // names supplied by the core, so the source prelude binds only the
+        // derived helpers and operator sections.
+        expect(prelude.model.bindings.find(b => b.name === 'table')).toBeUndefined();
         const core = createPreludeEnv();
-        expect(core.has('filter')).toBe(false);
-        expect(core.has('@filter')).toBe(true);
-        expect(core.has('int')).toBe(false);
+        expect(core.has('filter')).toBe(true);
+        expect(core.has('@filter')).toBe(false);
+        expect(core.has('table')).toBe(true);
+        expect(core.has('int')).toBe(false); // types are not runtime values
 
         const inferencer = new Inferencer();
         inferencer.prelude();
-        expect(inferencer.env.has('filter')).toBe(false);
-        expect(inferencer.env.has('@filter')).toBe(true);
+        expect(inferencer.env.has('filter')).toBe(true);
+        expect(inferencer.env.has('@filter')).toBe(false);
+        // Every builtin name is reachable natively.
+        for (const name of BUILTIN_NAMES) {
+            expect(inferencer.env.has(name)).toBe(true);
+        }
     });
 
     test('defines derived helpers outside the primitive builtin table', () => {
@@ -114,32 +116,84 @@ describe('standard prelude', () => {
     });
 
     test('the source prelude controls the public surface', () => {
-        const minimal = parsedModule('export type int = @int\nexport table = @table', 'tetaue:test-prelude');
-        const publicUse = checkProject(
-            [parsedModule('users: query { id: int } = table "users"\nq = users & filter (u => true)')],
-            { prelude: minimal },
-        );
-        expect(publicUse.diagnostics.map(d => d.message).join('\n')).toContain("unknown identifier 'filter'");
-
+        // Without the prelude, only the native builtin names are visible.
         const coreUse = checkProject(
-            [parsedModule('q = @filter (u => true) (@table "users")')],
-            { prelude: minimal },
+            [parsedModule('q = filter (u => true) (table "users")')],
+            { requireQuery: false },
         );
         expect(coreUse.diagnostics).toEqual([]);
         expect(coreUse.value.kind).toBe('query');
+
+        // Prelude-derived helpers (not builtins) disappear without the prelude.
+        const helperUse = checkProject(
+            [parsedModule('q = is_nothing')],
+            { requireQuery: false },
+        );
+        expect(helperUse.diagnostics.map(d => d.message).join('\n')).toContain("unknown identifier 'is_nothing'");
+    });
+});
+
+describe('list namespace', () => {
+    test('every list.* member maps to a real backend builtin', () => {
+        const env = createPreludeEnv();
+        const list = env.get('list');
+        expect(list?.kind).toBe('module');
+        if (!list || list.kind !== 'module') return;
+        for (const [publicName, builtinName] of Object.entries(LIST_NAMESPACE)) {
+            expect(list.exports.has(publicName)).toBe(true);
+            expect(Object.keys(BUILTINS)).toContain(builtinName);
+            expect(BUILTIN_NAMES).toContain(builtinName);
+        }
     });
 
-    test('omitting the source prelude exposes only core names', () => {
-        const publicUse = checkProject(
-            [parsedModule('q = filter')],
-            { requireQuery: false },
-        );
-        expect(publicUse.diagnostics.map(d => d.message).join('\n')).toContain("unknown identifier 'filter'");
+    test('list.* resolves and evaluates as pure in-memory list operations', () => {
+        expect(checked('main = (list.sum) [1, 2, 3]', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (list.length) [1, 2, 3]', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (list.product) [2, 3, 4]', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (list.reverse) [1, 2, 3]', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (list.head) [1, 2, 3]', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (list.elem) 2 [1, 2, 3]', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (list.map) (x => x + 1) [1, 2, 3]', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('xs = [1, 2, 3]\nmain = (list.fold) (acc => x => acc + x) 0 xs', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (list.isEmpty) []', { requireQuery: false }).diagnostics).toEqual([]);
+    });
 
-        const coreUse = checkProject(
-            [parsedModule('q = @filter')],
-            { requireQuery: false },
-        );
-        expect(coreUse.diagnostics).toEqual([]);
+    test('list.* coexists with the unqualified SQL vocabulary (no overwrite)', () => {
+        const env = createPreludeEnv();
+        const list = env.get('list');
+        expect(list?.kind).toBe('module');
+        if (!list || list.kind !== 'module') return;
+        // The unqualified query steps and scalar builtins stay in place —
+        // `map`/`filter`/`take`/`drop`/`length`/`reverse`/`concat`/`sum`
+        // remain the relational/SQL words — and the namespace adds the pure
+        // list spellings without replacing them.
+        for (const name of ['map', 'filter', 'take', 'drop', 'length', 'reverse', 'concat', 'sum']) {
+            expect(env.has(name)).toBe(true);
+            expect(env.get(name)).not.toBe(list.exports.get(name));
+        }
+        // And every list.* public spelling resolves through the namespace.
+        for (const publicName of Object.keys(LIST_NAMESPACE)) {
+            expect(list.exports.has(publicName)).toBe(true);
+        }
+    });
+
+    test('a pipeline can mix list.* and the relational query steps without collision', () => {
+        const result = checked(`
+            users: query { id: int, age: int } = table "users"
+            q = users
+                & filter (u => u.age >= 18)
+                & map (u => { id = u.id, age = u.age })
+        `);
+        expect(result.diagnostics).toEqual([]);
+        expect(result.value.kind).toBe('query');
+
+        // list.* is pure in-memory and usable in an ordinary binding.
+        const pure = checked(`
+            users: query { id: int } = table "users"
+            total = (list.fold) (acc => x => acc + x) 0 [1, 2, 3]
+            q = users & take 1 & map (u => { id = u.id, n = total })
+        `);
+        expect(pure.diagnostics).toEqual([]);
+        expect(pure.value.kind).toBe('query');
     });
 });

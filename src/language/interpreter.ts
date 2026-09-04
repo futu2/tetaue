@@ -12,15 +12,16 @@ import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBooleanLiteral,
     isCaseExpression, isIdentifier, isLambda, isLetExpression, isListLiteral,
     isListType, isMapLiteral,
-    isNullLiteral, isNumberLiteral, isOperatorSection, isQualifiedTypeName, isQueryType, isRecordType, isStringLiteral,
+    isNullLiteral, isNumberLiteral, isOperatorSection, isQueryType, isRecordType, isStringLiteral,
     isTypeAtom, isTypeHole, isTypeParen, isTypeVar, isUnaryMinus,
     type Application, type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
 } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
-import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
+import { resolveImportScope } from './project-scope.js';
 import { implicitParamName, labelName, parseStringLiteral } from './strings.js';
 export { parseStringLiteral };
-import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, LIST_ARITY, coreBuiltinName, type BuiltinName } from './builtin.js';
+import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
+import { LIST_NAMESPACE } from './list-namespace.js';
 import { TypeUniverse } from './types.js';
 import type { Type } from './types.js';
 import {
@@ -184,10 +185,6 @@ export interface Ctx {
     diagnostics: Diagnostic[];
     /** Names bound anywhere in the module (for forward-reference hints). */
     moduleBindings: Set<string>;
-    /** Module-local type aliases for schema decoding. */
-    typeAliases?: ReadonlyMap<string, import('./generated/ast.js').Type>;
-    /** Namespace type aliases for `t.Name` schema decoding. */
-    typeNamespaces?: ReadonlyMap<string, ReadonlyMap<string, import('./generated/ast.js').Type>>;
     /** When evaluating a fold projection, CASE branches may wrap aggregates. */
     allowAggregatesInCase?: boolean;
     /** Optional best-effort record of the runtime Value produced per AST node. */
@@ -330,6 +327,39 @@ function numberValue(v: Value): number | null {
     const node = exprNode(v);
     if (node?.kind === 'lit' && typeof node.value === 'number') return node.value;
     return null;
+}
+
+/** Whether a predicate result means "keep": a literal true, or a truthy SQL node. */
+function truthyValue(v: Value): boolean {
+    const node = exprNode(v);
+    if (!node) return false;
+    if (node.kind === 'lit') return node.value === true;
+    // A non-literal boolean expression (e.g. `x > 0` over SQL columns) is
+    // treated as a predicate that holds.
+    return true;
+}
+
+/**
+ * Fold a numeric list with `+`/`*` over its elements. Elements that are
+ * numeric literals are added into a constant accumulator; a non-literal SQL
+ * expression element folds into a `bin` expression chain via evalBinary.
+ */
+function listNumericFold(op: '+' | '*', start: number, type: SqlType, xs: { kind: 'list'; items: Value[]; ast?: AstNode }, at: AstNode | undefined, ctx: Ctx): Value {
+    let acc = mkExpr(lit(start, type), at ?? xs.ast);
+    for (const item of xs.items) {
+        const n = numberValue(item);
+        if (n !== null) {
+            const cur = numberValue(acc);
+            if (cur !== null) {
+                acc = mkExpr(lit(op === '+' ? cur + n : cur * n, type), at ?? item.ast ?? xs.ast);
+                continue;
+            }
+        }
+        const next = evalBinary(op, acc, item, at ?? item.ast ?? xs.ast ?? fallbackNode(ctx), ctx);
+        if (isError(next)) return ERROR;
+        acc = next;
+    }
+    return acc;
 }
 
 /** SQL three-valued logic predicates; all return a non-null boolean. */
@@ -597,8 +627,6 @@ export function applyWith(f: Value, arg: Value, at: AstNode | undefined, ctx: Ct
                     env,
                     diagnostics: ctx.diagnostics,
                     moduleBindings: ctx.moduleBindings,
-                    typeAliases: ctx.typeAliases,
-                    typeNamespaces: ctx.typeNamespaces,
                     allowAggregatesInCase: ctx.allowAggregatesInCase,
                 });
             }
@@ -810,23 +838,17 @@ function memptyIdentityFor(other: Value, at: AstNode | undefined, ctx: Ctx, othe
  */
 function expandMemptyAnnotation(t: import('./generated/ast.js').Type, ctx: Ctx): Value | null {
     let cur: import('./generated/ast.js').Type = t;
-    const seen = new Set<string>();
     for (;;) {
         if (isTypeAtom(cur)) {
             if (cur.maybeType) { cur = cur.maybeType; continue; }
             if (cur.base) { cur = cur.base; continue; }
         }
         if (isTypeParen(cur)) { cur = cur.type; continue; }
-        if (isTypeVar(cur) && !cur.name.startsWith('@') && ctx.typeAliases?.has(cur.name) && !seen.has(cur.name)) {
-            seen.add(cur.name);
-            cur = ctx.typeAliases.get(cur.name)!;
-            continue;
-        }
         break;
     }
     if (isListType(cur)) return { kind: 'list', items: [] };
     if (isRecordType(cur)) return recordValue([]);
-    if (isTypeVar(cur) && cur.name === '@string') return mkExpr(lit('', 'string'));
+    if (isTypeVar(cur) && cur.name === 'string') return mkExpr(lit('', 'string'));
     return null;
 }
 function memptyFromAnnotation(t: import('./generated/ast.js').Type, at: AstNode | undefined, ctx: Ctx): Value {
@@ -837,11 +859,6 @@ function memptyFromAnnotation(t: import('./generated/ast.js').Type, at: AstNode 
             if (cur.base) { cur = cur.base; continue; }
         }
         if (isTypeParen(cur)) { cur = cur.type; continue; }
-        // Expand module-local/scalar aliases (`int` → `@int`).
-        if (isTypeVar(cur) && !cur.name.startsWith('@') && ctx.typeAliases?.has(cur.name)) {
-            cur = ctx.typeAliases.get(cur.name)!;
-            continue;
-        }
         break;
     }
     if (isListType(cur)) {
@@ -852,13 +869,13 @@ function memptyFromAnnotation(t: import('./generated/ast.js').Type, at: AstNode 
     if (isRecordType(cur)) {
         return recordValue([], at);
     }
-    if (isTypeVar(cur) && cur.name.startsWith('@') && cur.name.slice(1) === 'string') {
+    if (isTypeVar(cur) && cur.name === 'string') {
         return mkExpr(lit('', 'string'), at);
     }
-    if (isTypeVar(cur) && cur.name.startsWith('@')) {
+    if (isTypeVar(cur) && (CAST_TYPES as readonly string[]).includes(cur.name)) {
         ctx.diagnostics.push({
             node: at ?? cur,
-            message: `mempty has no instance for ${cur.name.slice(1)} — the closed Monoid instances are string, [a], and records`,
+            message: `mempty has no instance for ${cur.name} — the closed Monoid instances are string, [a], and records`,
         });
         return mkExpr(lit('', 'string'), at); // concrete default keeps downstream IR valid
     }
@@ -1294,7 +1311,7 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
         // exactly like a top-level binding annotation.
         if (e.type && v.kind === 'query' && !v.query.known
             && v.query.steps.every(step => step.kind !== 'join')) {
-            const qt = queryTypeOf(e.type, ctx.typeAliases, ctx.typeNamespaces);
+            const qt = queryTypeOf(e.type);
             if (qt) {
                 const schema = schemaFromQueryType(qt, e, ctx);
                 if (schema) {
@@ -1312,7 +1329,7 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
         }
         const env = new Map(ctx.env);
         env.set(e.name ?? '', v);
-        return evalExprWith(e.body as Expr, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings, typeAliases: ctx.typeAliases, typeNamespaces: ctx.typeNamespaces });
+        return evalExprWith(e.body as Expr, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
     }
     if (isAscription(e)) {
         // Type annotations are erased except for query schemas on plain
@@ -1447,7 +1464,7 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
             ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}' — bindings must be defined before use` });
             return ERROR;
         }
-        const known = [...ctx.env.keys()].filter(k => !k.startsWith('@') && !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
+        const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
         ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
         return ERROR;
     }
@@ -1776,7 +1793,7 @@ function joinBuiltin(name: string, joinKind: JoinKind): () => Value {
 }
 
 const AGG_TYPES: Record<string, SqlType> = {
-    count: 'int', sum: 'int', avg: 'float', min: 'int', max: 'int', list: 'array',
+    count: 'int', sum: 'int', avg: 'float', min: 'int', max: 'int', array: 'array',
 };
 
 export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
@@ -2287,7 +2304,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     avg: aggBuiltin('avg', 'numeric'),
     min: aggBuiltin('min', 'any'),
     max: aggBuiltin('max', 'any'),
-    list: aggBuiltin('list', 'any'),
+    array: aggBuiltin('array', 'any'),
     group: () => fn('group', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
@@ -2461,6 +2478,211 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     pow: numericBinaryBuiltin('pow', 'float'),
     div: numericBinaryBuiltin('div', 'first'),
     mod: numericBinaryBuiltin('mod', 'first'),
+
+    // --- pure list combinators (the list.* namespace) --------------------
+    // In-memory operations over `{ kind: 'list' }` values. These are the
+    // Haskell base List vocabulary, kept separate from the SQL query steps
+    // (which keep `map`/`filter`/`take`/`drop`/`fold`).
+    list_map: () => fn('list.map', (f, at, ctx) => {
+        if (!isApplicable(f)) {
+            ctx.diagnostics.push({ node: at ?? f.ast, message: `list.map expects a function as its first argument, e.g. list.map (x => x + 1) [1, 2, 3]` });
+            return ERROR;
+        }
+        return fn('list.map', (xs, at2, ctx2) => {
+            if (xs.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? xs.ast, message: `list.map expected a list, got ${describe(xs)}` });
+                return ERROR;
+            }
+            const items: Value[] = [];
+            for (const item of xs.items) {
+                const mapped = applyWith(f, item, at2 ?? item.ast, ctx2);
+                if (isError(mapped)) return ERROR;
+                items.push(mapped);
+            }
+            return { kind: 'list', items, ast: at2 ?? xs.ast };
+        });
+    }),
+    list_filter: () => fn('list.filter', (p, at, ctx) => {
+        if (!isApplicable(p)) {
+            ctx.diagnostics.push({ node: at ?? p.ast, message: `list.filter expects a predicate function, e.g. list.filter (x => x > 0) [1, -2, 3]` });
+            return ERROR;
+        }
+        return fn('list.filter', (xs, at2, ctx2) => {
+            if (xs.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? xs.ast, message: `list.filter expected a list, got ${describe(xs)}` });
+                return ERROR;
+            }
+            const items: Value[] = [];
+            for (const item of xs.items) {
+                const keep = applyWith(p, item, at2 ?? item.ast, ctx2);
+                if (isError(keep)) return ERROR;
+                if (truthyValue(keep)) items.push(item);
+            }
+            return { kind: 'list', items, ast: at2 ?? xs.ast };
+        });
+    }),
+    list_fold: () => fn('list.fold', (f, at, ctx) => {
+        if (!isApplicable(f)) {
+            ctx.diagnostics.push({ node: at ?? f.ast, message: `list.fold expects a binary accumulator function (acc => x => acc'), e.g. list.fold (acc => x => acc + x) 0 xs` });
+            return ERROR;
+        }
+        return fn('list.fold', (z, at2, ctx2) => fn('list.fold', (xs, at3, ctx3) => {
+            if (xs.kind !== 'list') {
+                ctx3.diagnostics.push({ node: at3 ?? xs.ast, message: `list.fold expected a list, got ${describe(xs)}` });
+                return ERROR;
+            }
+            let acc = z;
+            for (const item of xs.items) {
+                const step = applyWith(f, acc, at3 ?? item.ast, ctx3);
+                if (isError(step)) return ERROR;
+                const next = applyWith(step, item, at3 ?? item.ast, ctx3);
+                if (isError(next)) return ERROR;
+                acc = next;
+            }
+            return acc;
+        }));
+    }),
+    list_foldr: () => fn('list.foldr', (f, at, ctx) => {
+        if (!isApplicable(f)) {
+            ctx.diagnostics.push({ node: at ?? f.ast, message: `list.foldr expects a binary function (x => acc => acc'), e.g. list.foldr (x => acc => x + acc) 0 xs` });
+            return ERROR;
+        }
+        return fn('list.foldr', (z, at2, ctx2) => fn('list.foldr', (xs, at3, ctx3) => {
+            if (xs.kind !== 'list') {
+                ctx3.diagnostics.push({ node: at3 ?? xs.ast, message: `list.foldr expected a list, got ${describe(xs)}` });
+                return ERROR;
+            }
+            let acc = z;
+            for (let i = xs.items.length - 1; i >= 0; i--) {
+                const item = xs.items[i]!;
+                const step = applyWith(f, item, at3 ?? item.ast, ctx3);
+                if (isError(step)) return ERROR;
+                const next = applyWith(step, acc, at3 ?? item.ast, ctx3);
+                if (isError(next)) return ERROR;
+                acc = next;
+            }
+            return acc;
+        }));
+    }),
+    list_sum: () => fn('list.sum', (xs, at, ctx) => {
+        if (xs.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.sum expected a list, got ${describe(xs)}` });
+            return ERROR;
+        }
+        return listNumericFold('+', 0, 'int', xs, at, ctx);
+    }),
+    list_product: () => fn('list.product', (xs, at, ctx) => {
+        if (xs.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.product expected a list, got ${describe(xs)}` });
+            return ERROR;
+        }
+        return listNumericFold('*', 1, 'int', xs, at, ctx);
+    }),
+    list_length: () => fn('list.length', (xs, at, ctx) => {
+        if (xs.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.length expected a list, got ${describe(xs)}` });
+            return ERROR;
+        }
+        return mkExpr(lit(xs.items.length, 'int'), at ?? xs.ast);
+    }),
+    list_reverse: () => fn('list.reverse', (xs, at, ctx) => {
+        if (xs.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.reverse expected a list, got ${describe(xs)}` });
+            return ERROR;
+        }
+        return { kind: 'list', items: [...xs.items].reverse(), ast: at ?? xs.ast };
+    }),
+    list_concat: () => fn('list.concat', (xss, at, ctx) => {
+        if (xss.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? xss.ast, message: `list.concat expected a list of lists, got ${describe(xss)}` });
+            return ERROR;
+        }
+        const items: Value[] = [];
+        for (const sub of xss.items) {
+            if (sub.kind !== 'list') {
+                ctx.diagnostics.push({ node: sub.ast ?? at, message: `list.concat expected a list of lists, got an element of ${describe(sub)}` });
+                return ERROR;
+            }
+            items.push(...sub.items);
+        }
+        return { kind: 'list', items, ast: at ?? xss.ast };
+    }),
+    list_append: () => fn('list.append', (xs, at, ctx) => fn('list.append', (ys, at2, ctx2) => {
+        if (xs.kind !== 'list' || ys.kind !== 'list') {
+            ctx2.diagnostics.push({ node: at2 ?? xs.ast ?? ys.ast, message: `list.append expects two lists, got ${describe(xs)} and ${describe(ys)}` });
+            return ERROR;
+        }
+        return { kind: 'list', items: [...xs.items, ...ys.items], ast: at2 ?? xs.ast };
+    })),
+    list_take: () => fn('list.take', (nArg, at, ctx) => {
+        const n = numberValue(nArg);
+        if (n === null || !Number.isInteger(n) || n < 0) {
+            ctx.diagnostics.push({ node: at ?? nArg.ast, message: `list.take expects a non-negative integer, got ${n === null ? describe(nArg) : String(n)}` });
+            return ERROR;
+        }
+        return fn('list.take', (xs, at2, ctx2) => {
+            if (xs.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? xs.ast, message: `list.take expected a list, got ${describe(xs)}` });
+                return ERROR;
+            }
+            return { kind: 'list', items: xs.items.slice(0, n), ast: at2 ?? xs.ast };
+        });
+    }),
+    list_drop: () => fn('list.drop', (nArg, at, ctx) => {
+        const n = numberValue(nArg);
+        if (n === null || !Number.isInteger(n) || n < 0) {
+            ctx.diagnostics.push({ node: at ?? nArg.ast, message: `list.drop expects a non-negative integer, got ${n === null ? describe(nArg) : String(n)}` });
+            return ERROR;
+        }
+        return fn('list.drop', (xs, at2, ctx2) => {
+            if (xs.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? xs.ast, message: `list.drop expected a list, got ${describe(xs)}` });
+                return ERROR;
+            }
+            return { kind: 'list', items: xs.items.slice(n), ast: at2 ?? xs.ast };
+        });
+    }),
+    list_head: () => fn('list.head', (xs, at, ctx) => {
+        if (xs.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.head expected a list, got ${describe(xs)}` });
+            return ERROR;
+        }
+        if (xs.items.length === 0) {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.head of an empty list` });
+            return ERROR;
+        }
+        return xs.items[0]!;
+    }),
+    list_last: () => fn('list.last', (xs, at, ctx) => {
+        if (xs.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.last expected a list, got ${describe(xs)}` });
+            return ERROR;
+        }
+        if (xs.items.length === 0) {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.last of an empty list` });
+            return ERROR;
+        }
+        return xs.items[xs.items.length - 1]!;
+    }),
+    list_null: () => fn('list.null', (xs, at, ctx) => {
+        if (xs.kind !== 'list') {
+            ctx.diagnostics.push({ node: at ?? xs.ast, message: `list.null expected a list, got ${describe(xs)}` });
+            return ERROR;
+        }
+        return mkExpr(lit(xs.items.length === 0, 'bool'), at ?? xs.ast);
+    }),
+    list_elem: () => fn('list.elem', (target, at, ctx) => fn('list.elem', (xs, at2, ctx2) => {
+        if (xs.kind !== 'list') {
+            ctx2.diagnostics.push({ node: at2 ?? xs.ast, message: `list.elem expected a list, got ${describe(xs)}` });
+            return ERROR;
+        }
+        for (const item of xs.items) {
+            const eq = evalBinary('==', target, item, at2 ?? xs.ast ?? fallbackNode(ctx2), ctx2);
+            if (isError(eq)) return ERROR;
+            if (truthyValue(eq)) return mkExpr(lit(true, 'bool'), at2 ?? xs.ast);
+        }
+        return mkExpr(lit(false, 'bool'), at2 ?? xs.ast);
+    })),
 
     // --- strings ----------------------------------------------------------
     trim: stringFnBuiltin('trim', 'string'),
@@ -2925,7 +3147,7 @@ function aggBuiltin(name: string, numeric: 'numeric' | 'any'): () => Value {
         let type: SqlType = node.type as SqlType;
         if (name === 'count') type = 'int';
         if (name === 'avg') type = 'float';
-        if (name === 'list') type = 'array';
+        if (name === 'array') type = 'array';
         return mkExpr({ kind: 'agg', name, arg: node, type }, at);
     });
 }
@@ -3597,12 +3819,7 @@ function inBuiltin(negated: boolean): () => Value {
 }
 
 /** The QueryType inside a type annotation, unwrapping parens (null if not a query type). */
-function queryTypeOf(
-    t: import('./generated/ast.js').Type,
-    aliases?: ReadonlyMap<string, import('./generated/ast.js').Type>,
-    namespaces?: ReadonlyMap<string, ReadonlyMap<string, import('./generated/ast.js').Type>>,
-    seen: Set<string> = new Set(),
-): QueryType | null {
+function queryTypeOf(t: import('./generated/ast.js').Type): QueryType | null {
     let cur = t;
     for (;;) {
         if (isTypeAtom(cur)) {
@@ -3611,20 +3828,6 @@ function queryTypeOf(
             return null;
         }
         if (isTypeParen(cur)) { cur = cur.type; continue; }
-        if (isTypeVar(cur) && aliases?.has(cur.name)) {
-            if (seen.has(cur.name)) return null; // recursive alias
-            seen.add(cur.name);
-            cur = aliases.get(cur.name)!;
-            continue;
-        }
-        if (isQualifiedTypeName(cur)) {
-            const key = `${cur.receiver}.${cur.name}`;
-            const target = namespaces?.get(cur.receiver)?.get(cur.name);
-            if (!target || seen.has(key)) return null;
-            seen.add(key);
-            cur = target;
-            continue;
-        }
         break;
     }
     return isQueryType(cur) ? cur : null;
@@ -3644,7 +3847,7 @@ function schemaFromQueryType(t: QueryType, at: AstNode | undefined, ctx: Ctx): S
             ctx.diagnostics.push({ node: field, message: `duplicate field '${key}' in query type` });
         }
         seenFields.add(key);
-        const type = scalarTypeOf(field.type, ctx.typeAliases, ctx.typeNamespaces);
+        const type = scalarTypeOf(field.type);
         if (type === null) {
             ctx.diagnostics.push({ node: field.type, message: `schema entry '${key}' must be a scalar type (int, string, bool, float, decimal, date, timestamp) or a list of one, e.g. [string]` });
             return null; // leave the table dynamic — no partial schema
@@ -3657,13 +3860,9 @@ function schemaFromQueryType(t: QueryType, at: AstNode | undefined, ctx: Ctx): S
 /** The SqlType named by a column type (`int`, `(maybe int)`, `[string]`, ...), or null if not a scalar. */
 function scalarTypeOf(
     t: import('./generated/ast.js').Type,
-    aliases?: ReadonlyMap<string, import('./generated/ast.js').Type>,
-    namespaces?: ReadonlyMap<string, ReadonlyMap<string, import('./generated/ast.js').Type>>,
-    seen: Set<string> = new Set(),
 ): SqlType | null {
     let cur: import('./generated/ast.js').Type = t;
-    // Unwrap maybe/parens and expand module-local aliases; a hole cannot be a
-    // concrete SQL column type.
+    // Unwrap maybe/parens; a hole cannot be a concrete SQL column type.
     for (;;) {
         if (isTypeAtom(cur)) {
             if (cur.maybeType) { cur = cur.maybeType; continue; }
@@ -3671,32 +3870,16 @@ function scalarTypeOf(
             return null;
         }
         if (isTypeParen(cur)) { cur = cur.type; continue; }
-        if (isTypeVar(cur) && aliases?.has(cur.name)) {
-            if (seen.has(cur.name)) return null; // recursive alias
-            seen.add(cur.name);
-            cur = aliases.get(cur.name)!;
-            continue;
-        }
-        if (isQualifiedTypeName(cur)) {
-            const key = `${cur.receiver}.${cur.name}`;
-            const target = namespaces?.get(cur.receiver)?.get(cur.name);
-            if (!target || seen.has(key)) return null;
-            seen.add(key);
-            cur = target;
-            continue;
-        }
         break;
     }
     if (isTypeHole(cur)) return null;
     // `[T]` — an array column (element type is not tracked at the SQL layer).
     if (isListType(cur)) {
-        return scalarTypeOf(cur.type, aliases, namespaces, seen) === null ? null : 'array';
+        return scalarTypeOf(cur.type) === null ? null : 'array';
     }
     if (!isTypeVar(cur)) return null;
-    if (!cur.name.startsWith('@')) return null;
-    const name = cur.name.slice(1);
-    if (name === 'int' || name === 'float' || name === 'decimal' || name === 'string' || name === 'bool' || name === 'date' || name === 'timestamp') {
-        return name;
+    if (cur.name === 'int' || cur.name === 'float' || cur.name === 'decimal' || cur.name === 'string' || cur.name === 'bool' || cur.name === 'date' || cur.name === 'timestamp') {
+        return cur.name;
     }
     return null;
 }
@@ -3781,11 +3964,20 @@ export interface ProjectAnalysisOptions {
 export function createPreludeEnv(): Map<string, Value> {
     const env = new Map<string, Value>();
     for (const [name, factory] of Object.entries(BUILTINS)) {
-        env.set(coreBuiltinName(name), factory());
+        env.set(name, factory());
     }
     for (const operator of INTRINSIC_OPERATORS) {
         env.set(operatorIntrinsicName(operator), operatorIntrinsicValue(operator));
     }
+    // The built-in `list.*` namespace: a module value whose exports are the
+    // pure list combinators, so `list.map` / `list.fold` / `list.sum` resolve
+    // exactly like a qualified import `import "..." as list`.
+    const listExports = new Map<string, Value>();
+    for (const [publicName, builtinName] of Object.entries(LIST_NAMESPACE)) {
+        const factory = BUILTINS[builtinName as BuiltinName];
+        if (factory) listExports.set(publicName, factory());
+    }
+    env.set('list', { kind: 'module', name: 'list', exports: listExports });
     return env;
 }
 
@@ -3808,12 +4000,10 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
     // means every importer references the SAME target object). Filled as each
     // module is evaluated, so a module's imports are always ready.
     const exportsByModule = new Map<ProjectModule, Map<string, Value>>();
-    const typeExportsByModule = new Map<ProjectModule, Map<string, import('./generated/ast.js').Type>>();
 
     const allModules = prelude ? [prelude, ...modules] : [...modules];
     const root = modules[modules.length - 1];
     let standardValues = new Map<string, Value>();
-    let standardTypes = new Map<string, import('./generated/ast.js').Type>();
     let rootEnv: Map<string, Value> | undefined;
     let value: Value = ERROR;
     for (const module of allModules) {
@@ -3828,10 +4018,8 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         // Shared with inference (project-scope.ts): collision detection and
         // selective-import validation happen exactly once, with one wording.
         const moduleImports: readonly ResolvedImportEdge[] = importsByModule.get(module) ?? module.imports ?? [];
-        const imported = resolveImportScope(module, moduleImports, exportsByModule, typeExportsByModule);
-        const importedTypes = resolveTypeImportScope(module, moduleImports, typeExportsByModule);
-        moduleDiagnostics.push(...imported.diagnostics, ...importedTypes.diagnostics);
-        const typeNamespaces = new Map([...importedTypes.namespaces].map(([k, v]) => [k, new Map(v)]));
+        const imported = resolveImportScope(module, moduleImports, exportsByModule);
+        moduleDiagnostics.push(...imported.diagnostics);
         for (const [name, v] of imported.flat) env.set(name, v);
         for (const [alias, selected] of imported.namespaces) {
             env.set(alias, { kind: 'module', name: alias, exports: new Map(selected), ast: module.model.imports.find(imp => imp.alias === alias) });
@@ -3843,16 +4031,6 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         }
         const scope = new Map(imported.scope);
 
-        // --- local type aliases (after imports; declaration order matters) --
-        const typeAliases = new Map(standardTypes);
-        for (const [name, type] of importedTypes.flat) typeAliases.set(name, type);
-        for (const alias of module.model.types) {
-            if (importedTypes.flat.has(alias.name)) {
-                moduleDiagnostics.push({ node: alias, message: `type alias '${alias.name}' conflicts with an imported type alias` });
-                continue;
-            }
-            typeAliases.set(alias.name, alias.type);
-        }
         // --- local bindings (Haskell-style: order-independent) ------------
         // Binding resolution is TOP-DOWN: every binding may reference any
         // other binding in the module, so definitions can appear in any
@@ -3877,10 +4055,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
                 moduleDiagnostics.push({ node: binding, message: conflictMessage(binding.name, scope.get(binding.name)!, 'a local binding') });
             }
             scope.set(binding.name, `local binding '${binding.name}'`);
-            const result = checkBinding(binding, env, moduleBindings, seen, {
-                typeAliases,
-                typeNamespaces,
-            });
+            const result = checkBinding(binding, env, moduleBindings, seen);
             moduleDiagnostics.push(...result.diagnostics);
             env = result.env;
             seen = result.seen;
@@ -3927,12 +4102,8 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
             }
         }
         exportsByModule.set(module, exports);
-        typeExportsByModule.set(module, new Map(
-            module.model.types.filter(a => a.export).map(a => [a.name, a.type]),
-        ));
         if (module === prelude) {
             standardValues = exports;
-            standardTypes = new Map(module.model.types.filter(a => a.export).map(a => [a.name, a.type]));
         }
         if (module === root) rootEnv = env;
         diagnostics.push(...moduleDiagnostics);
@@ -4007,7 +4178,7 @@ function stampQueryTypeAnnotation(
         || !v.query.steps.every(step => step.kind !== 'join')) {
         return v;
     }
-    const qt = queryTypeOf(typeAst, ctx.typeAliases, ctx.typeNamespaces);
+    const qt = queryTypeOf(typeAst);
     if (!qt) return v;
     const schema = schemaFromQueryType(qt, at, ctx);
     if (!schema) return v;
@@ -4034,7 +4205,7 @@ function stampQueryTypeAnnotation(
  */
 const TYPE_NODE_TYPES = new Set([
     'Type', 'FunType', 'TypeAtom', 'BaseType', 'RecordType', 'QueryType',
-    'RecordField', 'ListType', 'TypeHole', 'TypeVar', 'QualifiedTypeName', 'TypeParen',
+    'RecordField', 'ListType', 'TypeHole', 'TypeVar', 'TypeParen',
 ]);
 
 function freeModuleRefs(node: AstNode, moduleNames: ReadonlySet<string>, shadow: Set<string>, out: Set<string>): void {

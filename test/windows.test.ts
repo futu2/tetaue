@@ -58,7 +58,7 @@ describe('window functions', () => {
             q = users & map (u => {
                 ws = over (sum u.salary) { partition = [u.dept] },
                 wa = over (avg u.salary) { partition = [u.dept], order = [desc u.salary] },
-                wl = over (list u.name) { partition = [u.dept] },
+                wl = over (array u.name) { partition = [u.dept] },
             })
         `, 'trino');
         expect(sql).toContain('SUM(salary) OVER (PARTITION BY dept) AS ws');

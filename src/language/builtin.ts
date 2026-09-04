@@ -40,7 +40,7 @@
  ******************************************************************************/
 import {
     type PrimName, type Scheme, type Type, type TypeClass, type TypeUniverse, type VarKind,
-    aggOf, fun, groupOf, listOf, maybeOf, prim, queryOf, rowOf, truthType, windowOf,
+    fun, listOf, maybeOf, modeOf, prim, queryOf, rowOf, truthType,
 } from './types.js';
 
 export type BuiltinCategory =
@@ -56,6 +56,7 @@ export type BuiltinCategory =
     | 'date'            // current_date, extract, year, date_add, ...
     | 'math'            // ceil, floor, sqrt, pow, mod
     | 'string'          // concat, substring, lpad, rpad, ...
+    | 'list'            // pure in-memory list combinators (list.* namespace)
     | 'window'          // over, row_number, rank, lag, lead, ...
     | 'cast'            // cast
     | 'constant';       // current_timestamp
@@ -69,14 +70,9 @@ export interface BuiltinSpec {
     scheme: (u: TypeUniverse) => Scheme;
 }
 
-/** Spelling used for a primitive in the language core namespace. */
-export const coreBuiltinName = (name: string): string => `@${name}`;
-
-/** Primitive scalar types supplied by the core and re-exported by the prelude. */
+/** Primitive scalar types supplied by the core. */
 export const CORE_TYPE_NAMES = ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp'] as const;
 export type CoreTypeName = (typeof CORE_TYPE_NAMES)[number];
-
-export const coreTypeName = (name: CoreTypeName): string => `@${name}`;
 
 /** Build a polymorphic scheme: named free variables, generalized.
  *  `constraints` attach type classes to the variables by position
@@ -152,19 +148,19 @@ export const BUILTIN_SPECS = [
     { name: 'desc', category: 'order', doc: 'a descending ORDER BY item', scheme: u => poly(u, [tVar], t => fun(t, { kind: 'order' })) },
 
     // --- aggregates & grouping (aggregate/group MODES) -------------------
-    { name: 'count_distinct', category: 'aggregate', doc: 'COUNT(DISTINCT x) — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, aggOf(p('int')))) },
-    { name: 'count_where', category: 'aggregate', doc: 'count_where cond x — filtered COUNT', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(p('int'))))) },
-    { name: 'sum_where', category: 'aggregate', doc: 'sum_where cond x — filtered SUM', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(maybeOf(t))))) },
-    { name: 'avg_where', category: 'aggregate', doc: 'avg_where cond x — filtered AVG', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(maybeOf(p('float')))))) },
-    { name: 'min_where', category: 'aggregate', doc: 'min_where cond x — filtered MIN', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(maybeOf(t))))) },
-    { name: 'max_where', category: 'aggregate', doc: 'max_where cond x — filtered MAX', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, aggOf(maybeOf(t))))) },
-    { name: 'count', category: 'aggregate', doc: 'COUNT — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, aggOf(p('int')))) },
-    { name: 'sum', category: 'aggregate', doc: 'SUM — aggregate mode (maybe result: empty/all-null input is NULL)', scheme: u => poly(u, [tVar], t => fun(t, aggOf(maybeOf(t)))) },
-    { name: 'avg', category: 'aggregate', doc: 'AVG — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, aggOf(maybeOf(p('float'))))) },
-    { name: 'min', category: 'aggregate', doc: 'MIN — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, aggOf(maybeOf(t)))) },
-    { name: 'max', category: 'aggregate', doc: 'MAX — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, aggOf(maybeOf(t)))) },
-    { name: 'list', category: 'aggregate', doc: 'collect values into a list — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, aggOf(listOf(t)))) },
-    { name: 'group', category: 'group', doc: 'a GROUP BY key — group mode', scheme: u => poly(u, [tVar], t => fun(t, groupOf(t))) },
+    { name: 'count_distinct', category: 'aggregate', doc: 'COUNT(DISTINCT x) — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, modeOf('agg', p('int')))) },
+    { name: 'count_where', category: 'aggregate', doc: 'count_where cond x — filtered COUNT', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, modeOf('agg', p('int'))))) },
+    { name: 'sum_where', category: 'aggregate', doc: 'sum_where cond x — filtered SUM', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, modeOf('agg', maybeOf(t))))) },
+    { name: 'avg_where', category: 'aggregate', doc: 'avg_where cond x — filtered AVG', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, modeOf('agg', maybeOf(p('float')))))) },
+    { name: 'min_where', category: 'aggregate', doc: 'min_where cond x — filtered MIN', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, modeOf('agg', maybeOf(t))))) },
+    { name: 'max_where', category: 'aggregate', doc: 'max_where cond x — filtered MAX', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, modeOf('agg', maybeOf(t))))) },
+    { name: 'count', category: 'aggregate', doc: 'COUNT — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, modeOf('agg', p('int')))) },
+    { name: 'sum', category: 'aggregate', doc: 'SUM — aggregate mode (maybe result: empty/all-null input is NULL)', scheme: u => poly(u, [tVar], t => fun(t, modeOf('agg', maybeOf(t)))) },
+    { name: 'avg', category: 'aggregate', doc: 'AVG — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, modeOf('agg', maybeOf(p('float'))))) },
+    { name: 'min', category: 'aggregate', doc: 'MIN — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, modeOf('agg', maybeOf(t)))) },
+    { name: 'max', category: 'aggregate', doc: 'MAX — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, modeOf('agg', maybeOf(t)))) },
+    { name: 'array', category: 'aggregate', doc: 'collect values into a list/array — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, modeOf('agg', listOf(t)))) },
+    { name: 'group', category: 'group', doc: 'a GROUP BY key — group mode', scheme: u => poly(u, [tVar], t => fun(t, modeOf('group', t))) },
 
     // --- records ---------------------------------------------------------
     { name: 'merge', category: 'record', doc: 'record union — the right record wins on overlap', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, u.fresh('row')))) },
@@ -222,6 +218,28 @@ export const BUILTIN_SPECS = [
     { name: 'div', category: 'math', doc: 'div a b — integral division (Haskell base)', scheme: () => mono(fun(p('int'), fun(p('int'), p('int')))) },
     { name: 'mod', category: 'math', doc: 'mod a b — integral modulo (Haskell base)', scheme: () => mono(fun(p('int'), fun(p('int'), p('int')))) },
 
+    // --- pure list combinators (the list.* namespace) --------------------
+    // Pure, in-memory operations over list values — the Haskell base List
+    // vocabulary, kept out of the unqualified (relational/SQL) namespace so
+    // the two never collide. `elem`/`map`/`filter` here are the list
+    // functions; their SQL counterparts are the query steps.
+    { name: 'list_map', category: 'list', doc: 'list.map f xs — apply f to every element (a -> b) -> [a] -> [b]', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(fun(a, b), fun(listOf(a), listOf(b)))) },
+    { name: 'list_filter', category: 'list', doc: 'list.filter p xs — keep elements matching a predicate (a -> Bool) -> [a] -> [a]', scheme: u => poly(u, [aVar], a => fun(fun(a, p('bool')), fun(listOf(a), listOf(a)))) },
+    { name: 'list_fold', category: 'list', doc: 'list.fold f z xs — left fold (b -> a -> b) -> b -> [a] -> b', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(fun(b, fun(a, b)), fun(b, fun(listOf(a), b)))) },
+    { name: 'list_foldr', category: 'list', doc: 'list.foldr f z xs — right fold (a -> b -> b) -> b -> [a] -> b', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(fun(a, fun(b, b)), fun(b, fun(listOf(a), b)))) },
+    { name: 'list_sum', category: 'list', doc: 'list.sum xs — fold (+) over numeric elements', scheme: u => poly(u, [aVar], a => fun(listOf(a), a), { 0: 'Num' }) },
+    { name: 'list_product', category: 'list', doc: 'list.product xs — fold (*) over numeric elements', scheme: u => poly(u, [aVar], a => fun(listOf(a), a), { 0: 'Num' }) },
+    { name: 'list_length', category: 'list', doc: 'list.length xs — element count (empty = 0)', scheme: u => poly(u, [aVar], a => fun(listOf(a), p('int'))) },
+    { name: 'list_reverse', category: 'list', doc: 'list.reverse xs — elements in reverse order', scheme: u => poly(u, [aVar], a => fun(listOf(a), listOf(a))) },
+    { name: 'list_concat', category: 'list', doc: 'list.concat xss — flatten a list of lists', scheme: u => poly(u, [aVar], a => fun(listOf(listOf(a)), listOf(a))) },
+    { name: 'list_append', category: 'list', doc: 'list.append xs ys — join two lists (++) [a] -> [a] -> [a]', scheme: u => poly(u, [aVar], a => fun(listOf(a), fun(listOf(a), listOf(a)))) },
+    { name: 'list_take', category: 'list', doc: 'list.take n xs — first n elements', scheme: u => poly(u, [aVar], a => fun(p('int'), fun(listOf(a), listOf(a)))) },
+    { name: 'list_drop', category: 'list', doc: 'list.drop n xs — all but the first n elements', scheme: u => poly(u, [aVar], a => fun(p('int'), fun(listOf(a), listOf(a)))) },
+    { name: 'list_head', category: 'list', doc: 'list.head xs — first element (empty is an error)', scheme: u => poly(u, [aVar], a => fun(listOf(a), a)) },
+    { name: 'list_last', category: 'list', doc: 'list.last xs — last element (empty is an error)', scheme: u => poly(u, [aVar], a => fun(listOf(a), a)) },
+    { name: 'list_null', category: 'list', doc: 'list.isEmpty xs — true iff the list is empty', scheme: u => poly(u, [aVar], a => fun(listOf(a), p('bool'))) },
+    { name: 'list_elem', category: 'list', doc: 'list.elem x xs — whether x appears in xs', scheme: u => poly(u, [aVar], a => fun(a, fun(listOf(a), p('bool')))) },
+
     // --- strings ---------------------------------------------------------
     { name: 'trim', category: 'string', doc: 'TRIM', scheme: () => mono(fun(p('string'), p('string'))) },
     { name: 'reverse', category: 'string', doc: 'REVERSE (dialect fallback where needed)', scheme: () => mono(fun(p('string'), p('string'))) },
@@ -264,15 +282,15 @@ export const BUILTIN_SPECS = [
     { name: 'round', category: 'math', doc: 'round x scale — scale is required (0 rounds to integer)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('int'), t))) },
     { name: 'substring', category: 'string', doc: 'substring s start (just length) — length optional (omitted = to the end)', scheme: () => mono(fun(p('string'), fun(p('int'), fun(maybeOf(p('int')), p('string'))))) },
     { name: 'lpad', category: 'string', doc: 'lpad s n pad — pad is required (SQL defaults to a space)', scheme: () => mono(fun(p('string'), fun(p('int'), fun(p('string'), p('string'))))) },
-    { name: 'lag', category: 'window', doc: 'lag x offset (just default) — offset required, default optional (NULL)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('int'), fun(maybeOf(t), windowOf(t))))) },
+    { name: 'lag', category: 'window', doc: 'lag x offset (just default) — offset required, default optional (NULL)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('int'), fun(maybeOf(t), modeOf('window', t))))) },
 
     // --- window functions ------------------------------------------------
     { name: 'over', category: 'window', doc: 'over (fn) { partition = [...], order = [...] }', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, a))) },
-    { name: 'row_number', category: 'window', doc: 'ROW_NUMBER — window-only', scheme: () => mono(windowOf(p('int'))) },
-    { name: 'rank', category: 'window', doc: 'RANK — window-only', scheme: () => mono(windowOf(p('int'))) },
-    { name: 'dense_rank', category: 'window', doc: 'DENSE_RANK — window-only', scheme: () => mono(windowOf(p('int'))) },
-    { name: 'percent_rank', category: 'window', doc: 'PERCENT_RANK — window-only', scheme: () => mono(windowOf(p('int'))) },
-    { name: 'ntile', category: 'window', doc: 'NTILE — window-only', scheme: () => mono(fun(p('int'), windowOf(p('int')))) },
+    { name: 'row_number', category: 'window', doc: 'ROW_NUMBER — window-only', scheme: () => mono(modeOf('window', p('int'))) },
+    { name: 'rank', category: 'window', doc: 'RANK — window-only', scheme: () => mono(modeOf('window', p('int'))) },
+    { name: 'dense_rank', category: 'window', doc: 'DENSE_RANK — window-only', scheme: () => mono(modeOf('window', p('int'))) },
+    { name: 'percent_rank', category: 'window', doc: 'PERCENT_RANK — window-only', scheme: () => mono(modeOf('window', p('int'))) },
+    { name: 'ntile', category: 'window', doc: 'NTILE — window-only', scheme: () => mono(fun(p('int'), modeOf('window', p('int')))) },
 
     // --- monoid identity ---------------------------------------------------
     // Type-directed: inference resolves the instance at the use site (string,

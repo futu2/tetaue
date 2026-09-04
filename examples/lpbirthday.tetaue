@@ -42,7 +42,7 @@ table "ecs.dcm_ecs_c_ecis_m_tb1150_sf_f"
   & fold {
     c_cino = group this.c_cino,
     p_cino = group this.p_cino,
-    relation_names = list this.relation_name,
+    relation_names = array this.relation_name,
   }
 
 customerBirthday =

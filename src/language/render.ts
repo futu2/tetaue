@@ -104,7 +104,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         functions: {
             upper: 'UPPER', lower: 'LOWER', length: 'LENGTH', coalesce: 'COALESCE',
             abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            list: 'JSON_GROUP_ARRAY', // sqlite has no array type — a JSON array is the closest list
+            array: 'JSON_GROUP_ARRAY', // sqlite has no array type — a JSON array is the closest list
             ceil: 'CEILING', // sqlite has CEILING, not CEIL
         },
     },
@@ -116,7 +116,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         functions: {
             upper: 'UPPER', lower: 'LOWER', length: 'LENGTH', coalesce: 'COALESCE',
             abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            list: 'ARRAY_AGG',
+            array: 'ARRAY_AGG',
         },
     },
     mysql: {
@@ -131,7 +131,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         functions: {
             upper: 'UPPER', lower: 'LOWER', length: 'LENGTH', coalesce: 'COALESCE',
             abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            list: 'JSON_ARRAYAGG',
+            array: 'JSON_ARRAYAGG',
         },
     },
     trino: {
@@ -143,7 +143,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         functions: {
             upper: 'UPPER', lower: 'LOWER', length: 'LENGTH', coalesce: 'COALESCE',
             abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            list: 'ARRAY_AGG',
+            array: 'ARRAY_AGG',
         },
     },
     hive: {
@@ -159,7 +159,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         functions: {
             upper: 'UPPER', lower: 'LOWER', length: 'LENGTH', coalesce: 'COALESCE',
             abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            list: 'COLLECT_LIST',
+            array: 'COLLECT_LIST',
         },
     },
 };

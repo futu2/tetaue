@@ -26,13 +26,14 @@ import { isAccessExpression, isApplication, isIdentifier } from '../generated/as
 import type { Model } from '../generated/ast.js';
 import type { ProjectModule } from '../imports.js';
 import { effectiveExportNames } from '../imports.js';
+import { BUILTIN_NAMES } from '../builtin.js';
 import { standardPreludeNames } from '../prelude.js';
 
 /** Synthetic property inserted after the dot so the access parses. */
 const DUMMY = '_tetaue_field';
 
 const STEP_NAMES = new Set(['filter', 'map', 'sort', 'take', 'distinct', 'fold', 'joinInner', 'joinLeft', 'joinRight', 'joinFull', 'join_lateral', 'select']);
-const AGG_NAMES = new Set(['count', 'sum', 'avg', 'min', 'max', 'list', 'group']);
+const AGG_NAMES = new Set(['count', 'sum', 'avg', 'min', 'max', 'array', 'group']);
 
 function builtinDetail(name: string): string | undefined {
     if (STEP_NAMES.has(name)) return 'query step';
@@ -49,7 +50,7 @@ export class TetaueCompletionProvider extends DefaultCompletionProvider {
     constructor(services: TetaueServices) {
         super(services);
         this.services = services;
-        this.standardNames = [...new Set(standardPreludeNames(services))];
+        this.standardNames = [...new Set([...BUILTIN_NAMES, ...standardPreludeNames(services)])];
     }
 
     override async getCompletion(

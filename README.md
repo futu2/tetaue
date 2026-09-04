@@ -225,14 +225,13 @@ is exactly as valid as the reverse order. Recursive top-level bindings
 ### Core and standard prelude
 
 The language is checked and evaluated by one shared pass (`checkProject`). Its
-TypeScript core is limited to SQL-aware primitives, all reserved under `@`
-(`@filter`, `@table`, `@int`, ...). Reusable functional helpers and public
-aliases (`filter = @filter`, `type int = @int`) live in
+TypeScript core is limited to SQL-aware primitives and scalar types, exposed
+as native builtin names (`filter`, `table`, `int`, ...). Reusable functional
+helpers (`id`, `const`, `compose`, `flip`, `pipe`, the derived Maybe
+predicates, and the `_op_` bindings) live in
 [`prelude.tetaue`](prelude.tetaue) and are processed by the
-same parser, inference engine, and interpreter as application code. The
-standard helpers include the `_op_` bindings, `id`, `const`, `compose`, `flip`,
-`pipe`, and the derived Maybe predicates; local bindings and imports may shadow
-them normally. Infix parsing
+same parser, inference engine, and interpreter as application code; local
+bindings and imports may shadow them normally. Infix parsing
 and precedence stay in the grammar, while an expression such as `1 + 2`
 resolves the scoped `_+_` function defined by the prelude. See
 [`docs/design/core.md`](docs/design/core.md) for the boundary and extension
@@ -307,8 +306,7 @@ report: query {
   `import "package"` (resolved to `package/index.tetaue`) expose both.
 - Each module is its own scope: the prelude, its own imports, its own
   bindings — no module can see a sibling module's bindings or imports.
-  Imports, re-exports, `type` aliases and bindings may appear in any order
-  in a module.
+  Imports, re-exports, and bindings may appear in any order in a module.
 - Paths resolve **relative to the importing file**; nested imports work;
   cycles, missing files, and name collisions are reported as errors.
   Collisions are never silent: two flat imports exporting the same name, an
@@ -495,20 +493,16 @@ SQL three-valued predicates are explicit: `is_true x` and `is_false x` test
 the TRUE/FALSE branches, while `is_unknown x` tests SQL `NULL`. They accept
 both `bool` and `(maybe bool)` and always return a non-null `bool`.
 
-Type aliases are declarations before bindings; prefix with `export` to
-share them with importing modules (flat imports and selective renaming):
+Types are **builtin-only**: the scalar primitives (`int`, `float`, `decimal`,
+`string`, `bool`, `date`, `timestamp`) plus the anonymous constructors —
+records `{ ... }`, queries `query { ... }`, lists `[T]`, `(maybe T)`, and
+function arrows. There is no user-declared type and no type alias, so a
+schema is written inline on the binding:
 
 ```
-type UserRow = query { id: int, name: string }
-type AdultRow = { age: int | r }
-users: UserRow = table "users"
-adult: AdultRow -> bool = u => u.age >= 18
+users: query { id: int, name: string, age: int } = table "users"
+adult: { age: int | r } -> bool = u => u.age >= 18
 ```
-
-Aliases are expanded in annotations and schemas; recursive aliases are
-compile errors. `import "schema.tetaue" (UserRow as Row)` imports an
-exported alias under a local name. Namespaced imports expose qualified
-types as `t.UserRow`.
 
 ### Types and annotations
 
@@ -544,7 +538,7 @@ type errors, so they never disagree.
 The type system encodes the SQL phases a query step lives in, so mode mistakes
 are static errors, not runtime surprises:
 
-- **Aggregates** (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `list`) have aggregate
+- **Aggregates** (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `array`) have aggregate
   mode (`sum o.total : agg float`) and `group` has group mode
   (`group o.user_id : group int`). Every `fold` entry must use one of those
   modes, and the projection may contain groups, aggregates, or both. A plain
@@ -630,7 +624,7 @@ coalesce [u.nickname, u.email, just "?"]  # variadic list form
 abs u.balance                  # ABS
 count o.id  sum o.total  avg o.total  min o.x  max o.x   # aggregates (in fold)
 sum_where cond o.total  count_where cond o.id              # filtered aggregates
-list o.tag                      # collect values into a list: ARRAY_AGG (trino/pg), COLLECT_LIST (hive), JSON_ARRAYAGG (mysql), JSON_GROUP_ARRAY (sqlite)
+array o.tag                      # collect values into a list: ARRAY_AGG (trino/pg), COLLECT_LIST (hive), JSON_ARRAYAGG (mysql), JSON_GROUP_ARRAY (sqlite)
 current_date  current_timestamp   # CURRENT_DATE / CURRENT_TIMESTAMP (bare keywords)
 year u.created_at  month u.created_at  day u.created_at  day_of_week u.created_at
 hour u.created_at  minute u.created_at  second u.created_at

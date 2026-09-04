@@ -190,10 +190,10 @@ describe('aggregation', () => {
         expect(sql).toContain('SUM(total) AS total');
     });
 
-    test('list aggregate renders per dialect', () => {
+    test('array aggregate renders per dialect', () => {
         const src = `
             orders: query { user_id: int, tag: string } = table "orders"
-            q = orders & fold (o => { user_id = group o.user_id, tags = list o.tag })
+            q = orders & fold (o => { user_id = group o.user_id, tags = array o.tag })
         `;
         expect(render(src, 'trino')).toContain('ARRAY_AGG(tag) AS tags');
         expect(render(src, 'postgresql')).toContain('ARRAY_AGG(tag) AS tags');
@@ -203,10 +203,10 @@ describe('aggregation', () => {
         expect(render(src, 'trino')).toContain('GROUP BY user_id');
     });
 
-    test('a list aggregate result can be annotated [T]', () => {
+    test('an array aggregate result can be annotated [T]', () => {
         const src = `
             orders: query { user_id: int, tag: string } = table "orders"
-            q: query { user_id: int, tags: [string] } = orders & fold (o => { user_id = group o.user_id, tags = list o.tag })
+            q: query { user_id: int, tags: [string] } = orders & fold (o => { user_id = group o.user_id, tags = array o.tag })
         `;
         expect(allErrors(src)).toEqual([]);
         expect(render(src, 'trino')).toContain('ARRAY_AGG(tag) AS tags');

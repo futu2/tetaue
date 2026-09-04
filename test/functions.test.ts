@@ -359,8 +359,8 @@ describe('validation', () => {
         expect(errors(`${USERS}\nq = users & fold (u => { x = ceil (count u.id) })`).join('\n')).toContain('ceil cannot contain aggregates');
     });
 
-    test('list is an aggregate: rejected outside fold', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { tags = list u.name })`).join('\n')).toContain("projection entry 'tags' cannot contain aggregates");
+    test('array is an aggregate: rejected outside fold', () => {
+        expect(errors(`${USERS}\nq = users & map (u => { tags = array u.name })`).join('\n')).toContain("projection entry 'tags' cannot contain aggregates");
     });
 });
 

@@ -21,25 +21,26 @@ import {
     isBooleanLiteral, isCaseExpression, isFunType, isIdentifier, isLambda,
     isLetExpression, isListLiteral, isListType,
     isMapLiteral, isNullLiteral, isOperatorSection,
-    isNumberLiteral, isQualifiedTypeName, isQueryType, isRecordType, isStringLiteral, isTypeAtom, isTypeHole, isTypeParen,
+    isNumberLiteral, isQueryType, isRecordType, isStringLiteral, isTypeAtom, isTypeHole, isTypeParen,
     isTypeVar, isUnaryMinus,
     type Binding, type CaseExpression, type Expr, type Lambda, type MapEntry, type Model,
 } from './generated/ast.js';
 import type { Type as LangiumType } from './generated/ast.js';
 import {
     ConstraintError, TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
-    builtinOf, fun, isTypeClassInstance, listOf, maybeOf, nullExtendedMaybeOf, prim, queryOf, rowOf, truthType,
+    builtinOf, fun, isTypeClassInstance, listOf, maybeOf, modeOf, modePayload, nullExtendedMaybeOf, prim, queryOf, rowOf, truthType,
     type ScalarTypeClass,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
+import { LIST_NAMESPACE } from './list-namespace.js';
 import { moduleOf } from './imports.js';
-import { resolveImportScope, resolveTypeImportScope } from './project-scope.js';
+import { resolveImportScope } from './project-scope.js';
 import { checkBinding, missingBindingExpressionMessage, parseStringLiteral, recursiveBindingMessage, topoOrderBindings } from './interpreter.js';
 import type { Diagnostic, Value } from './interpreter.js';
 import { implicitParamName, labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
-import { CAST_TYPES, LIST_ARITY, coreBuiltinName, CORE_TYPE_NAMES, type CoreTypeName } from './builtin.js';
+import { CAST_TYPES, LIST_ARITY, CORE_TYPE_NAMES, type CoreTypeName } from './builtin.js';
 import {
     INTRINSIC_OPERATORS, isBinaryOperator, isIntrinsicOperator, operatorIntrinsicName,
     sectionName, sectionSpelling, type BinaryOperator, type IntrinsicOperator,
@@ -93,9 +94,7 @@ type PrimName = CoreTypeName;
 const SYNTHETIC_FIELD_PREFIX = '_tetaue_field';
 
 function primitiveName(name: string): PrimName | null {
-    if (!name.startsWith('@')) return null;
-    const spelling = name.slice(1);
-    return (PRIM_NAMES as readonly string[]).includes(spelling) ? spelling as PrimName : null;
+    return (PRIM_NAMES as readonly string[]).includes(name) ? name as PrimName : null;
 }
 
 /** A literal is `float` iff its source text contains '.', so `100.0` is float. */
@@ -154,18 +153,18 @@ export class Inferencer {
      */
     preludeEnv = new Map<string, Scheme>();
     /**
+     * The prelude's built-in namespaces (currently just `list.*`), seeded in
+     * `prelude()` and cloned into every module as the starting `modules` map
+     * (so prelude namespaces are always in scope, like the flat prelude).
+     */
+    preludeNamespaces = new Map<string, Map<string, Scheme>>();
+    /**
      * Namespace aliases of the CURRENT module (`import "x.tetaue" as t`):
      * alias -> the target module's exported binding schemes. Qualified access
      * `t.binding` instantiates the exported scheme (row polymorphism is
      * preserved through a namespace). Reset per module.
      */
     modules = new Map<string, Map<string, Scheme>>();
-    /** Module-local type aliases (name -> type AST), reset per module. */
-    private typeAliases = new Map<string, LangiumType>();
-    /** Namespace aliases for qualified type names (`t.UserRow`). */
-    private typeNamespaces = new Map<string, Map<string, LangiumType>>();
-    /** Alias names currently being expanded (cycle detection). */
-    private activeTypeAliases = new Set<string>();
     diagnostics: InferDiagnostic[] = [];
 
     /** Pull and clear every pending inference diagnostic. */
@@ -280,13 +279,13 @@ export class Inferencer {
         for (const spec of BUILTIN_SPECS) {
             const scheme = spec.scheme(this.u);
             const tagged = { ...scheme, type: builtinOf(spec.name, scheme.type) };
-            this.env.set(coreBuiltinName(spec.name), tagged);
+            this.env.set(spec.name, tagged);
         }
         for (const [name, target] of Object.entries(BUILTIN_ALIASES)) {
-            const scheme = this.env.get(coreBuiltinName(target));
+            const scheme = this.env.get(target);
             if (scheme) {
                 const tagged = { ...scheme, type: builtinOf(name, this.u.peel(scheme.type)) };
-                this.env.set(coreBuiltinName(name), tagged);
+                this.env.set(name, tagged);
             }
         }
         for (const operator of INTRINSIC_OPERATORS) {
@@ -299,6 +298,17 @@ export class Inferencer {
         }
         // The primitive environment is cloned into every module (see beginModule).
         this.preludeEnv = new Map(this.env);
+        // The built-in `list.*` namespace: a map of the pure list combinators'
+        // schemes, so `list.map` / `list.fold` / `list.sum` resolve like a
+        // qualified import (see beginModule, which starts each module from
+        // the prelude namespaces).
+        this.preludeNamespaces = new Map<string, Map<string, Scheme>>();
+        const listSchemes = new Map<string, Scheme>();
+        for (const [publicName, builtinName] of Object.entries(LIST_NAMESPACE)) {
+            const scheme = this.env.get(builtinName);
+            if (scheme) listSchemes.set(publicName, scheme);
+        }
+        this.preludeNamespaces.set('list', listSchemes);
     }
 
     /** Static shape of a hidden SQL-aware operator primitive. */
@@ -361,24 +371,16 @@ export class Inferencer {
     ): void {
         this.prelude();
         const exportsByModule = new Map<ProjectModule, Map<string, Scheme>>();
-        const typeExportsByModule = new Map<ProjectModule, Map<string, LangiumType>>();
         const allModules = prelude ? [prelude, ...modules] : [...modules];
-        let standardTypes = new Map<string, LangiumType>();
         for (const module of allModules) {
             const exported = this.inferModule(
                 module,
                 importsByModule.get(module) ?? module.imports ?? [],
                 exportsByModule,
-                typeExportsByModule,
-                standardTypes,
                 reexportsByModule.get(module) ?? module.exports ?? [],
             );
             exportsByModule.set(module, exported);
-            typeExportsByModule.set(module, new Map(
-                module.model.types.filter(a => a.export).map(a => [a.name, a.type]),
-            ));
             if (module === prelude) {
-                standardTypes = new Map(module.model.types.filter(a => a.export).map(a => [a.name, a.type]));
                 this.preludeEnv = new Map([...this.preludeEnv, ...exported]);
             }
         }
@@ -387,9 +389,9 @@ export class Inferencer {
 
     /**
      * Prepare this inferencer for one module without walking its bindings:
-     * clone the prelude, resolve import scopes, install flat and namespaced
-     * schemes, and expand module-local type aliases. Returns the shared scope
-     * map used by the per-binding typed pass in `checker.ts`.
+     * clone the prelude and resolve import scopes (flat and namespaced
+     * schemes). Returns the shared scope map used by the per-binding typed
+     * pass in `checker.ts`.
      *
      * `inferModule` remains a convenience wrapper around
      * `beginModule` + `inferBinding` for standalone `types`/test callers.
@@ -398,46 +400,30 @@ export class Inferencer {
         module: ProjectModule,
         imports: readonly ResolvedImportEdge[],
         exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, Scheme>>,
-        typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, LangiumType>>,
-        standardTypes: ReadonlyMap<string, LangiumType> = new Map(),
     ): { scope: ReadonlyMap<string, string> } {
         this.env = new Map(this.preludeEnv);
-        this.modules = new Map<string, Map<string, Scheme>>();
-        const imported = resolveImportScope(module, imports, exportsByModule, typeExportsByModule);
-        const importedTypes = resolveTypeImportScope(module, imports, typeExportsByModule);
-        for (const d of importedTypes.diagnostics) this.diag(d.node, d.message);
+        this.modules = new Map([...this.preludeNamespaces].map(([alias, ns]) => [alias, new Map(ns)]));
+        const imported = resolveImportScope(module, imports, exportsByModule);
         for (const d of imported.diagnostics) this.diag(d.node, d.message);
         for (const [name, scheme] of imported.flat) this.env.set(name, scheme);
         for (const [alias, selected] of imported.namespaces) this.modules.set(alias, new Map(selected));
         const scope = new Map(imported.scope);
-        this.typeAliases = new Map(standardTypes);
-        for (const [name, type] of importedTypes.flat) this.typeAliases.set(name, type);
-        this.typeNamespaces = new Map([...importedTypes.namespaces].map(([k, v]) => [k, new Map(v)]));
-        for (const alias of module.model.types) {
-            if (importedTypes.flat.has(alias.name)) {
-                this.diag(alias, `type alias '${alias.name}' conflicts with an imported type alias`);
-                continue;
-            }
-            this.typeAliases.set(alias.name, alias.type);
-        }
         return { scope };
     }
 
     /**
      * Infer one module in an already-prepared environment. Reads import
-     * scopes from `exportsByModule` / `typeExportsByModule` (previous
-     * modules) and returns the module's exported binding schemes. Callers
-     * update the project export maps after the module is processed.
+     * scopes from `exportsByModule` (previous modules) and returns the
+     * module's exported binding schemes. Callers update the project export
+     * map after the module is processed.
      */
     inferModule(
         module: ProjectModule,
         imports: readonly ResolvedImportEdge[],
         exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, Scheme>>,
-        typeExportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, LangiumType>>,
-        standardTypes: ReadonlyMap<string, LangiumType> = new Map(),
         reexports: readonly ResolvedExportEdge[] = [],
     ): Map<string, Scheme> {
-        const { scope } = this.beginModule(module, imports, exportsByModule, typeExportsByModule, standardTypes);
+        const { scope } = this.beginModule(module, imports, exportsByModule);
         const exported = new Map<string, Scheme>();
         // Top-down resolution mirrors the interpreter: bindings are inferred
         // in dependency order (source order as tiebreak) so a definition may
@@ -507,7 +493,7 @@ export class Inferencer {
             // narrows downstream uses.
             const v = b.value as Expr;
             const isBareTable = isApplication(v) && isIdentifier(v.func)
-                && (v.func.name === 'table' || v.func.name === coreBuiltinName('table'))
+                && v.func.name === 'table'
                 && v.arguments.length === 1
                 && this.isPreludeBuiltin(v.func.name, this.env);
             let ok = true;
@@ -603,8 +589,6 @@ export class Inferencer {
         scope.set(b.name, `local binding '${b.name}'`);
 
         const result = checkBinding(b, valueEnv, moduleBindings, seen, {
-            typeAliases: this.typeAliases,
-            typeNamespaces: this.typeNamespaces,
             ...(nodeValues ? { nodeValues } : {}),
         });
         diagnostics.push(...result.diagnostics);
@@ -651,7 +635,7 @@ export class Inferencer {
                 const ann = this.translateType(e.type);
                 const value = e.value as Expr;
                 const isBareTable = isApplication(value) && isIdentifier(value.func)
-                    && (value.func.name === 'table' || value.func.name === coreBuiltinName('table'))
+                    && value.func.name === 'table'
                     && value.arguments.length === 1
                     && this.isPreludeBuiltin(value.func.name, env);
                 const sk = isBareTable ? null : this.u.skolemize(inferred);
@@ -987,10 +971,9 @@ export class Inferencer {
             this.diag(node, `'${op}' requires non-null numeric operands — use from_maybe or coalesce to unwrap, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
             return true;
         }
-        // Aggregate/group/window modes are not plain scalars and must not be
+        // Pipeline modes are not plain scalars and must not be
         // silently absorbed by a numeric literal variable (`row_number + 1`).
-        if (ka === 'agg' || ka === 'group' || ka === 'window'
-            || kb === 'agg' || kb === 'group' || kb === 'window') {
+        if (modePayload(this.u.peel(lt)) !== null || modePayload(this.u.peel(rt)) !== null) {
             this.diag(node, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
             return true;
         }
@@ -1009,9 +992,8 @@ export class Inferencer {
             // Aggregates/window values cannot be compared as plain scalars; a
             // polymorphic literal would otherwise absorb the mode (`row_number
             // == 1`, `sum t == 1`). Nullable `maybe` is handled below (== null).
-            const cmpKind = (t: Type): string => this.u.peel(t).kind;
-            const cmpMode = ['agg', 'group', 'window'];
-            if (cmpMode.includes(cmpKind(lt)) || cmpMode.includes(cmpKind(rt))) {
+            const cmpMode = (t: Type): boolean => modePayload(this.u.peel(t)) !== null;
+            if (cmpMode(lt) || cmpMode(rt)) {
                 this.diag(node, `cannot compare an aggregate or window value with ${this.u.pretty(lt)} and ${this.u.pretty(rt)} — project it through fold/over first`);
                 return prim('bool');
             }
@@ -1785,7 +1767,7 @@ export class Inferencer {
         const firstExpr = e.arguments[0]!;
         const first = this.inferArg(firstExpr, env);
         const raw = this.u.peel(first);
-        if (raw.kind !== 'window' && raw.kind !== 'agg') {
+        if (raw.kind !== 'mode' || raw.mode === 'group') {
             this.argError('over', 0, firstExpr, first, undefined, undefined);
             return this.u.fresh();
         }
@@ -2119,7 +2101,8 @@ export class Inferencer {
         const entryNodes = this.entryNodesOf(argExpr);
         const groupSigs = new Set<string>();
         for (const [key, ft] of res.fields) {
-            if (this.u.peel(ft).kind !== 'group') continue;
+            const raw = this.u.peel(ft);
+            if (raw.kind !== 'mode' || raw.mode !== 'group') continue;
             const groupArg = this.groupArgumentOf(entryNodes?.get(key));
             const sig = this.accessSignature(groupArg);
             if (sig) groupSigs.add(sig);
@@ -2128,7 +2111,7 @@ export class Inferencer {
         let modes = 0;
         for (const [key, ft] of res.fields) {
             const raw = this.u.peel(ft);
-            if (raw.kind === 'agg') {
+            if (raw.kind === 'mode' && raw.mode === 'agg') {
                 const entry = entryNodes?.get(key);
                 const caseNode = this.unwrapApplicationExpr(entry);
                 if (caseNode && isCaseExpression(caseNode)) {
@@ -2140,7 +2123,7 @@ export class Inferencer {
                 }
                 modes++;
                 out.push([key, raw.of]);
-            } else if (raw.kind === 'group') {
+            } else if (raw.kind === 'mode' && raw.mode === 'group') {
                 modes++;
                 out.push([key, raw.of]);
             } else {
@@ -2218,11 +2201,11 @@ export class Inferencer {
         const out: [string, Type][] = [];
         for (const [key, ft] of res.fields) {
             const raw = this.u.peel(ft);
-            if (raw.kind === 'group') {
+            if (raw.kind === 'mode' && raw.mode === 'group') {
                 this.diag(entryNodes?.get(key) ?? argExpr, `projection entry '${key}' cannot contain group`);
             } else if (raw.kind === 'order') {
                 this.diag(entryNodes?.get(key) ?? argExpr, `projection entry '${key}' cannot contain order items (asc/desc)`);
-            } else if (raw.kind === 'window') {
+            } else if (raw.kind === 'mode' && raw.mode === 'window') {
                 const entry = entryNodes?.get(key);
                 const fnName = this.windowFunctionNameOf(entry) ?? 'window function';
                 // Anchor on the enclosing pipeline so this diagnostic and the
@@ -2231,13 +2214,11 @@ export class Inferencer {
                 out.push([key, raw.of]);
                 continue;
             }
-            out.push([key, raw.kind === 'agg' ? raw.of : ft]);
+            out.push([key, raw.kind === 'mode' && raw.mode === 'agg' ? raw.of : ft]);
         }
         return fun(queryOf(r.from), queryOf(rowOf(out, res.tail)));
     }
 
-    /** Unwrap zero-argument Application wrappers around an expression node. */
-    /** Unwrap zero-argument Application wrappers around an expression node. */
     /** Unwrap zero-argument Application wrappers around an expression node. */
     private unwrapApplicationExpr(node: AstNode | undefined): AstNode | undefined {
         let cur = node;
@@ -2815,7 +2796,7 @@ export class Inferencer {
             if (t.base) return this.translateType(t.base, rigid, names, rigidVars);
             return this.u.fresh();
         }
-        if (isTypeHole(t)) return this.typeHole(t.name);
+        if (isTypeHole(t)) return this.typeHole(t.name, names);
         if (isFunType(t)) return fun(this.translateType(t.left, rigid, names, rigidVars), this.translateType(t.right, rigid, names, rigidVars));
         if (isListType(t)) return listOf(this.translateType(t.type, rigid, names, rigidVars));
         if (isRecordType(t)) {
@@ -2830,32 +2811,10 @@ export class Inferencer {
             const tail = t.tail ? this.typeTailVar(t.tail, rigid, names, rigidVars) : null;
             return queryOf(rowOf(fields, tail));
         }
-        if (isQualifiedTypeName(t)) {
-            const ns = this.typeNamespaces.get(t.receiver);
-            const alias = ns?.get(t.name);
-            if (!alias) {
-                this.diag(t, `unknown type '${t.receiver}.${t.name}'`);
-                return this.u.fresh();
-            }
-            return this.translateType(alias, rigid, names, rigidVars);
-        }
         if (isTypeVar(t)) {
             const name = t.name;
             const primitive = primitiveName(name);
             if (primitive) return prim(primitive);
-            const alias = this.typeAliases.get(name);
-            if (alias) {
-                if (this.activeTypeAliases.has(name)) {
-                    this.diag(t, `recursive type alias '${name}'`);
-                    return this.u.fresh();
-                }
-                this.activeTypeAliases.add(name);
-                try {
-                    return this.translateType(alias, rigid, names, rigidVars);
-                } finally {
-                    this.activeTypeAliases.delete(name);
-                }
-            }
             if (!/^[a-z]/.test(name)) {
                 this.diag(t, `unknown type '${name}'`);
                 return this.u.fresh();
@@ -2949,9 +2908,14 @@ export class Inferencer {
         return this.typeOrRowVar(name, 'row', rigid, names, rigidVars);
     }
 
-    /** A non-tail `?name` annotation: a named type hole shared within the annotation. */
-    private typeHole(name: string): Type {
-        return this.u.freshHole('flex', name);
+    /** A non-tail `?name` annotation: all same-name holes in one annotation share one metavariable. */
+    private typeHole(name: string, names: Map<string, Type>): Type {
+        const key = `type-hole:${name}`;
+        const existing = names.get(key);
+        if (existing) return existing;
+        const hole = this.u.freshHole('flex', name.slice(1));
+        names.set(key, hole);
+        return hole;
     }
 
     /** Rendered, resolved type text of a recorded node (friendly var names for hover). */

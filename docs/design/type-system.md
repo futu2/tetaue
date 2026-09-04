@@ -4,7 +4,9 @@ Status: **implemented (v4)** — `src/language/types.ts`, `src/language/inferenc
 `src/language/builtin.ts`, and the `Type` grammar.
 
 This document is the current specification. The previous `t?` / absorption
-design has been removed.
+design has been removed. A formal treatment — syntax, judgments, laws, and
+the reflection that shaped the implementation — lives in
+[`type-system-formal.md`](type-system-formal.md).
 
 ## 1. Core ideas
 
@@ -16,7 +18,8 @@ design has been removed.
    `(maybe T)` and no absorption during unification.
 3. **Holes are named unsolved metavariables.** `?name` is never generalized,
    so every use of a binding with a hole shares one metavariable until
-   unification fills it. A bare `table "users"` gets a fresh row hole
+   unification fills it; the same name inside one annotation denotes one
+   metavariable. A bare `table "users"` gets a fresh row hole
    (`query ?table`) instead of `forall r. query r`.
 4. **SQL NULL is explicit.** `null : forall a. (maybe a)`, `just : a -> (maybe a)`,
    `nothing : forall a. (maybe a)`, `from_maybe : a -> (maybe a) -> a`,
@@ -32,23 +35,15 @@ design has been removed.
    have executable instances for `maybe` and lists. These constraints are not
    user-declarable.
 
-## 2. Type aliases
+## 2. Types are builtin-only
 
-A module may declare aliases before its bindings:
-
-```
-type UserRow = query { id: int, name: string }
-type AdultRow = { age: int | r }
-```
-
-Aliases expand in any annotation or schema and may not be recursive.
-`export type UserRow = ...` publishes an alias; importers bring it into
-scope with flat imports, selective renaming, or a namespace:
-
-```
-import "schema.tetaue" as s
-users: s.UserRow = table "users"
-```
+The type vocabulary is closed: the scalar primitives (`int`, `float`,
+`decimal`, `string`, `bool`, `date`, `timestamp`) plus the anonymous
+constructors — records `{ ... }`, queries `query { ... }`, lists `[T]`,
+`(maybe T)`, function arrows, type variables, and holes. There is **no**
+user-declared type and **no** type alias: a module can only bind values, and
+annotations are written inline. This keeps the core small and the grammar
+flat — see `docs/design/core.md`.
 
 ## 3. Type syntax
 
@@ -85,7 +80,15 @@ tail       ::= lowercase-row-variable | '?hole_name'
 - Comparison `==`/`!=` with `null` is only well-typed when the other operand
   is already maybe; it lowers to `IS [NOT] NULL`.
 - Ordinary comparison and arithmetic require non-maybe operands. Use
-  `from_maybe` (or `coalesce`) to unwrap first.
+  `from_maybe` (or `coalesce`) to unwrap first. Two consequences of the
+  implementation mechanism: a nullable column meeting a *polymorphic
+  literal* (`v.s + 1`, `v.s > 1` on `v.s : (maybe int)`) is accepted and
+  stays maybe — inside an open lambda nullability flows in at row
+  unification, after the literal has adapted. Two columns (`v.s + v.g`)
+  still fail — not by a special guard, but because unifying both operands
+  into one numeric variable and then requiring `(maybe int) ~ int` violates
+  Maybe strictness. The explicit "unwrap first" diagnostics fire where
+  nullability is already known (outer-join mergers, ascriptions).
 - Scalar SQL functions (`upper`, `length`, `trim`, date functions, ...) take
   and return non-maybe values; SQL NULL propagation is achieved explicitly
   with `from_maybe`/`coalesce`, not by implicit lifting.
@@ -97,7 +100,7 @@ tail       ::= lowercase-row-variable | '?hole_name'
 - **Aggregates** that SQL can make NULL on empty/all-null input
   (`sum`, `avg`, `min`, `max`) produce maybe results:
   `sum : numeric -> agg (maybe numeric)`. `count : a -> agg int` and
-  `list : a -> agg [a]` are non-null.
+  `array : a -> agg [a]` are non-null.
 
 ## 5. Holes and dynamic tables
 
@@ -207,7 +210,7 @@ count_distinct : forall a. a -> agg int
 sum         : forall a. a -> agg (maybe a)       -- numeric a
 avg         : forall a. a -> agg (maybe float)   -- numeric a
 min, max    : forall a. a -> agg (maybe a)       -- comparable a
-list        : forall a. a -> agg [a]
+array       : forall a. a -> agg [a]
 group       : forall a. a -> group a
 
 == !=            : Eq a => a -> a -> bool       -- non-maybe; null via == null
