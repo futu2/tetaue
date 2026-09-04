@@ -16,19 +16,19 @@ export type BinaryOperator = (typeof BINARY_OPERATORS)[number];
  * intrinsic.
  */
 export const OPERATOR_INTRINSICS = {
-    '*': '@op_multiply',
-    '/': '@op_divide',
-    '+': '@op_add',
-    '-': '@op_subtract',
-    '<>': '@op_merge',
-    '==': '@op_equal',
-    '!=': '@op_not_equal',
-    '<': '@op_less_than',
-    '<=': '@op_less_than_or_equal',
-    '>': '@op_greater_than',
-    '>=': '@op_greater_than_or_equal',
-    '&&': '@op_and',
-    '||': '@op_or',
+    '*': 'op_multiply',
+    '/': 'op_divide',
+    '+': 'op_add',
+    '-': 'op_subtract',
+    '<>': 'op_merge',
+    '==': 'op_equal',
+    '!=': 'op_not_equal',
+    '<': 'op_less_than',
+    '<=': 'op_less_than_or_equal',
+    '>': 'op_greater_than',
+    '>=': 'op_greater_than_or_equal',
+    '&&': 'op_and',
+    '||': 'op_or',
 } as const satisfies Partial<Record<BinaryOperator, string>>;
 
 export type IntrinsicOperator = keyof typeof OPERATOR_INTRINSICS;

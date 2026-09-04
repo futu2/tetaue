@@ -35,19 +35,11 @@
     "keywords": {
       "patterns": [
         {
-          "match": "@(int|float|decimal|string|bool|date|timestamp)\\b",
-          "name": "storage.type.tetaue"
-        },
-        {
-          "match": "@[A-Za-z][A-Za-z0-9_]*",
-          "name": "support.function.builtin.tetaue"
-        },
-        {
           "match": "\\b(import|table|filter|map|sort|take|distinct|fold|joinInner|joinLeft|joinRight|joinFull|asc|desc|group|count|sum|avg|min|max|coalesce|fmap|replaceWith|ap|applyLeft|applyRight|orElse|bind|then|from_maybe|is_nothing|is_just|is_null|is_not_null|just|nothing|div|mod|upper|lower|length|abs|is_in|is_not_in|not|rename|pick|omit|true|false|null|query|maybe|forall|case|_)\\b",
           "name": "keyword.other.tetaue"
         },
         {
-          "match": "\\b(int|float|string|bool|date|timestamp)\\b",
+          "match": "\\b(int|float|decimal|string|bool|date|timestamp)\\b",
           "name": "storage.type.tetaue"
         }
       ]

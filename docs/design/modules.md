@@ -111,17 +111,18 @@ Export:
     'export' ('*' | '{' names+=ImportName (',' names+=ImportName)* '}') 'from' path=STRING;
 
 Model:
-    (imports+=Import | exports+=Export | types+=TypeAlias | bindings+=Binding)*;
+    (imports+=Import | exports+=Export | bindings+=Binding)*;
 ```
 
 `export` and `as` become **reserved words** (Langium lexes keywords with
 priority over identifiers everywhere — `u.export` as a field name is a parse
 error). The `Model` is a single flat loop instead of
-`Import* TypeAlias* Binding*`: `export` is shared by re-exports, type aliases
-and bindings, and only one loop lets the parser backtrack (`export *` /
-`export { a }` → re-export, `export type` → alias, `export name` → binding).
+`Import* TypeAlias* Binding*`: `export` is shared by re-exports and bindings,
+and only one loop lets the parser backtrack (`export *` /
+`export { a }` → re-export, `export name` → binding). There is no `TypeAlias`
+rule — types are builtin-only, so a module can only bind values.
 A consequence is that imports/re-exports may appear anywhere among bindings;
-the interpreter evaluates them in fixed order regardless (imports, types,
+the interpreter evaluates them in fixed order regardless (imports, then
 bindings, then re-exports merged into the export map).
 
 ## 4. Semantics
@@ -181,8 +182,8 @@ export * from "./tables/orders"
 re-exports every exported VALUE binding of the target (transitively following
 the target's own re-exports); `export { a as b } from` re-exports only the
 listed names, renaming as shown. Conflicts (a re-exported name colliding with
-a local export or another re-export) are errors, never silent. Re-exporting
-type aliases is not yet supported.
+a local export or another re-export) are errors, never silent. Types are
+builtin-only, so re-exports never carry type aliases.
 
 ### 4.3 Qualified access
 
@@ -379,8 +380,7 @@ dependency graph:
 
 ## 9. Out of scope (future work)
 
-- Selective exports lists are already covered by re-exports; `export type …
-  from` (re-exporting type aliases) is not yet supported.
+- Selective exports lists are already covered by re-exports.
 - Cyclic imports at the *semantic* level (detected + reported today, then
   modules are analyzed as far as possible).
 - Package/registry sources (`{ git = "…" }`, npm-style resolution) — they

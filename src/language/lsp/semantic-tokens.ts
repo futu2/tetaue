@@ -22,6 +22,7 @@
 import type { AstNode } from 'langium';
 import { GrammarUtils } from 'langium';
 import { AbstractSemanticTokenProvider, type SemanticTokenAcceptor } from 'langium/lsp';
+import { BUILTIN_NAMES } from '../builtin.js';
 import { standardPreludeNames } from '../prelude.js';
 import type { TetaueServices } from '../tetaue-module.js';
 import {
@@ -38,7 +39,7 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
 
     constructor(services: TetaueServices) {
         super(services);
-        this.standardNames = new Set(standardPreludeNames(services));
+        this.standardNames = new Set([...BUILTIN_NAMES, ...standardPreludeNames(services)]);
     }
 
     protected highlightElement(node: AstNode, acceptor: SemanticTokenAcceptor): void {

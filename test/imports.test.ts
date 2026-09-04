@@ -327,40 +327,32 @@ describe('selective imports', () => {
         expect(sql).toContain('LIMIT 3');
     });
 
-    test('qualified type aliases work through a namespace import', () => {
+    test('user type aliases are no longer part of the language', () => {
+        // A `type` declaration does not parse (no TypeAlias rule).
+        const parsed = services.parser.LangiumParser.parse('type UserRow = query { id: int }');
+        expect(parsed.parserErrors.length).toBeGreaterThan(0);
+
+        // Qualified type names (`s.UserRow`) are not a grammar form either.
+        const qualified = services.parser.LangiumParser.parse(
+            'import "schema.tetaue" as s\nusers: s.UserRow = table "users"',
+        );
+        expect(qualified.parserErrors.length).toBeGreaterThan(0);
+
+        // The schema still comes from an inline annotation on the binding.
         const sql = renderFiles({
-            'schema.tetaue': `export type UserRow = query { id: int, name: string }`,
-            'main.tetaue': `import "schema.tetaue" as s\nusers: s.UserRow = table "users"\nq = users & take 1`,
+            'schema.tetaue': `export users: query { id: int, name: string } = table "users"`,
+            'main.tetaue': `import "schema.tetaue" as s\nq = s.users & take 1`,
         }, 'main.tetaue');
         expect(sql).toContain('FROM users');
-        const renamed = renderFiles({
-            'schema.tetaue': `export type UserRow = query { id: int }`,
-            'main.tetaue': `import "schema.tetaue" as s (UserRow as Row)\nusers: s.Row = table "users"\nq = users & take 1`,
-        }, 'main.tetaue');
-        expect(renamed).toContain('FROM users');
-        const missing = analyzeFiles({
-            'schema.tetaue': `export type UserRow = query { id: int }`,
-            'main.tetaue': `import "schema.tetaue" as s\nusers: s.Nope = table "users"\nq = users & take 1`,
-        }, 'main.tetaue');
-        const typeDiags = inferProject(
-            missing.tree.modules,
-            missing.tree.importsByModule,
-            standardPrelude(services),
-        ).diagnostics.map(d => d.message).join('\n');
-        expect(typeDiags).toContain("unknown type 's.Nope'");
+        expect(sql).toContain('LIMIT 1');
     });
 
-    test('exported type aliases are imported flat and can be renamed', () => {
+    test('inline table annotations keep working without any type aliases', () => {
         const sql = renderFiles({
-            'schema.tetaue': `export type UserRow = query { id: int, name: string }`,
-            'main.tetaue': `import "schema.tetaue" (UserRow as Row)\nusers: Row = table "users"\nq = users & take 1`,
+            'main.tetaue': `users: query { id: int, name: string } = table "users"\nq = users & take 1`,
         }, 'main.tetaue');
         expect(sql).toContain('FROM users');
-        const { result } = analyzeFiles({
-            'schema.tetaue': `export type UserRow = query { id: int }`,
-            'main.tetaue': `import "schema.tetaue"\nusers: UserRow = table "users"\nq = users & take 1`,
-        }, 'main.tetaue');
-        expect(result.diagnostics).toEqual([]);
+        expect(sql).toContain('LIMIT 1');
     });
 
     test('import "x" (a as b) renames a flat selective import', () => {

@@ -57,8 +57,8 @@ describe('builtin catalog', () => {
             });
         }
         const u = new TypeUniverse();
-        expect(spec.get('sum')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'agg' } });
-        expect(spec.get('group')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'group' } });
+        expect(spec.get('sum')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'mode', mode: 'agg' } });
+        expect(spec.get('group')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'mode', mode: 'group' } });
         const names = BUILTIN_SPECS.map(item => item.name) as string[];
         for (const removed of ['join', 'inner', 'left', 'right', 'full']) {
             expect(names).not.toContain(removed);

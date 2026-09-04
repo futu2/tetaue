@@ -92,7 +92,6 @@ export function checkProject(
     // reference the SAME target module object, so this stays deduplicated).
     const valueExportsByModule = new Map<ProjectModule, Map<string, Value>>();
     const schemeExportsByModule = new Map<ProjectModule, Map<string, Scheme>>();
-    const typeExportsByModule = new Map<ProjectModule, Map<string, import('./generated/ast.js').Type>>();
 
     const interpreterDiagnostics: Diagnostic[] = [];
     const root = modules[modules.length - 1];
@@ -104,7 +103,6 @@ export function checkProject(
     const allModules = prelude ? [prelude, ...modules] : [...modules];
     let standardValues = new Map<string, Value>();
     let standardSchemes = new Map<string, Scheme>();
-    let standardTypes = new Map<string, import('./generated/ast.js').Type>();
     let rootEnv: Map<string, Value> | undefined;
     let value: Value = ERROR;
 
@@ -119,8 +117,6 @@ export function checkProject(
             module,
             moduleImports,
             schemeExportsByModule,
-            typeExportsByModule,
-            standardTypes,
         ).scope;
         const scope = new Map(typedScope);
 
@@ -130,7 +126,7 @@ export function checkProject(
             ...inferencer.takeDiagnostics(),
         ];
 
-        const imported = resolveImportScope(module, moduleImports, valueExportsByModule, typeExportsByModule);
+        const imported = resolveImportScope(module, moduleImports, valueExportsByModule);
         moduleDiagnostics.push(...imported.diagnostics);
         for (const [name, v] of imported.flat) env.set(name, v);
         for (const [alias, selected] of imported.namespaces) {
@@ -212,15 +208,11 @@ export function checkProject(
 
         valueExportsByModule.set(module, exports);
         schemeExportsByModule.set(module, exportedSchemes);
-        typeExportsByModule.set(module, new Map(
-            module.model.types.filter(a => a.export).map(a => [a.name, a.type]),
-        ));
 
         if (module === root) rootEnv = env;
         if (module === prelude) {
             standardValues = exports;
             standardSchemes = exportedSchemes;
-            standardTypes = new Map(module.model.types.filter(a => a.export).map(a => [a.name, a.type]));
             // Public aliases are the prelude for every following module. Keep
             // their scheme identity so builtin-specific inference checks still
             // recognize `filter`, `fold`, etc. while allowing local shadowing.

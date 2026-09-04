@@ -14,10 +14,14 @@
  * first time it is unified with a row) and live in a mutable binding store
  * owned by a TypeUniverse — one universe per inference run.
  *
- * See docs/design/type-system.md for the full specification.
+ * See docs/design/type-system.md for the user-level specification and
+ * docs/design/type-system-formal.md for the formal core (syntax, judgments,
+ * laws) this module implements.
  ******************************************************************************/
 
 export type PrimName = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' | 'timestamp';
+/** The pipeline modes: aggregate / group-key / window-only. */
+export type ModeName = 'agg' | 'group' | 'window';
 export type ScalarTypeClass = 'Num' | 'Frac' | 'Eq' | 'Ord' | 'DateTime' | 'Semigroup' | 'Monoid';
 export type ContainerTypeClass = 'Functor' | 'Applicative' | 'Alternative' | 'Monad';
 export type TypeClass = ScalarTypeClass | ContainerTypeClass;
@@ -72,17 +76,17 @@ export type Type =
      */
     | { kind: 'builtin'; name: string; of: Type }
     /**
-     * An aggregate-mode expression (`sum o.total`, `count o.id`, ...) — "the
-     * value of type `t`, aggregated". Transparent in unification (like `maybe`),
-     * so comparisons/arithmetic on aggregate results work; the mode is
-     * enforced by the fold/map mode checks in inference, which inspect the
-     * raw (pre-unification) field types.
+     * A pipeline mode: `agg t` ("the value `t`, aggregated"), `group t`
+     * ("the value `t`, a GROUP BY key"), or `window t` ("a window-only
+     * value"). Modes are transparent in unification per mode: two values of
+     * the same mode unify on their payloads, while mixed modes never unify
+     * (an aggregate result is not a GROUP BY key and vice versa). Mode
+     * discipline beyond unification (which rows may carry which modes) is
+     * enforced by the fold/map/over checks in inference, which inspect the
+     * raw (pre-unification) field types; `rejectModeOperand` keeps modes
+     * from being silently absorbed by polymorphic variables in arithmetic.
      */
-    | { kind: 'agg'; of: Type }
-    /** A group-mode expression (`group o.user_id`). Transparent in unification. */
-    | { kind: 'group'; of: Type }
-    /** A window-only expression (`row_number`, `lag`, ...) that must be wrapped by `over`. */
-    | { kind: 'window'; of: Type };
+    | { kind: 'mode'; mode: ModeName; of: Type };
 
 export type VarKind = 'type' | 'row';
 
@@ -172,19 +176,14 @@ export function builtinOf(name: string, of: Type): Type {
     return { kind: 'builtin', name, of };
 }
 
-/** Wrap `t` in the aggregate mode: `agg t` ("an aggregate of `t`"). */
-export function aggOf(t: Type): Type {
-    return t.kind === 'agg' ? t : { kind: 'agg', of: t };
+/** Wrap `t` in a pipeline mode. Idempotent within a mode. */
+export function modeOf(mode: ModeName, t: Type): Type {
+    return t.kind === 'mode' && t.mode === mode ? t : { kind: 'mode', mode, of: t };
 }
 
-/** Wrap `t` in the group mode: `group t` (a GROUP BY key). */
-export function groupOf(t: Type): Type {
-    return t.kind === 'group' ? t : { kind: 'group', of: t };
-}
-
-/** Wrap `t` in the window mode: `window t` (a window-only function result). */
-export function windowOf(t: Type): Type {
-    return t.kind === 'window' ? t : { kind: 'window', of: t };
+/** Unwrap one mode layer (`modeOf('agg', t) -> t`); any other type unchanged. */
+export function modePayload(t: Type): Type | null {
+    return t.kind === 'mode' ? t.of : null;
 }
 
 export function rowOf(fields: [string, Type][], tail: Type | null = null): Type {
@@ -286,8 +285,7 @@ export class TypeUniverse {
             && functorName !== null && isContainerTypeClassInstance(constraint, functorName)) {
             return;
         }
-        if (r.kind === 'builtin' || r.kind === 'maybe' || r.kind === 'agg'
-            || r.kind === 'group' || r.kind === 'window') {
+        if (r.kind === 'builtin' || r.kind === 'maybe' || r.kind === 'mode') {
             this.constrainInternal(r.of, constraint);
             return;
         }
@@ -325,11 +323,6 @@ export class TypeUniverse {
         return r;
     }
 
-        /** Resolve a type through variable bindings. */
-    normalize(t: Type): Type {
-        return this.resolve(t);
-    }
-
     /** Free (unbound) variable ids reachable from `t`, resolving bindings. */
     freeVars(t: Type): Set<number> {
         const out = new Set<number>();
@@ -346,7 +339,7 @@ export class TypeUniverse {
                     break;
                 case 'query': visit(r.row); break;
                 case 'builtin':
-                case 'agg': case 'group': case 'window': visit(r.of); break;
+                case 'mode': visit(r.of); break;
                 case 'prim': case 'truth': case 'order': break;
             }
         };
@@ -507,20 +500,17 @@ export class TypeUniverse {
             throw new UnifyError(a, b);
         }
 
-        // `agg`/`group` mode absorption (transparent): unify the
-        // payloads and re-wrap. Mixed modes never unify (an aggregate result
-        // is not a GROUP BY key and vice versa).
-        const aAgg = a.kind === 'agg' ? a.of : null;
-        const bAgg = b.kind === 'agg' ? b.of : null;
-        const aGroup = a.kind === 'group' ? a.of : null;
-        const bGroup = b.kind === 'group' ? b.of : null;
-        if (aAgg !== null || bAgg !== null || aGroup !== null || bGroup !== null) {
-            if ((aAgg !== null && bGroup !== null) || (aGroup !== null && bAgg !== null)) {
-                throw new UnifyError(a, b);
-            }
-            const inner = this.unifyInternal(aAgg ?? aGroup ?? a, bAgg ?? bGroup ?? b);
-            return aAgg !== null || bAgg !== null ? aggOf(inner) : groupOf(inner);
+        // Mode transparency: two values of the same mode unify on their
+        // payloads and the mode re-wraps the unified result; a mode against a
+        // plain type unifies through the payload (the mode re-wraps); mixed
+        // modes never unify (an aggregate result is not a GROUP BY key and
+        // vice versa).
+        if (a.kind === 'mode' && b.kind === 'mode') {
+            if (a.mode !== b.mode) throw new UnifyError(a, b);
+            return modeOf(a.mode, this.unifyInternal(a.of, b.of));
         }
+        if (a.kind === 'mode') return modeOf(a.mode, this.unifyInternal(a.of, b));
+        if (b.kind === 'mode') return modeOf(b.mode, this.unifyInternal(a, b.of));
 
         switch (a.kind) {
             case 'prim':
@@ -559,12 +549,6 @@ export class TypeUniverse {
                 break;
             case 'order':
                 if (b.kind === 'order') return a;
-                break;
-            case 'window':
-                if (b.kind === 'window') {
-                    this.unifyInternal(a.of, b.of);
-                    return a;
-                }
                 break;
         }
         throw new UnifyError(a, b);
@@ -824,9 +808,7 @@ export class TypeUniverse {
             }
             case 'query': return queryOf(this.substitute(subst, r.row));
             case 'builtin': return builtinOf(r.name, this.substitute(subst, r.of));
-            case 'agg': return aggOf(this.substitute(subst, r.of));
-            case 'group': return groupOf(this.substitute(subst, r.of));
-            case 'window': return windowOf(this.substitute(subst, r.of));
+            case 'mode': return modeOf(r.mode, this.substitute(subst, r.of));
             case 'prim': case 'truth': case 'order': return r;
         }
     }
@@ -871,9 +853,7 @@ export class TypeUniverse {
                 }
                 case 'query': return `query ${p(r.row, false)}`;
                 case 'builtin': return p(r.of, paren);
-                case 'agg': return `agg ${p(r.of, false)}`;
-                case 'group': return `group ${p(r.of, false)}`;
-                case 'window': return `window ${p(r.of, false)}`;
+                case 'mode': return `${r.mode} ${p(r.of, false)}`;
                 case 'fun': {
                     const s = `${p(r.from, true)} -> ${p(r.to, false)}`;
                     return paren ? `(${s})` : s;
