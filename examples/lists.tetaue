@@ -1,20 +1,22 @@
-# The pure `list.*` namespace — Haskell base List vocabulary for in-memory
-# lists, kept OUT of the unqualified (relational/SQL) namespace so the two
-# never collide:
+# The pure `list.*` and `Maybe.*` namespaces — Haskell base vocabulary for
+# the less-common, pure operations, kept OUT of the unqualified
+# (relational/SQL) namespace so the two never collide:
 #
 #   list.map / list.filter / list.fold / list.foldr   higher-order folds
 #   list.sum / list.product / list.length             numeric/structural
 #   list.reverse / list.concat / list.append          reshaping
 #   list.take / list.drop / list.head / list.last     indexing
 #   list.elem / list.isEmpty                          predicates
+#   Maybe.isJust / Maybe.isNothing / Maybe.fromMaybe  nullable helpers
+#   Maybe.just / Maybe.nothing                        constructors
 #
 # A qualified name is not an Atom, so calling one needs parens — the same
 # rule as `filter (p.adult)`:
 #
 #   (list.fold) (acc => x => acc + x) 0 [1, 2, 3]
 #
-# These are pure in-memory operations: they never touch SQL. `map`, `filter`,
-# `take`, `drop`, `fold`, `sum`, `length`, `reverse`, `concat` keep their
+# These are pure operations: they never touch SQL. `map`, `filter`, `take`,
+# `drop`, `fold`, `sum`, `length`, `reverse`, `concat` keep their
 # relational/SQL meanings unqualified.
 
 # A module-level pure binding: total = 6.
@@ -27,8 +29,9 @@ doubled = (list.map) (x => x * 2) [1, 2, 3]
 has_four = (list.elem) 4 doubled
 empty_check = (list.isEmpty) []
 
-# list.* is in-memory only; use it to build a column value in a projection.
-users: query { id: int, name: string } = table "users"
+# Maybe.* over a nullable column expression.
+users: query { id: int, name: string, nickname: (maybe string) } = table "users"
 main = users
     & take 2
-    & map (u => { id = u.id, total = total, has_four = has_four })
+    & filter (u => (Maybe.isJust) u.nickname)
+    & map (u => { id = u.id, nick = (Maybe.fromMaybe) u.name u.nickname })

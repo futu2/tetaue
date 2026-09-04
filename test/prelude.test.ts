@@ -5,7 +5,7 @@ import { createTetaueServices } from '../src/language/tetaue-module.js';
 import { standardPrelude, standardPreludeNames, STANDARD_PRELUDE_SOURCE } from '../src/language/prelude.js';
 import { BUILTINS, createPreludeEnv } from '../src/language/interpreter.js';
 import { BUILTIN_NAMES } from '../src/language/builtin.js';
-import { LIST_NAMESPACE } from '../src/language/list-namespace.js';
+import { MAYBE_NAMESPACE, PRELUDE_NAMESPACES } from '../src/language/prelude-namespaces.js';
 import { checkProject } from '../src/language/checker.js';
 import { Inferencer } from '../src/language/inference.js';
 import type { Model } from '../src/language/generated/ast.js';
@@ -137,9 +137,10 @@ describe('list namespace', () => {
     test('every list.* member maps to a real backend builtin', () => {
         const env = createPreludeEnv();
         const list = env.get('list');
+        const listNamespace = PRELUDE_NAMESPACES.list ?? {};
         expect(list?.kind).toBe('module');
         if (!list || list.kind !== 'module') return;
-        for (const [publicName, builtinName] of Object.entries(LIST_NAMESPACE)) {
+        for (const [publicName, builtinName] of Object.entries(listNamespace)) {
             expect(list.exports.has(publicName)).toBe(true);
             expect(Object.keys(BUILTINS)).toContain(builtinName);
             expect(BUILTIN_NAMES).toContain(builtinName);
@@ -172,7 +173,8 @@ describe('list namespace', () => {
             expect(env.get(name)).not.toBe(list.exports.get(name));
         }
         // And every list.* public spelling resolves through the namespace.
-        for (const publicName of Object.keys(LIST_NAMESPACE)) {
+        const listNamespace = PRELUDE_NAMESPACES.list ?? {};
+        for (const publicName of Object.keys(listNamespace)) {
             expect(list.exports.has(publicName)).toBe(true);
         }
     });
@@ -195,5 +197,46 @@ describe('list namespace', () => {
         `);
         expect(pure.diagnostics).toEqual([]);
         expect(pure.value.kind).toBe('query');
+    });
+});
+
+describe('Maybe namespace', () => {
+    test('every Maybe.* member maps to a real backend builtin', () => {
+        const env = createPreludeEnv();
+        const maybe = env.get('Maybe');
+        expect(maybe?.kind).toBe('module');
+        if (!maybe || maybe.kind !== 'module') return;
+        for (const [publicName, builtinName] of Object.entries(MAYBE_NAMESPACE)) {
+            expect(maybe.exports.has(publicName)).toBe(true);
+            expect(Object.keys(BUILTINS)).toContain(builtinName);
+            expect(BUILTIN_NAMES).toContain(builtinName);
+        }
+    });
+
+    test('Maybe.* resolves and types like the Data.Maybe vocabulary', () => {
+        expect(checked('main = (Maybe.just) 1', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (Maybe.isJust) (just 1)', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (Maybe.isNothing) nothing', { requireQuery: false }).diagnostics).toEqual([]);
+        expect(checked('main = (Maybe.fromMaybe) 0 nothing', { requireQuery: false }).diagnostics).toEqual([]);
+    });
+
+    test('Maybe.* coexists with the unqualified maybe builtins', () => {
+        const env = createPreludeEnv();
+        const maybe = env.get('Maybe');
+        expect(maybe?.kind).toBe('module');
+        if (!maybe || maybe.kind !== 'module') return;
+        for (const name of ['just', 'nothing', 'is_null', 'from_maybe']) {
+            expect(env.has(name)).toBe(true);
+            expect(env.get(name)).not.toBe(maybe.exports.get(name));
+        }
+    });
+
+    test('Maybe.* works in a query predicate', () => {
+        const result = checked(`
+            users: query { id: int, nickname: (maybe string) } = table "users"
+            q = users & filter (u => (Maybe.isJust) u.nickname)
+        `);
+        expect(result.diagnostics).toEqual([]);
+        expect(result.value.kind).toBe('query');
     });
 });

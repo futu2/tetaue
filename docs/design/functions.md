@@ -112,12 +112,12 @@ Semantics and typing:
 - **Not for aggregation.** `merge` inside `fold` produces non-grouped,
   non-aggregated entries, which `fold` rejects like any plain column.
 
-## The pure `list.*` namespace
+## The pure `list.*` / `Maybe.*` namespaces
 
-The Haskell `base` List vocabulary lives in a **built-in `list` namespace**,
-kept strictly separate from the unqualified relational/SQL vocabulary so the
-two never collide. Qualified access needs parens when applied (the same rule
-as `filter (p.adult)`):
+The Haskell `base` vocabulary for the less-common, pure operations lives in
+**built-in namespaces**, kept strictly separate from the unqualified
+relational/SQL vocabulary so the two never collide. Qualified access needs
+parens when applied (the same rule as `filter (p.adult)`):
 
 ```
 (list.map)    (x => x * 2) [1, 2, 3]      # [2, 4, 6]
@@ -125,16 +125,23 @@ as `filter (p.adult)`):
 (list.length) [1, 2, 3]                   # 3
 (list.elem)   2 [1, 2, 3]                 # true
 (list.isEmpty) []                         # true
+(Maybe.isJust) (just 1)                   # true
+(Maybe.fromMaybe) 0 nothing               # 0
 ```
 
-Members: `map`, `filter`, `fold`, `foldr`, `sum`, `product`, `length`,
-`reverse`, `concat`, `append`, `take`, `drop`, `head`, `last`, `isEmpty`,
-`elem`. (`isEmpty` is used instead of `null` because `null` is a reserved
-keyword and cannot follow the namespace dot.)
+`list.*` members: `map`, `filter`, `fold`, `foldr`, `sum`, `product`,
+`length`, `reverse`, `concat`, `append`, `take`, `drop`, `head`, `last`,
+`isEmpty`, `elem`. (`isEmpty` is used instead of `null` because `null` is a
+reserved keyword and cannot follow the namespace dot.)
 
-These operate on **in-memory `[...]` list values only** — they never touch
-SQL. `map`, `filter`, `take`, `drop`, `fold`, `sum`, `length`, `reverse`,
-`concat` keep their unqualified relational/scalar meanings.
+`Maybe.*` members: `just`, `nothing`, `isJust`, `isNothing`, `fromMaybe`.
+The namespace is capitalized `Maybe` (as in Haskell) because lowercase
+`maybe` is the reserved type keyword.
+
+These operate on **in-memory `[...]` list values** and **nullable SQL
+expressions** — they never introduce new SQL. `map`, `filter`, `take`,
+`drop`, `fold`, `sum`, `length`, `reverse`, `concat` keep their unqualified
+relational/scalar meanings.
 
 ## Date & time
 

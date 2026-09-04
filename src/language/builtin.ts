@@ -263,6 +263,7 @@ export const BUILTIN_SPECS = [
     { name: 'from_maybe', category: 'scalar', doc: 'from_maybe default maybe_value — COALESCE', scheme: u => poly(u, [tVar], t => fun(t, fun(maybeOf(t), t))) },
     { name: 'null_if', category: 'scalar', doc: 'NULLIF', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))) },
     { name: 'is_null', category: 'logic', doc: 'IS NULL', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
+    { name: 'maybe_isJust', category: 'logic', doc: 'maybe.isJust x — not (is_null x); the Data.Maybe isJust', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
     { name: 'is_true', category: 'logic', doc: 'SQL three-valued logic: IS TRUE', scheme: () => mono(fun(truthType(), p('bool'))) },
     { name: 'is_false', category: 'logic', doc: 'SQL three-valued logic: IS FALSE', scheme: () => mono(fun(truthType(), p('bool'))) },
     { name: 'is_unknown', category: 'logic', doc: 'SQL three-valued logic: IS UNKNOWN / NULL', scheme: () => mono(fun(truthType(), p('bool'))) },

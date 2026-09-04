@@ -21,7 +21,7 @@ import { resolveImportScope } from './project-scope.js';
 import { implicitParamName, labelName, parseStringLiteral } from './strings.js';
 export { parseStringLiteral };
 import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
-import { LIST_NAMESPACE } from './list-namespace.js';
+import { PRELUDE_NAMESPACES } from './prelude-namespaces.js';
 import { TypeUniverse } from './types.js';
 import type { Type } from './types.js';
 import {
@@ -3002,6 +3002,16 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         if (forbid(node, ['agg', 'group', 'order'], 'is_null', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'is-null', expr: node, negated: false, type: 'bool' }, at);
     }),
+    maybe_isJust: () => fn('isJust', (arg, at, ctx) => {
+        const node = exprNode(arg);
+        if (!node) {
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `maybe.isJust expects an expression, e.g. maybe.isJust u.nickname` });
+            return ERROR;
+        }
+        if (forbid(node, ['agg', 'group', 'order'], 'isJust', at ?? arg.ast, ctx)) return ERROR;
+        // not (x IS NULL) — Data.Maybe's isJust over nullable SQL values.
+        return mkExpr({ kind: 'is-null', expr: node, negated: true, type: 'bool' }, at);
+    }),
     is_true: truthPredicateBuiltin('is_true'),
     is_false: truthPredicateBuiltin('is_false'),
     is_unknown: truthPredicateBuiltin('is_unknown'),
@@ -3969,15 +3979,17 @@ export function createPreludeEnv(): Map<string, Value> {
     for (const operator of INTRINSIC_OPERATORS) {
         env.set(operatorIntrinsicName(operator), operatorIntrinsicValue(operator));
     }
-    // The built-in `list.*` namespace: a module value whose exports are the
-    // pure list combinators, so `list.map` / `list.fold` / `list.sum` resolve
-    // exactly like a qualified import `import "..." as list`.
-    const listExports = new Map<string, Value>();
-    for (const [publicName, builtinName] of Object.entries(LIST_NAMESPACE)) {
-        const factory = BUILTINS[builtinName as BuiltinName];
-        if (factory) listExports.set(publicName, factory());
+    // Built-in prelude namespaces (`list.*`, `maybe.*`): module values whose
+    // exports are the pure combinators, so `list.map` / `maybe.isJust`
+    // resolve exactly like a qualified import `import "..." as list`.
+    for (const [alias, namespace] of Object.entries(PRELUDE_NAMESPACES)) {
+        const exports = new Map<string, Value>();
+        for (const [publicName, builtinName] of Object.entries(namespace)) {
+            const factory = BUILTINS[builtinName as BuiltinName];
+            if (factory) exports.set(publicName, factory());
+        }
+        env.set(alias, { kind: 'module', name: alias, exports });
     }
-    env.set('list', { kind: 'module', name: 'list', exports: listExports });
     return env;
 }
 

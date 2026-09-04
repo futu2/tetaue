@@ -33,7 +33,7 @@ import {
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
-import { LIST_NAMESPACE } from './list-namespace.js';
+import { PRELUDE_NAMESPACES } from './prelude-namespaces.js';
 import { moduleOf } from './imports.js';
 import { resolveImportScope } from './project-scope.js';
 import { checkBinding, missingBindingExpressionMessage, parseStringLiteral, recursiveBindingMessage, topoOrderBindings } from './interpreter.js';
@@ -298,17 +298,19 @@ export class Inferencer {
         }
         // The primitive environment is cloned into every module (see beginModule).
         this.preludeEnv = new Map(this.env);
-        // The built-in `list.*` namespace: a map of the pure list combinators'
-        // schemes, so `list.map` / `list.fold` / `list.sum` resolve like a
-        // qualified import (see beginModule, which starts each module from
-        // the prelude namespaces).
+        // The built-in prelude namespaces (`list.*`, `maybe.*`): maps of each
+        // pure combinator's scheme, so `list.map` / `maybe.isJust` resolve
+        // like a qualified import (see beginModule, which starts each module
+        // from the prelude namespaces).
         this.preludeNamespaces = new Map<string, Map<string, Scheme>>();
-        const listSchemes = new Map<string, Scheme>();
-        for (const [publicName, builtinName] of Object.entries(LIST_NAMESPACE)) {
-            const scheme = this.env.get(builtinName);
-            if (scheme) listSchemes.set(publicName, scheme);
+        for (const [alias, namespace] of Object.entries(PRELUDE_NAMESPACES)) {
+            const schemes = new Map<string, Scheme>();
+            for (const [publicName, builtinName] of Object.entries(namespace)) {
+                const scheme = this.env.get(builtinName);
+                if (scheme) schemes.set(publicName, scheme);
+            }
+            this.preludeNamespaces.set(alias, schemes);
         }
-        this.preludeNamespaces.set('list', listSchemes);
     }
 
     /** Static shape of a hidden SQL-aware operator primitive. */
