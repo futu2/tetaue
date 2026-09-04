@@ -180,7 +180,7 @@ export const BUILTIN_SPECS = [
     { name: 'not', category: 'logic', doc: 'NOT', scheme: () => mono(fun(p('bool'), p('bool'))) },
     { name: 'in_query', category: 'logic', doc: 'IN (SELECT ...) — in_query x subquery', scheme: u => poly(u, [tVar, rowVar], (t, r) => fun(t, fun(queryOf(r), p('bool')))) },
     { name: 'is_in', category: 'logic', doc: 'IN — is_in x [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(t, fun(listOf(t), p('bool')))) },
-    { name: 'like', category: 'logic', doc: 'LIKE — portable SQL pattern matching', scheme: () => mono(fun(p('string'), fun(p('string'), p('bool')))) },
+    // `like` (binary operator) lives in prelude.tetaue as sql_infix "LIKE".
 
     // --- scalar functions ------------------------------------------------
     // `upper`, `lower`, `length` live in prelude.tetaue (they are plain
@@ -214,9 +214,8 @@ export const BUILTIN_SPECS = [
     { name: 'floor', category: 'math', doc: 'FLOOR', scheme: u => poly(u, [tVar], t => fun(t, t)) },
     { name: 'sqrt', category: 'math', doc: 'SQRT', scheme: u => poly(u, [tVar], t => fun(t, t)) },
     { name: 'pow', category: 'math', doc: 'POW', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, p('float')))) },
-    // `div` (integral division) and `mod` are Haskell base; `div` lives in
-    // prelude.tetaue (dialect-branching), `mod` stays a core builtin.
-    { name: 'mod', category: 'math', doc: 'mod a b — integral modulo (Haskell base)', scheme: () => mono(fun(p('int'), fun(p('int'), p('int')))) },
+    // `div`/`mod` (Haskell base) live in prelude.tetaue: div branches on
+    // dialect, mod renders MOD everywhere.
 
     // --- pure list combinators (the list.* namespace) --------------------
     // Pure, in-memory operations over list values — the Haskell base List

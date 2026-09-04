@@ -352,7 +352,9 @@ describe('validation', () => {
     });
 
     test('like requires string operands', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => like u.id "a%")`).join('\n')).toContain('like expects a string expression');
+        // `like` is a prelude definition (`string -> string -> bool`), so a
+        // non-string operand is a static type error caught by inference.
+        expect(allErrors(`${USERS}\nq = users & filter (u => like u.id "a%")`).join('\n')).toContain('cannot apply');
     });
 
     test('aggregates cannot be wrapped by scalar functions', () => {

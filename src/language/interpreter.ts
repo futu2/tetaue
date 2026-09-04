@@ -2492,7 +2492,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     floor: numericUnaryBuiltin('floor'),
     sqrt: numericUnaryBuiltin('sqrt'),
     pow: numericBinaryBuiltin('pow', 'float'),
-    mod: numericBinaryBuiltin('mod', 'first'),
 
     // --- pure list combinators (the list.* namespace) --------------------
     // In-memory operations over `{ kind: 'list' }` values. These are the
@@ -2701,25 +2700,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
 
     // --- strings ----------------------------------------------------------
     reverse: stringFnBuiltin('reverse', 'string'),
-    // --- logical ----------------------------------------------------------
-    like: () => fn('like', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `like expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'like', at ?? arg.ast, ctx)) return ERROR;
-        return fn('like', (patternArg, at2, ctx2) => {
-            const pattern = exprNode(patternArg);
-            if (!pattern || (pattern.type !== 'string' && pattern.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? patternArg.ast, message: `like expects a string pattern, got ${pattern ? `type ${typeName(pattern.type)}` : describe(patternArg)}` });
-                return ERROR;
-            }
-            if (forbid(pattern, ['agg', 'group', 'order'], 'like', at2 ?? patternArg.ast, ctx2)) return ERROR;
-            return mkExpr({ kind: 'bin', op: 'LIKE', left: node, right: pattern, type: 'bool' }, at2);
-        });
-    }),
-
     // --- closed Functor / Applicative / Alternative / Monad operations ----
     fmap: () => fn('fmap', (f, at, ctx) => {
         if (!isApplicable(f)) {

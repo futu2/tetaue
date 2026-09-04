@@ -72,6 +72,10 @@ export right_substring: string -> int -> string = s => n => case sql_dialect.nam
     _        => (sql_func) "RIGHT" [s, n],
 }
 
+# mod renders MOD(a, b) in every dialect; like is a binary operator in SQL.
+export mod: int -> int -> int = a => b => (sql_func) "MOD" [a, b]
+export like: string -> string -> bool = x => p => (sql_infix) "LIKE" x p
+
 # position varies per dialect in BOTH the function name and the argument
 # order, so its lowering branches on the hidden sql_dialect value. The
 # argument-reordered form (POSITION(needle IN value)) is expressed with the
