@@ -96,14 +96,16 @@ once per project (not per dialect), a program rendered for two dialects is
 analyzed once per dialect — the same cost as today's render-only variance.
 
 **Hidden SQL intrinsics for lowering.** The core exposes a small set of
-primitives the SQL prelude composes:
+primitives the SQL prelude composes (implemented):
 
 ```
-sql_func name args...        # emit FUNC(args) — the generic call node
-sql_cast x "target"          # CAST(x AS target)
-sql_dialect                  # the record above (branch on sql_dialect.name,
-                             # read sql_dialect.functions.foo for the mapped name)
+sql_func name [args]        # emit FUNC(args) — the generic call node
+sql_infix op left right     # emit `left op right` (e.g. POSITION(n IN x))
+sql_dialect                 # the record above (branch on sql_dialect.name)
 ```
+
+`sql_cast x "target"` is planned but not implemented — `cast` remains a core
+builtin.
 
 `render.ts`'s `call` case already falls through to `NAME(args)` via
 `ctx.dialect.functions`, so `sql_func` produces the existing IR node and

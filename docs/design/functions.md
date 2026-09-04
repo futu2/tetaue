@@ -194,6 +194,12 @@ numerics: int and float do not mix, like everywhere else in the language).
 
 ## Strings
 
+`trim`, `upper`, `lower`, `length`, and `position` are now ordinary
+`prelude.tetaue` definitions over the `sql_func`/`sql_infix` primitives (see
+the `sql_dialect` mechanism in [sql-dialect.md](sql-dialect.md)) — only
+`reverse` remains a core builtin because sqlite lowers it to a scalar
+recursive CTE.
+
 | tetaue | Trino | PostgreSQL | MySQL | SQLite | Hive |
 |---|---|---|---|---|---|
 | `concat [a, b, ...]` | `CONCAT(a, b, ...)` | Direct | Direct | **Fallback** `a \|\| b` | Direct |
@@ -425,6 +431,16 @@ inlining the `OVER` expression would be invalid SQL.
   returns the per-dialect SQL or `null` to fall through to plain `NAME(args)`;
   `sqlTypeName` maps cast targets per dialect; `dialect.functions` handles
   simple renames (sqlite `ceil` → `CEILING`).
+- **`sql_dialect` (per-dialect lowering in the prelude).** `checkProject` /
+  `analyzeProject` take a `dialect` option (default sqlite); the resolved
+  `DialectView` is seeded as a first-class `sql_dialect` record
+  (`{ name, functions }`) in every module's prelude environment. The prelude
+  branches on `sql_dialect.name` at **analysis time** (literal `==` folds and
+  `case` short-circuits) and composes `sql_func` / `sql_infix` to emit the
+  dialect-specific SQL. Migrated functions: `upper`, `lower`, `length`,
+  `trim`, `position`. `reverse` stays a core builtin (sqlite's scalar
+  recursive-CTE fallback is query-shape). See
+  `docs/design/sql-dialect.md`.
 - `inference.ts` — the prelude is built from the builtin catalog
   (`catalog.ts`, the single source of truth for every scheme);
   `LIST_BUILTINS` applications get per-element kind and arity checks in
