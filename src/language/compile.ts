@@ -198,6 +198,7 @@ export function compileModuleText(
         reexportsByModule: exportsByModule,
         entryBinding: binding,
         prelude,
+        dialect: DIALECTS[dialect],
     });
 
     const all: CompileDiagnostic[] = [];

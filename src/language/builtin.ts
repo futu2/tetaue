@@ -240,6 +240,14 @@ export const BUILTIN_SPECS = [
     { name: 'list_null', category: 'list', doc: 'list.isEmpty xs — true iff the list is empty', scheme: u => poly(u, [aVar], a => fun(listOf(a), p('bool'))) },
     { name: 'list_elem', category: 'list', doc: 'list.elem x xs — whether x appears in xs', scheme: u => poly(u, [aVar], a => fun(a, fun(listOf(a), p('bool')))) },
 
+    // --- generic SQL call builder (prelude lowering) --------------------
+    // `sql_func name [args]` emits an uninterpreted SQL function call. It is
+    // the building block the source prelude uses to express per-dialect
+    // lowerings (branched on the hidden `sql_dialect` value) without a new TS
+    // builtin per function. The result type is left open (`b`) — the prelude
+    // definition that wraps it pins the type at its use site.
+    { name: 'sql_func', category: 'scalar', doc: 'sql_func name [args] — an uninterpreted SQL function call', scheme: u => poly(u, [tVar], t => fun(p('string'), fun(listOf(t), u.fresh()))) },
+
     // --- strings ---------------------------------------------------------
     { name: 'trim', category: 'string', doc: 'TRIM', scheme: () => mono(fun(p('string'), p('string'))) },
     { name: 'reverse', category: 'string', doc: 'REVERSE (dialect fallback where needed)', scheme: () => mono(fun(p('string'), p('string'))) },

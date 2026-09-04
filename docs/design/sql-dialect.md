@@ -1,6 +1,9 @@
 # `sql_dialect` — a first-class per-dialect dictionary
 
-Status: **design** — mechanism specified, not yet implemented.
+Status: **implemented (mechanism)** — the dialect is seeded as a first-class
+value and the prelude can branch on it at analysis time. Full scalar-function
+migration is the follow-up; `position` in particular needs one more step (see
+below).
 
 Goal: make per-dialect SQL lowering a property of a **first-class `sql_dialect`
 value** that `prelude-sql.tetaue` can read, instead of a large bespoke dispatch
@@ -8,7 +11,33 @@ table inside the TypeScript renderer. This is the piece that lets the language
 keep a small pure core and build the SQL surface on top of it (the "SQL should
 not leak" direction), while dialect differences stay a *library* concern.
 
-## The current flow (why it can't work yet)
+## What is implemented
+
+- **`sql_dialect` value.** `analyzeProject`/`checkProject`/`compileModuleText`
+  accept a `dialect` option; the resolved `DialectView` (name + the
+  canonical->SQL function map) is seeded into every module's prelude
+  environment as a record `{ name = "sqlite", functions = {...} }`, typed as a
+  record scheme by the inferencer.
+- **`sql_func` primitive.** `sql_func "NAME" [args]` emits an uninterpreted SQL
+  call node, the building block the prelude composes.
+- **Analysis-time branching.** Literal `==`/`!=` comparisons constant-fold in
+  `evalBinary`, and `case` short-circuits on a literal condition — so
+  `case sql_dialect.name { "mysql" => sql_func "LOCATE" [n, x], ... }` picks
+  the branch during evaluation instead of emitting a runtime SQL `CASE`.
+- **Tests** (`test/dialect.test.ts`): seeding, typing, per-dialect lowering,
+  and the short-circuit behavior.
+
+## The `position` follow-up (why it is not migrated yet)
+
+`position` lowers to `POSITION(needle IN value)` on postgresql/trino — an
+argument-reordered **infix** form, not `NAME(args)`. `sql_func` cannot express
+that shape, so the renderer's `SPECIAL_CALLS` entry for `position` must stay
+until `sql_func` grows an infix/binary form (e.g. a `sql_infix` or an explicit
+operator-name argument). This is the natural next increment; it also needs the
+function's type scheme preserved at the prelude binding (`position : string ->
+string -> int`).
+
+## The current flow (what changed)
 
 Today the dialect reaches the renderer only:
 

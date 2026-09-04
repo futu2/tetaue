@@ -66,6 +66,11 @@ export interface CheckProjectOptions {
      * second evaluator.
      */
     prelude?: ProjectModule;
+    /**
+     * The dialect the prelude's `sql_dialect` value describes. When omitted,
+     * the prelude sees a sqlite-shaped view (matching the CLI default).
+     */
+    dialect?: import('./interpreter.js').DialectView;
 }
 
 /**
@@ -76,11 +81,11 @@ export function checkProject(
     modules: readonly ProjectModule[],
     options: CheckProjectOptions = {},
 ): CheckProjectResult {
-    const { requireQuery = true, requireMain = false, importsByModule = new Map(), entryBinding, prelude } = options;
+    const { requireQuery = true, requireMain = false, importsByModule = new Map(), entryBinding, prelude, dialect } = options;
     const reexportsByModule = options.reexportsByModule ?? new Map<ProjectModule, readonly ResolvedExportEdge[]>();
 
     const inferencer = new Inferencer();
-    inferencer.prelude();
+    inferencer.prelude(dialect);
     const nodeValues = new Map<AstNode, Value>();
 
     // Export maps are filled as each module is processed (diamond imports
@@ -119,7 +124,7 @@ export function checkProject(
         ).scope;
         const scope = new Map(typedScope);
 
-        let env = createPreludeEnv();
+        let env = createPreludeEnv(dialect);
         const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
         const moduleDiagnostics: Diagnostic[] = [
             ...inferencer.takeDiagnostics(),

@@ -275,7 +275,7 @@ export class Inferencer {
      * one list argument, so plain fold entries and non-order sort lambdas are
      * STATIC type errors, not runtime checks.
      */
-    prelude(): void {
+    prelude(dialect?: import('./interpreter.js').DialectView): void {
         for (const spec of BUILTIN_SPECS) {
             const scheme = spec.scheme(this.u);
             const tagged = { ...scheme, type: builtinOf(spec.name, scheme.type) };
@@ -296,6 +296,22 @@ export class Inferencer {
                 type: builtinOf(`operator:${operator}`, type),
             });
         }
+        // The first-class `sql_dialect` value: a record `{ name: string,
+        // functions: { canonical: sqlName } }` the prelude branches on. The
+        // scheme mirrors the seeded interpreter value exactly.
+        const view = dialect ?? { name: 'sqlite', functions: {} };
+        const functionFields: [string, Type][] = [];
+        for (const canonical of Object.keys(view.functions)) {
+            functionFields.push([canonical, prim('string')]);
+        }
+        const sqlDialectType = rowOf([
+            ['name', prim('string')],
+            ['functions', rowOf(functionFields)],
+        ]);
+        this.env.set('sql_dialect', {
+            vars: [],
+            type: builtinOf('sql_dialect', sqlDialectType),
+        });
         // The primitive environment is cloned into every module (see beginModule).
         this.preludeEnv = new Map(this.env);
         // The built-in prelude namespaces (`list.*`, `maybe.*`): maps of each
@@ -912,7 +928,9 @@ export class Inferencer {
         if (property.startsWith(SYNTHETIC_FIELD_PREFIX)) return this.u.fresh();
         let field;
         try {
-            field = this.u.fieldOf(fieldReceiver, property);
+            // Use the peeled row: the receiver may be a builtin-tagged record
+            // (e.g. `sql_dialect`), whose `of` is the row the fields live in.
+            field = this.u.fieldOf(receiverRow, property);
         } catch (err) {
             if (!(err instanceof UnifyError)) throw err;
             field = null; // e.g. extending a rigid (annotated) row tail

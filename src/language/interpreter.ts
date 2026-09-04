@@ -1087,6 +1087,13 @@ function evalBinary(op: string, l: Value, r: Value, at: AstNode, ctx: Ctx): Valu
             ctx.diagnostics.push({ node: at, message: `cannot compare ${typeName(ln.type)} with ${typeName(rn.type)}` });
             return ERROR;
         }
+        // Constant-fold literal comparisons so the prelude can branch on
+        // compile-time values like `sql_dialect.name == "mysql"` and the
+        // `case` short-circuits at analysis time instead of emitting SQL.
+        if (ln.kind === 'lit' && rn.kind === 'lit') {
+            const eq = ln.value === rn.value;
+            return mkExpr(lit(op === '==' ? eq : !eq, 'bool'), at);
+        }
         return mkExpr({ kind: 'bin', op: op === '==' ? '=' : '!=', left: ln, right: rn, type: 'bool' }, at);
     }
 
@@ -1584,11 +1591,23 @@ function evalCase(e: CaseExpression, ctx: Ctx): Value {
             return ERROR;
         }
         if (forbid(cond, ['agg', 'group', 'order'], 'case', b.cond ?? b, ctx)) return ERROR;
+        // Constant-fold a literal condition: the prelude branches on
+        // compile-time values (`sql_dialect.name == "mysql"` folds to a
+        // literal bool), so pick the branch NOW instead of emitting SQL.
+        if (cond.kind === 'lit') {
+            if (cond.value === true) {
+                return value;
+            }
+            continue; // false branch: skip it entirely
+        }
         const v = valueNode(b, value);
         if (!v) return ERROR;
         branches.push({ cond, value: v });
     }
 
+    if (branches.length === 0 && elseValue !== null) {
+        return mkExpr(elseValue, e);
+    }
     const t: SqlType = resultType ?? 'string'; // all-null branches → string, like coalesce
     return mkExpr({ kind: 'case', branches, elseValue, type: t }, e);
 }
@@ -3019,6 +3038,35 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     // --- type conversion --------------------------------------------------
     cast: castBuiltin('cast'),
 
+    // --- generic SQL call builder (prelude lowering) --------------------
+    // `sql_func name [args]` emits an uninterpreted SQL function call. The
+    // source prelude branches on the hidden `sql_dialect` value and composes
+    // dialect-specific lowerings from this primitive, so a per-function
+    // dialect table does not need a new TS builtin per function.
+    sql_func: () => fn('sql_func', (nameArg, at, ctx) => {
+        const name = stringValue(nameArg);
+        if (name === null || name.trim().length === 0) {
+            ctx.diagnostics.push({ node: at ?? nameArg.ast, message: `sql_func expects a non-empty SQL function name string, e.g. sql_func "UPPER" [u.name]` });
+            return ERROR;
+        }
+        return fn('sql_func', (argsArg, at2, ctx2) => {
+            if (argsArg.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? argsArg.ast, message: `sql_func expects a list of arguments, e.g. sql_func "UPPER" [u.name] — got ${describe(argsArg)}` });
+                return ERROR;
+            }
+            const args: SqlNode[] = [];
+            for (const item of argsArg.items) {
+                const node = exprNode(item);
+                if (!node) {
+                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `sql_func arguments must be SQL expressions, got ${describe(item)}` });
+                    return ERROR;
+                }
+                args.push(node);
+            }
+            return mkExpr({ kind: 'call', name, args, type: 'unknown' }, at2 ?? at);
+        });
+    }),
+
     // --- list-argument builtins (homogeneous variadic) -------------------
     // concat [a, b], greatest [a, b], least [a, b] take a single list
     // argument — the sound encoding for variadic functions with ONE element
@@ -3959,6 +4007,17 @@ export interface AnalysisResult {
     diagnostics: Diagnostic[];
 }
 
+/**
+ * The per-dialect surface the prelude can branch on. It is a structural slice
+ * of render.ts's `DialectSpec` (name + the canonical->SQL function map), kept
+ * here so the interpreter does not import render (which imports interpreter).
+ * The prelude seeds a first-class `sql_dialect` record from this.
+ */
+export interface DialectView {
+    name: string;
+    functions: Readonly<Record<string, string>>;
+}
+
 export interface ProjectAnalysisOptions {
     /** Require the last module's last binding to be a query (default true). */
     requireQuery?: boolean;
@@ -3968,10 +4027,15 @@ export interface ProjectAnalysisOptions {
     reexportsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]>;
     /** Optional source standard library, evaluated before the user modules. */
     prelude?: ProjectModule;
+    /**
+     * The dialect the prelude's `sql_dialect` value describes. When omitted,
+     * the prelude sees a sqlite-shaped view (matching the CLI default).
+     */
+    dialect?: DialectView;
 }
 
 /** The primitive environment shared by `analyzeProject` and `checkProject`. */
-export function createPreludeEnv(): Map<string, Value> {
+export function createPreludeEnv(dialect?: DialectView): Map<string, Value> {
     const env = new Map<string, Value>();
     for (const [name, factory] of Object.entries(BUILTINS)) {
         env.set(name, factory());
@@ -3979,6 +4043,17 @@ export function createPreludeEnv(): Map<string, Value> {
     for (const operator of INTRINSIC_OPERATORS) {
         env.set(operatorIntrinsicName(operator), operatorIntrinsicValue(operator));
     }
+    // The first-class `sql_dialect` value the prelude branches on for
+    // per-dialect lowering (hidden intrinsic: reserved, not in BUILTINS).
+    const view = dialect ?? { name: 'sqlite', functions: {} };
+    const functionFields: { key: string; value: Value }[] = [];
+    for (const [canonical, sqlName] of Object.entries(view.functions)) {
+        functionFields.push({ key: canonical, value: mkExpr(lit(sqlName, 'string')) });
+    }
+    env.set('sql_dialect', recordValue([
+        { key: 'name', value: mkExpr(lit(view.name, 'string')) },
+        { key: 'functions', value: recordValue(functionFields) },
+    ]));
     // Built-in prelude namespaces (`list.*`, `maybe.*`): module values whose
     // exports are the pure combinators, so `list.map` / `maybe.isJust`
     // resolve exactly like a qualified import `import "..." as list`.
@@ -4005,7 +4080,7 @@ export function createPreludeEnv(): Map<string, Value> {
  * binding, or its last binding when there is no `main`.
  */
 export function analyzeProject(modules: readonly ProjectModule[], options: ProjectAnalysisOptions = {}): AnalysisResult {
-    const { requireQuery = true, importsByModule = new Map(), reexportsByModule = new Map(), prelude } = options;
+    const { requireQuery = true, importsByModule = new Map(), reexportsByModule = new Map(), prelude, dialect } = options;
     const diagnostics: Diagnostic[] = [];
 
     // Exported bindings per module, keyed by module identity (diamond dedup
@@ -4022,7 +4097,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         // Each module gets its OWN immutable scope: prelude, imports, then
         // local bindings. The environment is threaded through the binding
         // fold; nothing is reassigned on a shared context object.
-        let env = createPreludeEnv();
+        let env = createPreludeEnv(dialect);
         const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
         const moduleDiagnostics: Diagnostic[] = [];
 

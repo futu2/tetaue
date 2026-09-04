@@ -64,7 +64,7 @@ export function render(text: string, dialect: string = 'sqlite', format: RenderF
     const model = parseModel(text);
     const { value, diagnostics } = analyzeProject(
         [{ model, uri: undefined, imports: [] }],
-        { prelude: standardPrelude(services) },
+        { prelude: standardPrelude(services), dialect: DIALECTS[dialect] },
     );
     if (diagnostics.length > 0) {
         throw new Error(`invalid module: ${diagnostics.map(d => d.message).join(' | ')}`);
