@@ -333,10 +333,10 @@ describe('non-portable functions are not in the common prelude', () => {
 
 describe('validation', () => {
     test('numeric functions reject strings', () => {
-        // `ceil` is a prelude definition (`Num t => t -> t`), so a string is a
-        // static type error; `pow` stays a core builtin with a runtime check.
+        // `ceil` and `pow` are now prelude definitions with `Num` constraints,
+        // so a string is a static type error.
         expect(allErrors(`${USERS}\nq = users & map (u => { c = ceil u.name })`).join('\n')).toContain('Num requires a numeric type');
-        expect(errors(`${USERS}\nq = users & map (u => { p = pow u.name 2 })`).join('\n')).toContain('pow expects a numeric expression');
+        expect(allErrors(`${USERS}\nq = users & map (u => { p = pow u.name 2 })`).join('\n')).toContain('Num requires a numeric type');
     });
 
     test('concat rejects non-strings', () => {

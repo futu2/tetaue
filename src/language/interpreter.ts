@@ -2479,9 +2479,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     to_unixtime: unixTimeBuiltin('to_unixtime'),
     from_unixtime: unixTimeBuiltin('from_unixtime'),
 
-    // --- math -------------------------------------------------------------
-    pow: numericBinaryBuiltin('pow', 'float'),
-
     // --- pure list combinators (the list.* namespace) --------------------
     // In-memory operations over `{ kind: 'list' }` values. These are the
     // Haskell base List vocabulary, kept separate from the SQL query steps
@@ -3316,32 +3313,6 @@ function unixTimeBuiltin(name: 'to_unixtime' | 'from_unixtime'): () => Value {
 // Scalar builtins (math, string, logical, null handling, casts) — following
 // teta's general SQL function set; render.ts owns the per-dialect lowering.
 // ---------------------------------------------------------------------------
-
-/**
- * Numeric binary: `pow x y`, `mod x y`.
- * Result type: 'float' for pow (SQL returns a double), 'first' keeps the
- * first operand's type (int % int stays int).
- */
-function numericBinaryBuiltin(name: string, result: 'float' | 'first'): () => Value {
-    return () => fn(name, (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (!isNumeric(node.type) && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects a numeric expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], name, at ?? arg.ast, ctx)) return ERROR;
-        return fn(name, (otherArg, at2, ctx2) => {
-            const other = exprNode(otherArg);
-            if (!other || (!isNumeric(other.type) && other.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? otherArg.ast, message: `${name} expects a numeric expression, got ${other ? `type ${typeName(other.type)}` : describe(otherArg)}` });
-                return ERROR;
-            }
-            if (forbid(other, ['agg', 'group', 'order'], name, at2 ?? otherArg.ast, ctx2)) return ERROR;
-            const t: SqlType = result === 'float' ? 'float' : (node.type === 'float' ? 'float' : 'int');
-            return mkExpr({ kind: 'call', name, args: [node, other], type: t }, at2);
-        });
-    });
-}
 
 /** `cast x "int"` — target type as a string literal. */
 function castBuiltin(name: 'cast'): () => Value {

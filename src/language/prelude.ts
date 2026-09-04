@@ -99,6 +99,7 @@ export ceil: Num t => t -> t = x => case sql_dialect.name {
 }
 export floor: Num t => t -> t = x => (sql_func) "FLOOR" [x]
 export sqrt: Num t => t -> t = x => (sql_func) "SQRT" [x]
+export pow: Num a => Num b => a -> b -> float = x => y => (sql_func) "POW" [x, y]
 
 # position varies per dialect in BOTH the function name and the argument
 # order, so its lowering branches on the hidden sql_dialect value. The

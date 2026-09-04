@@ -209,9 +209,8 @@ export const BUILTIN_SPECS = [
     { name: 'from_unixtime', category: 'date', doc: 'unix seconds to timestamp', scheme: u => poly(u, [tVar], t => fun(p('int'), p('timestamp'))) },
 
     // --- math ------------------------------------------------------------
-    { name: 'pow', category: 'math', doc: 'POW', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, p('float')))) },
-    // `ceil`/`floor`/`sqrt` (and `abs` above) live in prelude.tetaue as
-    // Num-constrained sql_func definitions; `div`/`mod` too.
+    // All math builtins are now prelude definitions: abs/ceil/floor/sqrt
+    // (Num-constrained), pow (Num a => Num b =>), div/mod.
 
     // --- pure list combinators (the list.* namespace) --------------------
     // Pure, in-memory operations over list values — the Haskell base List
