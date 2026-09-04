@@ -103,9 +103,8 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         stringLiteral: quoteSingleQuoted,
         functions: {
             coalesce: 'COALESCE',
-            abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
+            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'JSON_GROUP_ARRAY', // sqlite has no array type — a JSON array is the closest list
-            ceil: 'CEILING', // sqlite has CEILING, not CEIL
         },
     },
     postgresql: {
@@ -115,7 +114,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         stringLiteral: quoteSingleQuoted,
         functions: {
             coalesce: 'COALESCE',
-            abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
+            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'ARRAY_AGG',
         },
     },
@@ -130,7 +129,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         stringLiteral: quoteMysql,
         functions: {
             coalesce: 'COALESCE',
-            abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
+            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'JSON_ARRAYAGG',
         },
     },
@@ -142,7 +141,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         stringLiteral: quoteSingleQuoted,
         functions: {
             coalesce: 'COALESCE',
-            abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
+            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'ARRAY_AGG',
         },
     },
@@ -158,7 +157,7 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         stringLiteral: quoteMysql,
         functions: {
             coalesce: 'COALESCE',
-            abs: 'ABS', count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
+            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'COLLECT_LIST',
         },
     },

@@ -10,7 +10,6 @@ export const TetaueTerminals = {
     WS: /\s+/,
     COMMENT: /#[^\r\n]*/,
     OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\?|\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/,
-    CORE_ID: /@[a-zA-Z][\w_]*/,
     ARG_ID: /(?=([_a-zA-Z][\w_]*))\1(?![ \t\r\n]*[:=])/,
     ID: /[_a-zA-Z][\w_]*/,
     NUMBER: /[0-9]+(\.[0-9]*)?/,
@@ -69,7 +68,6 @@ export type TetaueKeywordNames =
     | "null"
     | "query"
     | "true"
-    | "type"
     | "{"
     | "|"
     | "||"
@@ -219,6 +217,23 @@ export function isCaseExpression(item: unknown): item is CaseExpression {
     return reflection.isInstance(item, CaseExpression.$type);
 }
 
+export interface ConstrainedType extends langium.AstNode {
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
+    readonly $type: 'ConstrainedType';
+    constraints: Array<TypeConstraint>;
+    type: Type;
+}
+
+export const ConstrainedType = {
+    $type: 'ConstrainedType',
+    constraints: 'constraints',
+    type: 'type'
+} as const;
+
+export function isConstrainedType(item: unknown): item is ConstrainedType {
+    return reflection.isInstance(item, ConstrainedType.$type);
+}
+
 export interface Export extends langium.AstNode {
     readonly $container: Model;
     readonly $type: 'Export';
@@ -257,7 +272,7 @@ export function isExpression(item: unknown): item is Expression {
 }
 
 export interface FunType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
     readonly $type: 'FunType';
     left: TypeAtom;
     right: Type;
@@ -395,7 +410,7 @@ export function isListLiteral(item: unknown): item is ListLiteral {
 }
 
 export interface ListType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
     readonly $type: 'ListType';
     type: Type;
 }
@@ -448,15 +463,13 @@ export interface Model extends langium.AstNode {
     bindings: Array<Binding>;
     exports: Array<Export>;
     imports: Array<Import>;
-    types: Array<TypeAlias>;
 }
 
 export const Model = {
     $type: 'Model',
     bindings: 'bindings',
     exports: 'exports',
-    imports: 'imports',
-    types: 'types'
+    imports: 'imports'
 } as const;
 
 export function isModel(item: unknown): item is Model {
@@ -506,25 +519,8 @@ export function isOperatorSection(item: unknown): item is OperatorSection {
     return reflection.isInstance(item, OperatorSection.$type);
 }
 
-export interface QualifiedTypeName extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
-    readonly $type: 'QualifiedTypeName';
-    name: string;
-    receiver: string;
-}
-
-export const QualifiedTypeName = {
-    $type: 'QualifiedTypeName',
-    name: 'name',
-    receiver: 'receiver'
-} as const;
-
-export function isQualifiedTypeName(item: unknown): item is QualifiedTypeName {
-    return reflection.isInstance(item, QualifiedTypeName.$type);
-}
-
 export interface QueryType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
     readonly $type: 'QueryType';
     fields: Array<RecordField>;
     tail?: string;
@@ -558,7 +554,7 @@ export function isRecordField(item: unknown): item is RecordField {
 }
 
 export interface RecordType extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
     readonly $type: 'RecordType';
     fields: Array<RecordField>;
     tail?: string;
@@ -589,7 +585,7 @@ export function isStringLiteral(item: unknown): item is StringLiteral {
     return reflection.isInstance(item, StringLiteral.$type);
 }
 
-export type Type = FunType | ListType | QualifiedTypeName | QueryType | RecordType | TypeAtom | TypeHole | TypeParen | TypeVar;
+export type Type = ConstrainedType | FunType | ListType | QueryType | RecordType | TypeAtom | TypeHole | TypeParen | TypeVar;
 
 export const Type = {
     $type: 'Type'
@@ -599,27 +595,8 @@ export function isType(item: unknown): item is Type {
     return reflection.isInstance(item, Type.$type);
 }
 
-export interface TypeAlias extends langium.AstNode {
-    readonly $container: Model;
-    readonly $type: 'TypeAlias';
-    export: boolean;
-    name: string;
-    type: Type;
-}
-
-export const TypeAlias = {
-    $type: 'TypeAlias',
-    export: 'export',
-    name: 'name',
-    type: 'type'
-} as const;
-
-export function isTypeAlias(item: unknown): item is TypeAlias {
-    return reflection.isInstance(item, TypeAlias.$type);
-}
-
 export interface TypeAtom extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
     readonly $type: 'TypeAtom';
     base?: Type;
     maybeType?: Type;
@@ -635,8 +612,25 @@ export function isTypeAtom(item: unknown): item is TypeAtom {
     return reflection.isInstance(item, TypeAtom.$type);
 }
 
+export interface TypeConstraint extends langium.AstNode {
+    readonly $container: ConstrainedType;
+    readonly $type: 'TypeConstraint';
+    name: string;
+    var: string;
+}
+
+export const TypeConstraint = {
+    $type: 'TypeConstraint',
+    name: 'name',
+    var: 'var'
+} as const;
+
+export function isTypeConstraint(item: unknown): item is TypeConstraint {
+    return reflection.isInstance(item, TypeConstraint.$type);
+}
+
 export interface TypeHole extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
     readonly $type: 'TypeHole';
     name: string;
 }
@@ -651,7 +645,7 @@ export function isTypeHole(item: unknown): item is TypeHole {
 }
 
 export interface TypeParen extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
     readonly $type: 'TypeParen';
     type: Type;
 }
@@ -666,7 +660,7 @@ export function isTypeParen(item: unknown): item is TypeParen {
 }
 
 export interface TypeVar extends langium.AstNode {
-    readonly $container: Ascription | Binding | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAlias | TypeAtom | TypeParen;
+    readonly $container: Ascription | Binding | ConstrainedType | FunType | LambdaParam | LetExpression | ListType | RecordField | TypeAtom | TypeParen;
     readonly $type: 'TypeVar';
     name: string;
 }
@@ -714,6 +708,7 @@ export type TetaueAstType = {
     BooleanLiteral: BooleanLiteral
     CaseBranch: CaseBranch
     CaseExpression: CaseExpression
+    ConstrainedType: ConstrainedType
     Export: Export
     Expr: Expr
     Expression: Expression
@@ -732,14 +727,13 @@ export type TetaueAstType = {
     NullLiteral: NullLiteral
     NumberLiteral: NumberLiteral
     OperatorSection: OperatorSection
-    QualifiedTypeName: QualifiedTypeName
     QueryType: QueryType
     RecordField: RecordField
     RecordType: RecordType
     StringLiteral: StringLiteral
     Type: Type
-    TypeAlias: TypeAlias
     TypeAtom: TypeAtom
+    TypeConstraint: TypeConstraint
     TypeHole: TypeHole
     TypeParen: TypeParen
     TypeVar: TypeVar
@@ -868,6 +862,19 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                 }
             },
             superTypes: [Expr.$type]
+        },
+        ConstrainedType: {
+            name: ConstrainedType.$type,
+            properties: {
+                constraints: {
+                    name: ConstrainedType.constraints,
+                    defaultValue: []
+                },
+                type: {
+                    name: ConstrainedType.type
+                }
+            },
+            superTypes: [Type.$type]
         },
         Export: {
             name: Export.$type,
@@ -1059,11 +1066,6 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                     name: Model.imports,
                     defaultValue: [],
                     optional: true
-                },
-                types: {
-                    name: Model.types,
-                    defaultValue: [],
-                    optional: true
                 }
             },
             superTypes: []
@@ -1091,18 +1093,6 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                 }
             },
             superTypes: [Expr.$type]
-        },
-        QualifiedTypeName: {
-            name: QualifiedTypeName.$type,
-            properties: {
-                name: {
-                    name: QualifiedTypeName.name
-                },
-                receiver: {
-                    name: QualifiedTypeName.receiver
-                }
-            },
-            superTypes: [Type.$type]
         },
         QueryType: {
             name: QueryType.$type,
@@ -1161,23 +1151,6 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
             },
             superTypes: []
         },
-        TypeAlias: {
-            name: TypeAlias.$type,
-            properties: {
-                export: {
-                    name: TypeAlias.export,
-                    defaultValue: false,
-                    optional: true
-                },
-                name: {
-                    name: TypeAlias.name
-                },
-                type: {
-                    name: TypeAlias.type
-                }
-            },
-            superTypes: []
-        },
         TypeAtom: {
             name: TypeAtom.$type,
             properties: {
@@ -1191,6 +1164,18 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                 }
             },
             superTypes: [Type.$type]
+        },
+        TypeConstraint: {
+            name: TypeConstraint.$type,
+            properties: {
+                name: {
+                    name: TypeConstraint.name
+                },
+                var: {
+                    name: TypeConstraint.var
+                }
+            },
+            superTypes: []
         },
         TypeHole: {
             name: TypeHole.$type,

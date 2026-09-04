@@ -31,6 +31,14 @@ not leak" direction), while dialect differences stay a *library* concern.
 - `upper`, `lower`, `length`, `trim` — no per-dialect variance, plain
   `sql_func "UPPER"/"LOWER"/"LENGTH"/"TRIM"` wrappers with precise
   annotations.
+- `replace`, `mod` — no per-dialect variance; `like` is a binary operator
+  (`sql_infix "LIKE"`).
+- `div`, `left_substring`/`right_substring` — vary by dialect and
+  branch on `sql_dialect.name`.
+- `abs`, `ceil`, `floor`, `sqrt` — **polymorphic** math unaries, now expressible
+  because binding annotations accept a Haskell-style typeclass context:
+  `abs: Num t => t -> t = x => (sql_func) "ABS" [x]`. The `Num` bound keeps
+  `abs u.name` a static error (verified).
 - `position` — varies per dialect in BOTH the function name and the argument
   order. The prelude branches on `sql_dialect.name` and composes the
   argument-reordered `POSITION(needle IN value)` form with the `sql_infix`

@@ -2374,15 +2374,8 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     not_in_query: inQueryBuiltin(true),
 
     // --- string & scalar functions --------------------------------------
-    abs: () => fn('abs', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (!isNumeric(node.type) && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `abs expects a numeric expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'abs', at ?? arg.ast, ctx)) return ERROR;
-        return mkExpr({ kind: 'call', name: 'abs', args: [node], type: node.type as SqlType }, at);
-    }),
+    // `abs`/`ceil`/`floor`/`sqrt` live in prelude.tetaue (Num-constrained
+    // sql_func definitions).
     coalesce: () => fn('coalesce', (arg1, at1, ctx) => {
         // Variadic list form: coalesce [a, b, c].
         if (arg1.kind === 'list') {
@@ -2487,10 +2480,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     from_unixtime: unixTimeBuiltin('from_unixtime'),
 
     // --- math -------------------------------------------------------------
-    // add/sub/mul/div are the `+ - * /` operators; mod is a curried builtin.
-    ceil: numericUnaryBuiltin('ceil'),
-    floor: numericUnaryBuiltin('floor'),
-    sqrt: numericUnaryBuiltin('sqrt'),
     pow: numericBinaryBuiltin('pow', 'float'),
 
     // --- pure list combinators (the list.* namespace) --------------------
@@ -3327,19 +3316,6 @@ function unixTimeBuiltin(name: 'to_unixtime' | 'from_unixtime'): () => Value {
 // Scalar builtins (math, string, logical, null handling, casts) — following
 // teta's general SQL function set; render.ts owns the per-dialect lowering.
 // ---------------------------------------------------------------------------
-
-/** Numeric unary: `ceil x`, `floor x`, `sqrt x` — result keeps the input type. */
-function numericUnaryBuiltin(name: string): () => Value {
-    return () => fn(name, (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (!isNumeric(node.type) && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects a numeric expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], name, at ?? arg.ast, ctx)) return ERROR;
-        return mkExpr({ kind: 'call', name, args: [node], type: node.type as SqlType }, at);
-    });
-}
 
 /**
  * Numeric binary: `pow x y`, `mod x y`.

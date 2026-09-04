@@ -22,14 +22,14 @@ import {
     isLetExpression, isListLiteral, isListType,
     isMapLiteral, isNullLiteral, isOperatorSection,
     isNumberLiteral, isQueryType, isRecordType, isStringLiteral, isTypeAtom, isTypeHole, isTypeParen,
-    isTypeVar, isUnaryMinus,
+    isConstrainedType, isTypeVar, isUnaryMinus,
     type Binding, type CaseExpression, type Expr, type Lambda, type MapEntry, type Model,
 } from './generated/ast.js';
 import type { Type as LangiumType } from './generated/ast.js';
 import {
     ConstraintError, TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
     builtinOf, fun, isTypeClassInstance, listOf, maybeOf, modeOf, modePayload, nullExtendedMaybeOf, prim, queryOf, rowOf, truthType,
-    type ScalarTypeClass,
+    type ScalarTypeClass, type TypeClass,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
@@ -2866,6 +2866,26 @@ export class Inferencer {
             return this.u.fresh();
         }
         if (isTypeHole(t)) return this.typeHole(t.name, names);
+        if (isConstrainedType(t)) {
+            // `Num t => t -> t` — apply each typeclass constraint to its type
+            // variable, then translate the body with those vars in scope.
+            for (const c of t.constraints) {
+                const classNames: readonly TypeClass[] = ['Num', 'Frac', 'Eq', 'Ord', 'DateTime', 'Semigroup', 'Monoid', 'Functor', 'Applicative', 'Alternative', 'Monad'];
+                if (!classNames.includes(c.name as TypeClass)) {
+                    this.diag(c, `unknown typeclass '${c.name}' — the closed typeclasses are: ${classNames.join(', ')}`);
+                    continue;
+                }
+                const tv = this.typeOrRowVar(c.var, 'type', rigid, names, rigidVars);
+                try {
+                    this.u.constrain(tv, c.name as TypeClass);
+                } catch (err) {
+                    if (err instanceof ConstraintError) {
+                        this.diag(c, `'${c.name}' does not apply here`);
+                    } else if (!(err instanceof UnifyError)) throw err;
+                }
+            }
+            return this.translateType(t.type, rigid, names, rigidVars);
+        }
         if (isFunType(t)) return fun(this.translateType(t.left, rigid, names, rigidVars), this.translateType(t.right, rigid, names, rigidVars));
         if (isListType(t)) return listOf(this.translateType(t.type, rigid, names, rigidVars));
         if (isRecordType(t)) {

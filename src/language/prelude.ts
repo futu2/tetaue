@@ -90,6 +90,16 @@ export right_substring: string -> int -> string = s => n => case sql_dialect.nam
 export mod: int -> int -> int = a => b => (sql_func) "MOD" [a, b]
 export like: string -> string -> bool = x => p => (sql_infix) "LIKE" x p
 
+# Polymorphic math unaries carry a Num typeclass constraint, so abs u.name
+# is a static error. The lowering is a plain function call in every dialect.
+export abs: Num t => t -> t = x => (sql_func) "ABS" [x]
+export ceil: Num t => t -> t = x => case sql_dialect.name {
+    "sqlite" => (sql_func) "CEILING" [x],
+    _        => (sql_func) "CEIL" [x],
+}
+export floor: Num t => t -> t = x => (sql_func) "FLOOR" [x]
+export sqrt: Num t => t -> t = x => (sql_func) "SQRT" [x]
+
 # position varies per dialect in BOTH the function name and the argument
 # order, so its lowering branches on the hidden sql_dialect value. The
 # argument-reordered form (POSITION(needle IN value)) is expressed with the

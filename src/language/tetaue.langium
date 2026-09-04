@@ -12,8 +12,9 @@
  *   - implicit lambdas: a parenthesized expression using `this`/`that` sugar
  *     for the first/second implicit row parameters: `filter (this.active)` is
  *     `u => u.active`, and a two-row lambda is `(this.id == that.user_id)`
- *   - SQL primitives use reserved `@` names (for example `@table`); public
- *     names such as `table` and `filter` are ordinary prelude bindings
+ *   - SQL primitives are the builtin vocabulary: `table`, `filter`, `map`
+ *     and the scalar type names are native names; the source prelude
+ *     builds ordinary bindings on top of them.
  * Operators: `&` is the pipeline (`a & f` ⇔ `f a`), `$` is right-associative
  * application (`f $ a` ⇔ `f a`), and `<<<`/`>>>` compose functions point-free.
  * Semantics follow teta (https://github.com/futu2/teta): immutable queries,
@@ -35,19 +36,15 @@
 
 grammar Tetaue
 
-// One flat prefix loop: `import`/`export ... from` statements, `type` aliases,
-// and bindings may interleave (they all share the optional `export` keyword).
-// A single loop — not separate `*` groups — lets the parser backtrack:
-// `export * from` / `export { a } from` are re-exports, `export type` is an
-// alias, and `export name = ...` is a binding.
+// One flat prefix loop: `import`/`export ... from` statements and bindings
+// may interleave (they share the optional `export` keyword). A single loop —
+// not separate `*` groups — lets the parser backtrack: `export * from` /
+// `export { a } from` are re-exports, and `export name = ...` is a binding.
+// There are no user-declared types or type aliases: the type vocabulary is
+// builtin-only (the scalar primitives plus the anonymous record / query /
+// list / maybe / arrow constructors), so a module can only bind values.
 entry Model:
-    (imports+=Import | exports+=Export | types+=TypeAlias | bindings+=Binding)*;
-
-// `type Name = T` — a module-local type alias. Aliases are expanded during
-// type inference and schema decoding; declaration order matters and aliases
-// may not be recursive.
-TypeAlias:
-    (export?='export')? 'type' name=(ID | ARG_ID) '=' type=Type;
+    (imports+=Import | exports+=Export | bindings+=Binding)*;
 
 // `import "path.tetaue"` brings the module's exported bindings into the
 // current scope; `import "path.tetaue" as t` binds only the namespace `t`,
@@ -102,10 +99,21 @@ Ascription:
 //   unsolved metavariable that must be filled by unification at a use site
 //   (a bare `table "t"` gets a fresh row hole per table expression).
 //   `->` is right-associative. Unknown names are errors reported by inference.
+//   The type vocabulary is BUILTIN ONLY: the scalar primitives (`int`,
+//   `float`, `decimal`, `string`, `bool`, `date`, `timestamp`) plus the
+//   anonymous record / query / list / maybe / arrow constructors. There is
+//   no user-declared type and no type alias — a module can only bind values.
 // ---------------------------------------------------------------------------
 Type:
-    {infer FunType} left=TypeAtom '->' right=Type
+    {infer ConstrainedType} constraints+=TypeConstraint (',' constraints+=TypeConstraint)* '=>' type=Type
+    | {infer FunType} left=TypeAtom '->' right=Type
     | TypeAtom;
+
+// A typeclass constraint in an annotation: `Num t => t -> t`,
+// `DateTime t => t -> int`. The class name is a bare identifier; the
+// variable must be a lowercase type variable (or a hole).
+TypeConstraint:
+    name=(ID | ARG_ID) var=(ID | ARG_ID | HOLE);
 
 TypeAtom:
     base=BaseType
@@ -116,8 +124,7 @@ BaseType infers Type:
     | QueryType
     | {infer ListType} '[' type=Type ']'
     | {infer TypeHole} name=HOLE
-    | {infer TypeVar} name=(ID | ARG_ID | CORE_ID)
-    | {infer QualifiedTypeName} receiver=(ID | ARG_ID) '.' name=(ID | ARG_ID | CORE_ID)
+    | {infer TypeVar} name=(ID | ARG_ID)
     | {infer TypeParen} '(' type=Type ')';
 
 RecordType:
@@ -199,7 +206,7 @@ Application infers Expr:
 Argument infers Expr:
     {infer Lambda} '(' param=LambdaParam ')' '=>' body=Expression
     | Atom ({infer AccessExpression.receiver=current} '.' property=(ID | ARG_ID | OP_SECTION | STRING))+
-    | {infer Identifier} name=(ARG_ID | CORE_ID)
+    | {infer Identifier} name=ARG_ID
     | {infer OperatorSection} value=OP_SECTION
     | {infer NumberLiteral} value=NUMBER
     | {infer StringLiteral} value=STRING
@@ -226,7 +233,7 @@ Atom infers Expr:
     | '(' Expression ')';
 
 Identifier infers Expr:
-    {infer Identifier} name=(ID | ARG_ID | CORE_ID);
+    {infer Identifier} name=(ID | ARG_ID);
 
 // `case { cond => value, ..., _ => value }` — SQL CASE WHEN as a first-class
 // expression. Each branch maps a boolean condition to a value; the final
@@ -259,10 +266,6 @@ hidden terminal COMMENT: /#[^\r\n]*/;
 // `1 + 2`. This must precede ID: named sections such as `_div_` are otherwise
 // valid identifiers.
 terminal OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\?|\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/;
-
-// Core SQL primitives are inaccessible through ordinary names. The standard
-// prelude aliases `filter = @filter`, etc. before user modules are checked.
-terminal CORE_ID: /@[a-zA-Z][\w_]*/;
 
 // A bare identifier usable as an application argument: any identifier NOT
 // followed by `=`. The lookahead keeps bindings comma-free — `filter adult`

@@ -333,7 +333,9 @@ describe('non-portable functions are not in the common prelude', () => {
 
 describe('validation', () => {
     test('numeric functions reject strings', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { c = ceil u.name })`).join('\n')).toContain('ceil expects a numeric expression');
+        // `ceil` is a prelude definition (`Num t => t -> t`), so a string is a
+        // static type error; `pow` stays a core builtin with a runtime check.
+        expect(allErrors(`${USERS}\nq = users & map (u => { c = ceil u.name })`).join('\n')).toContain('Num requires a numeric type');
         expect(errors(`${USERS}\nq = users & map (u => { p = pow u.name 2 })`).join('\n')).toContain('pow expects a numeric expression');
     });
 
@@ -358,7 +360,9 @@ describe('validation', () => {
     });
 
     test('aggregates cannot be wrapped by scalar functions', () => {
-        expect(errors(`${USERS}\nq = users & fold (u => { x = ceil (count u.id) })`).join('\n')).toContain('ceil cannot contain aggregates');
+        // `ceil` is now a prelude definition; wrapping `count u.id` leaves the
+        // fold entry non-aggregate, which the fold checker rejects.
+        expect(allErrors(`${USERS}\nq = users & fold (u => { x = ceil (count u.id) })`).join('\n')).toContain("fold entry 'x' must be wrapped in an aggregate");
     });
 
     test('array is an aggregate: rejected outside fold', () => {

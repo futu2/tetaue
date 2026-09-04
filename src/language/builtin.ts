@@ -183,9 +183,8 @@ export const BUILTIN_SPECS = [
     // `like` (binary operator) lives in prelude.tetaue as sql_infix "LIKE".
 
     // --- scalar functions ------------------------------------------------
-    // `upper`, `lower`, `length` live in prelude.tetaue (they are plain
-    // `sql_func "UPPER"/"LOWER"/"LENGTH"` wrappers with precise annotations).
-    { name: 'abs', category: 'math', doc: 'ABS', scheme: u => poly(u, [tVar], t => fun(t, t)) },
+    // `upper`, `lower`, `length`, `trim` live in prelude.tetaue; `abs`,
+    // `ceil`, `floor`, `sqrt` live there too (Num-constrained, sql_func).
     { name: 'coalesce', category: 'scalar', doc: 'COALESCE', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))) },
 
     // --- date & time -----------------------------------------------------
@@ -210,12 +209,9 @@ export const BUILTIN_SPECS = [
     { name: 'from_unixtime', category: 'date', doc: 'unix seconds to timestamp', scheme: u => poly(u, [tVar], t => fun(p('int'), p('timestamp'))) },
 
     // --- math ------------------------------------------------------------
-    { name: 'ceil', category: 'math', doc: 'CEIL', scheme: u => poly(u, [tVar], t => fun(t, t)) },
-    { name: 'floor', category: 'math', doc: 'FLOOR', scheme: u => poly(u, [tVar], t => fun(t, t)) },
-    { name: 'sqrt', category: 'math', doc: 'SQRT', scheme: u => poly(u, [tVar], t => fun(t, t)) },
     { name: 'pow', category: 'math', doc: 'POW', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, p('float')))) },
-    // `div`/`mod` (Haskell base) live in prelude.tetaue: div branches on
-    // dialect, mod renders MOD everywhere.
+    // `ceil`/`floor`/`sqrt` (and `abs` above) live in prelude.tetaue as
+    // Num-constrained sql_func definitions; `div`/`mod` too.
 
     // --- pure list combinators (the list.* namespace) --------------------
     // Pure, in-memory operations over list values — the Haskell base List
