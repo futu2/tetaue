@@ -2374,9 +2374,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     not_in_query: inQueryBuiltin(true),
 
     // --- string & scalar functions --------------------------------------
-    upper: stringFnBuiltin('upper', 'string'),
-    lower: stringFnBuiltin('lower', 'string'),
-    length: stringFnBuiltin('length', 'int'),
     abs: () => fn('abs', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node || (!isNumeric(node.type) && node.type !== 'unknown')) {

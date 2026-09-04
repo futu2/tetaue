@@ -165,10 +165,11 @@ describe('list namespace', () => {
         expect(list?.kind).toBe('module');
         if (!list || list.kind !== 'module') return;
         // The unqualified query steps and scalar builtins stay in place —
-        // `map`/`filter`/`take`/`drop`/`length`/`reverse`/`concat`/`sum`
-        // remain the relational/SQL words — and the namespace adds the pure
-        // list spellings without replacing them.
-        for (const name of ['map', 'filter', 'take', 'drop', 'length', 'reverse', 'concat', 'sum']) {
+        // `map`/`filter`/`take`/`drop`/`reverse`/`concat`/`sum` remain the
+        // relational/SQL words — and the namespace adds the pure list
+        // spellings without replacing them. (`length` moved from a core
+        // builtin to a prelude export; it is covered below.)
+        for (const name of ['map', 'filter', 'take', 'drop', 'reverse', 'concat', 'sum']) {
             expect(env.has(name)).toBe(true);
             expect(env.get(name)).not.toBe(list.exports.get(name));
         }
@@ -177,6 +178,10 @@ describe('list namespace', () => {
         for (const publicName of Object.keys(listNamespace)) {
             expect(list.exports.has(publicName)).toBe(true);
         }
+        // `length` is no longer a core builtin — it is a prelude export that
+        // still resolves unqualified (list.length stays the namespace form).
+        expect(env.has('length')).toBe(false);
+        expect(standardPreludeNames(services)).toContain('length');
     });
 
     test('a pipeline can mix list.* and the relational query steps without collision', () => {

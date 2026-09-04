@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { errors, render, buildDocument, services, parseModel } from './helpers.ts';
+import { allErrors, errors, render, buildDocument, services, parseModel } from './helpers.ts';
 
 const USERS = `users: query {
     id: int,
@@ -90,7 +90,10 @@ describe('semantic errors', () => {
     });
 
     test('string functions require strings', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { x = upper u.age })`).join('\n')).toContain('upper expects a string expression');
+        // `upper` is a prelude definition (`string -> string`), so passing a
+        // non-string is a static type error (caught by inference) rather than
+        // a runtime check.
+        expect(allErrors(`${USERS}\nq = users & map (u => { x = upper u.age })`).join('\n')).toContain('cannot apply');
     });
 
     test('sum requires numeric', () => {

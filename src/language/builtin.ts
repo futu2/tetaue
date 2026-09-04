@@ -183,9 +183,8 @@ export const BUILTIN_SPECS = [
     { name: 'like', category: 'logic', doc: 'LIKE — portable SQL pattern matching', scheme: () => mono(fun(p('string'), fun(p('string'), p('bool')))) },
 
     // --- scalar functions ------------------------------------------------
-    { name: 'upper', category: 'scalar', doc: 'UPPER', scheme: () => mono(fun(p('string'), p('string'))) },
-    { name: 'lower', category: 'scalar', doc: 'LOWER', scheme: () => mono(fun(p('string'), p('string'))) },
-    { name: 'length', category: 'scalar', doc: 'LENGTH', scheme: () => mono(fun(p('string'), p('int'))) },
+    // `upper`, `lower`, `length` live in prelude.tetaue (they are plain
+    // `sql_func "UPPER"/"LOWER"/"LENGTH"` wrappers with precise annotations).
     { name: 'abs', category: 'math', doc: 'ABS', scheme: u => poly(u, [tVar], t => fun(t, t)) },
     { name: 'coalesce', category: 'scalar', doc: 'COALESCE', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))) },
 

@@ -8,36 +8,29 @@
 import type { TetaueServices } from './tetaue-module.js';
 import type { Model } from './generated/ast.js';
 import type { ProjectModule } from './imports.js';
-import { BUILTIN_NAMES, CORE_TYPE_NAMES } from './builtin.js';
 
 /** Source for the built-in standard library module. */
 export const STANDARD_PRELUDE_SOURCE = [
-'# The public language surface is ordinary source; only @ names are core.',
-'# Scalar types are aliases for the reserved core type namespace.',
-...CORE_TYPE_NAMES.map(name => `export type ${name} = @${name}`),
-'',
-'# Public SQL functions are ordinary aliases of the reserved core namespace.',
-...BUILTIN_NAMES.map(name => `export ${name} = @${name}`),
+'# The standard library is intentionally ordinary tetaue code. SQL',
+'# primitives and scalar types are native builtin names; only reusable',
+'# functional definitions live here.',
 '',
 `
-# The standard library is intentionally ordinary tetaue code. Keep SQL
-# implementation primitives in the TypeScript core and put reusable
-# functional definitions here.
 export _>>>_ = f => g => x => g (f x)
 export _<<<_ = f => g => x => f (g x)
-export _*_ = @op_multiply
-export _/_ = @op_divide
-export _+_ = @op_add
-export _-_ = @op_subtract
-export _<>_ = @op_merge
-export _==_ = @op_equal
-export _!=_ = @op_not_equal
-export _<_ = @op_less_than
-export _<=_ = @op_less_than_or_equal
-export _>_ = @op_greater_than
-export _>=_ = @op_greater_than_or_equal
-export _&&_ = @op_and
-export _||_ = @op_or
+export _*_ = op_multiply
+export _/_ = op_divide
+export _+_ = op_add
+export _-_ = op_subtract
+export _<>_ = op_merge
+export _==_ = op_equal
+export _!=_ = op_not_equal
+export _<_ = op_less_than
+export _<=_ = op_less_than_or_equal
+export _>_ = op_greater_than
+export _>=_ = op_greater_than_or_equal
+export _&&_ = op_and
+export _||_ = op_or
 export _?_ = x => d => from_maybe d x
 export _&_ = x => f => f x
 export _$_ = f => x => f x
@@ -60,6 +53,13 @@ export pipe = f => g => x => g (f x)
 export is_nothing = is_null
 export is_just = x => not (is_null x)
 export is_not_null = is_just
+
+# Scalar SQL functions with no per-dialect variance are ordinary prelude
+# definitions over the sql_func primitive, not core builtins. The precise
+# annotation keeps their type exact (length is int, not a fresh variable).
+export upper: string -> string = x => (sql_func) "UPPER" [x]
+export lower: string -> string = x => (sql_func) "LOWER" [x]
+export length: string -> int = x => (sql_func) "LENGTH" [x]
 `.trimStart(),
 ].join('\n');
 
@@ -95,11 +95,4 @@ export function standardPreludeNames(services: TetaueServices): readonly string[
     return standardPrelude(services).model.bindings
         .filter(binding => binding.export)
         .map(binding => binding.name);
-}
-
-/** Public type names supplied by the source prelude. */
-export function standardPreludeTypeNames(services: TetaueServices): readonly string[] {
-    return standardPrelude(services).model.types
-        .filter(alias => alias.export)
-        .map(alias => alias.name);
 }
