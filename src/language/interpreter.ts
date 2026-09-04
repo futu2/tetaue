@@ -2701,7 +2701,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     })),
 
     // --- strings ----------------------------------------------------------
-    trim: stringFnBuiltin('trim', 'string'),
     reverse: stringFnBuiltin('reverse', 'string'),
     position: () => fn('position', (arg, at, ctx) => {
         const node = exprNode(arg);

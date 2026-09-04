@@ -248,7 +248,9 @@ export const BUILTIN_SPECS = [
     { name: 'sql_func', category: 'scalar', doc: 'sql_func name [args] — an uninterpreted SQL function call', scheme: u => poly(u, [tVar], t => fun(p('string'), fun(listOf(t), u.fresh()))) },
 
     // --- strings ---------------------------------------------------------
-    { name: 'trim', category: 'string', doc: 'TRIM', scheme: () => mono(fun(p('string'), p('string'))) },
+    // `trim` lives in prelude.tetaue (a plain `sql_func "TRIM"` wrapper).
+    // `reverse` stays a core builtin: sqlite lowers it to a recursive CTE,
+    // which sql_func cannot express yet (see sql-dialect.md).
     { name: 'reverse', category: 'string', doc: 'REVERSE (dialect fallback where needed)', scheme: () => mono(fun(p('string'), p('string'))) },
     { name: 'position', category: 'string', doc: 'POSITION / LOCATE / INSTR', scheme: () => mono(fun(p('string'), fun(p('string'), p('int')))) },
     { name: 'replace', category: 'string', doc: 'REPLACE', scheme: () => mono(fun(p('string'), fun(p('string'), fun(p('string'), p('string'))))) },

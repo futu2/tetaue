@@ -46,3 +46,4 @@ export is_not_null = is_just
 export upper: string -> string = x => (sql_func) "UPPER" [x]
 export lower: string -> string = x => (sql_func) "LOWER" [x]
 export length: string -> int = x => (sql_func) "LENGTH" [x]
+export trim: string -> string = x => (sql_func) "TRIM" [x]
