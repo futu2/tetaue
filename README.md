@@ -237,6 +237,14 @@ resolves the scoped `_+_` function defined by the prelude. See
 [`docs/design/core.md`](docs/design/core.md) for the boundary and extension
 rules.
 
+Per-dialect lowering is also a prelude concern: `checkProject` seeds a
+first-class `sql_dialect` value (name + the canonical→SQL function map), and
+no-variance scalar functions such as `upper`/`lower`/`length`/`trim`/`position`
+are ordinary prelude definitions over `sql_func`/`sql_infix` that branch on
+`sql_dialect.name` at analysis time. `toUpper`/`toLower` are provided as
+Haskell-flavored spellings. See
+[`docs/design/sql-dialect.md`](docs/design/sql-dialect.md).
+
 Numeric literals are polymorphic, Haskell-`fromIntegral`-style: `1 : Num t => t`
 (int | float | decimal) and `1.5 : Frac t => t` (float | decimal), so a plain
 `1` adapts to its context — `o.total + 1` works when `total: decimal`, and
