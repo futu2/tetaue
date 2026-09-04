@@ -58,9 +58,9 @@ describe('sql_dialect', () => {
     test('branches at analysis time: per-dialect lowering via case + sql_func', () => {
         const src = USERS + `
             position = x => n => case sql_dialect.name {
-                "mysql"  => (sql_func) "LOCATE" [n, x],
-                "sqlite" => (sql_func) "INSTR" [x, n],
-                _        => (sql_func) "POSITION" [n, x],
+                "mysql"  => sql_func "LOCATE" [n, x],
+                "sqlite" => sql_func "INSTR" [x, n],
+                _        => sql_func "POSITION" [n, x],
             }
             main = users & map (u => { p = position u.name "a" })
         `;
@@ -85,18 +85,21 @@ describe('sql_dialect', () => {
     });
 
     test('sql_func emits an uninterpreted call node', () => {
-        const src = USERS + `main = users & map (u => { n = (sql_func) "UPPER" [u.name] })`;
+        const src = USERS + `main = users & map (u => { n = sql_func "UPPER" [u.name] })`;
         expect(render(src, 'trino')).toContain(`UPPER(name)`);
     });
 
     test('sql_bare emits an unquoted SQL word, unlike a string literal', () => {
-        // NOTE: (sql_bare) is an atom, so a nested application argument needs
-        // double parens — ((sql_bare) "YEAR") — or it binds to the enclosing
-        // application (same reason `(sql_infix) "IN" n x` needs identifier
-        // operands in the position/div prelude definitions).
+        // Function-position parens are pure style (sql_func "EXTRACT" [...]
+        // is identical). What IS required is argument-position grouping: a
+        // parenthesized atom in argument position ((sql_bare)) stays one
+        // argument, but a nested application must be wrapped whole
+        // (((sql_bare) "YEAR")) or it splits into sibling arguments of the
+        // enclosing call — the same reason sql_infix "IN" n x is passed as a
+        // list element above.
         const src = USERS + `
             events: query { happened_at: date } = table "events"
-            main = events & map (e => { y = (sql_func) "EXTRACT" [((sql_infix) "FROM") ((sql_bare) "YEAR") e.happened_at] })
+            main = events & map (e => { y = sql_func "EXTRACT" [((sql_infix) "FROM") ((sql_bare) "YEAR") e.happened_at] })
         `;
         expect(render(src, 'postgresql')).toContain(`EXTRACT(YEAR FROM happened_at)`);
         expect(render(src, 'postgresql')).not.toContain(`'YEAR'`);

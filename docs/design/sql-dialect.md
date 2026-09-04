@@ -1,11 +1,13 @@
 # `sql_dialect` — a first-class per-dialect dictionary
 
 Status: **implemented** — the dialect is seeded as a first-class value, the
-prelude branches on it at analysis time, and `upper`/`lower`/`length`/`trim`/
-`position` have migrated out of the TS core into `prelude.tetaue`.
+prelude branches on it at analysis time, and the scalar family (`upper`/`lower`/
+`length`/`trim`/`replace`/`mod`/`like`/`div`/`left_substring`/`right_substring`/
+`abs`/`ceil`/`floor`/`sqrt`/`pow`/`position`) has migrated out of the TS core
+into `prelude.tetaue`.
 
 Goal: make per-dialect SQL lowering a property of a **first-class `sql_dialect`
-value** that `prelude-sql.tetaue` can read, instead of a large bespoke dispatch
+value** that `prelude.tetaue` can read, instead of a large bespoke dispatch
 table inside the TypeScript renderer. This is the piece that lets the language
 keep a small pure core and build the SQL surface on top of it (the "SQL should
 not leak" direction), while dialect differences stay a *library* concern.
@@ -42,7 +44,7 @@ not leak" direction), while dialect differences stay a *library* concern.
   branch on `sql_dialect.name`.
 - `abs`, `ceil`, `floor`, `sqrt` — **polymorphic** math unaries, now expressible
   because binding annotations accept a Haskell-style typeclass context:
-  `abs: Num t => t -> t = x => (sql_func) "ABS" [x]`. The `Num` bound keeps
+  `abs: Num t => t -> t = x => sql_func "ABS" [x]`. The `Num` bound keeps
   `abs u.name` a static error (verified).
 - `position` — varies per dialect in BOTH the function name and the argument
   order. The prelude branches on `sql_dialect.name` and composes the
@@ -50,10 +52,10 @@ not leak" direction), while dialect differences stay a *library* concern.
   primitive:
   ```
   export position: string -> string -> int = x => n => case sql_dialect.name {
-      "postgresql" => (sql_func) "POSITION" [(sql_infix) "IN" n x],
-      "trino"      => (sql_func) "POSITION" [(sql_infix) "IN" n x],
-      "mysql"      => (sql_func) "LOCATE" [n, x],
-      _            => (sql_func) "INSTR" [x, n],
+      "postgresql" => sql_func "POSITION" [sql_infix "IN" n x],
+      "trino"      => sql_func "POSITION" [sql_infix "IN" n x],
+      "mysql"      => sql_func "LOCATE" [n, x],
+      _            => sql_func "INSTR" [x, n],
   }
   ```
   The renderer's `SPECIAL_CALLS` entry and `case 'position'` are gone.
@@ -123,13 +125,16 @@ sql_dialect                 # the record above (branch on sql_dialect.name)
 `quoteIdentifier`, which would quote the reserved word and break `EXTRACT`.
 `bare` renders the word as-is.
 
-**Grammar gotcha (learned while wiring `sql_bare`).** A parenthesized
-expression is an *atom*, so a nested application argument does not group on its
-own: `(sql_infix) "FROM" (sql_bare) "YEAR" x` passes `(sql_bare)`, `"YEAR"`,
-and `x` as three separate arguments of `sql_infix`. Nested applications need
-double parens — `((sql_infix) "FROM") ((sql_bare) "YEAR") x` — or identifier
-operands, which is why the migrated `position`/`div` definitions pass plain
-lambda parameters into `sql_infix`.
+**Grammar gotcha (learned while wiring `sql_bare`).** Function-position parens
+around a bare name are pure style — `sql_func "UPPER" [x]` and
+`(sql_func) "UPPER" [x]` parse and lower identically, so the prelude writes the
+Haskell form. Parens are only load-bearing in *argument* position: an argument
+is an atom, so a parenthesized atom (`(sql_bare)`) is one argument but a
+nested application does not group on its own —
+`sql_infix "FROM" (sql_bare) "YEAR" x` passes `(sql_bare)`, `"YEAR"`, and `x`
+as three separate arguments of `sql_infix`. A nested application argument must
+be wrapped whole: `sql_func "EXTRACT" [((sql_infix) "FROM") ((sql_bare)
+"YEAR") x]`.
 
 `sql_cast` reuses the existing per-dialect CAST lowering, so a prelude
 definition can compose it (e.g. SQLite's `CAST(STRFTIME('%Y', x) AS INTEGER)`
@@ -145,7 +150,7 @@ whose per-dialect lowering is currently bespoke — `position` is ideal
 (`POSITION(x IN n)` PG/Trino, `LOCATE(n, x)` MySQL, `INSTR(x, n)` SQLite/Hive):
 
 ```
-# prelude-sql.tetaue
+# prelude.tetaue
 export position = x => n => case sql_dialect.name {
     "mysql"  => sql_func "LOCATE" n x,
     "sqlite" => sql_func "INSTR" x n,
@@ -228,7 +233,7 @@ function-name* surface.
 - **Shadowing.** `sql_dialect` must be a reserved hidden intrinsic so a user
   binding cannot override it (same mechanism as `op_add`).
 - **No user-facing `sql_dialect` in the base prelude.** It lives in
-  `prelude-sql.tetaue`; the base prelude never mentions a dialect, preserving
+  `prelude.tetaue`; the base prelude never mentions a dialect, preserving
   the "no SQL leak" property.
 
 ## Naming direction (resolved)
@@ -247,7 +252,7 @@ public names:
 ## Success criteria
 
 - `position` across `trino`, `postgresql`, `mysql`, `sqlite`, `hive` renders
-  correctly with its logic living in `prelude-sql.tetaue` and no `position`
+  correctly with its logic living in `prelude.tetaue` and no `position`
   entry in `render.ts` special cases.
 - `renderCall`/`DATE_FUNCTIONS`/`SPECIAL_CALLS` shrink to the irreducible
   query-shape set.

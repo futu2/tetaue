@@ -46,7 +46,7 @@ describe('dialect capability preflight', () => {
     test('bare SqlNodes (sql_bare) traverse the capability walker without noise', () => {
         const query = queryOf(`
             events: query { happened_at: date } = table "events"
-            q = events & map (e => { y = (sql_func) "EXTRACT" [((sql_infix) "FROM") ((sql_bare) "YEAR") e.happened_at] })
+            q = events & map (e => { y = sql_func "EXTRACT" [((sql_infix) "FROM") ((sql_bare) "YEAR") e.happened_at] })
         `);
         for (const dialect of ['sqlite', 'mysql', 'trino', 'postgresql', 'hive'] as const) {
             const d = DIALECTS[dialect]!;

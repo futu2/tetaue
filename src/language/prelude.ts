@@ -59,10 +59,10 @@ export is_not_null = is_just
 # annotation keeps their type exact (length is int, not a fresh variable).
 # The public spellings are Haskell-flavored (toUpper/toLower); the SQL-named
 # exports remain as aliases for compatibility.
-export toUpper: string -> string = x => (sql_func) "UPPER" [x]
-export toLower: string -> string = x => (sql_func) "LOWER" [x]
-export length: string -> int = x => (sql_func) "LENGTH" [x]
-export trim: string -> string = x => (sql_func) "TRIM" [x]
+export toUpper: string -> string = x => sql_func "UPPER" [x]
+export toLower: string -> string = x => sql_func "LOWER" [x]
+export length: string -> int = x => sql_func "LENGTH" [x]
+export trim: string -> string = x => sql_func "TRIM" [x]
 
 # SQL-named aliases, kept for compatibility with existing code.
 export upper = toUpper
@@ -71,45 +71,45 @@ export lower = toLower
 # More monomorphic scalar lowerings. replace has no per-dialect variance;
 # div (integral division) and left_substring/right_substring vary by
 # dialect and branch on the hidden sql_dialect value.
-export replace: string -> string -> string -> string = s => f => r => (sql_func) "REPLACE" [s, f, r]
+export replace: string -> string -> string -> string = s => f => r => sql_func "REPLACE" [s, f, r]
 export div: int -> int -> int = a => b => case sql_dialect.name {
-    "mysql" => (sql_infix) "DIV" a b,
-    "hive"  => (sql_infix) "DIV" a b,
-    _       => (sql_infix) "/" a b,
+    "mysql" => sql_infix "DIV" a b,
+    "hive"  => sql_infix "DIV" a b,
+    _       => sql_infix "/" a b,
 }
 export left_substring: string -> int -> string = s => n => case sql_dialect.name {
-    "sqlite" => (sql_func) "SUBSTR" [s, 1, n],
-    _        => (sql_func) "LEFT" [s, n],
+    "sqlite" => sql_func "SUBSTR" [s, 1, n],
+    _        => sql_func "LEFT" [s, n],
 }
 export right_substring: string -> int -> string = s => n => case sql_dialect.name {
-    "sqlite" => (sql_func) "SUBSTR" [s, (-n)],
-    _        => (sql_func) "RIGHT" [s, n],
+    "sqlite" => sql_func "SUBSTR" [s, (-n)],
+    _        => sql_func "RIGHT" [s, n],
 }
 
 # mod renders MOD(a, b) in every dialect; like is a binary operator in SQL.
-export mod: int -> int -> int = a => b => (sql_func) "MOD" [a, b]
-export like: string -> string -> bool = x => p => (sql_infix) "LIKE" x p
+export mod: int -> int -> int = a => b => sql_func "MOD" [a, b]
+export like: string -> string -> bool = x => p => sql_infix "LIKE" x p
 
 # Polymorphic math unaries carry a Num typeclass constraint, so abs u.name
 # is a static error. The lowering is a plain function call in every dialect.
-export abs: Num t => t -> t = x => (sql_func) "ABS" [x]
+export abs: Num t => t -> t = x => sql_func "ABS" [x]
 export ceil: Num t => t -> t = x => case sql_dialect.name {
-    "sqlite" => (sql_func) "CEILING" [x],
-    _        => (sql_func) "CEIL" [x],
+    "sqlite" => sql_func "CEILING" [x],
+    _        => sql_func "CEIL" [x],
 }
-export floor: Num t => t -> t = x => (sql_func) "FLOOR" [x]
-export sqrt: Num t => t -> t = x => (sql_func) "SQRT" [x]
-export pow: Num a => Num b => a -> b -> float = x => y => (sql_func) "POW" [x, y]
+export floor: Num t => t -> t = x => sql_func "FLOOR" [x]
+export sqrt: Num t => t -> t = x => sql_func "SQRT" [x]
+export pow: Num a => Num b => a -> b -> float = x => y => sql_func "POW" [x, y]
 
 # position varies per dialect in BOTH the function name and the argument
 # order, so its lowering branches on the hidden sql_dialect value. The
 # argument-reordered form (POSITION(needle IN value)) is expressed with the
 # sql_infix primitive.
 export position: string -> string -> int = x => n => case sql_dialect.name {
-    "postgresql" => (sql_func) "POSITION" [(sql_infix) "IN" n x],
-    "trino"      => (sql_func) "POSITION" [(sql_infix) "IN" n x],
-    "mysql"      => (sql_func) "LOCATE" [n, x],
-    _            => (sql_func) "INSTR" [x, n],
+    "postgresql" => sql_func "POSITION" [sql_infix "IN" n x],
+    "trino"      => sql_func "POSITION" [sql_infix "IN" n x],
+    "mysql"      => sql_func "LOCATE" [n, x],
+    _            => sql_func "INSTR" [x, n],
 }
 `.trimStart(),
 ].join('\n');
