@@ -62,6 +62,12 @@ export lower: string -> string = x => (sql_func) "LOWER" [x]
 export length: string -> int = x => (sql_func) "LENGTH" [x]
 export trim: string -> string = x => (sql_func) "TRIM" [x]
 
+# Haskell-flavored spellings (Data.Char/Data.List style). These are aliases
+# for now, so the SQL-named exports stay available; whether they become
+# canonical is a naming decision left open.
+export toUpper = upper
+export toLower = lower
+
 # position varies per dialect in BOTH the function name and the argument
 # order, so its lowering branches on the hidden sql_dialect value. The
 # argument-reordered form (POSITION(needle IN value)) is expressed with the
