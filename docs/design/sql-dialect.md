@@ -1,9 +1,8 @@
 # `sql_dialect` — a first-class per-dialect dictionary
 
-Status: **implemented (mechanism)** — the dialect is seeded as a first-class
-value and the prelude can branch on it at analysis time. Full scalar-function
-migration is the follow-up; `position` in particular needs one more step (see
-below).
+Status: **implemented** — the dialect is seeded as a first-class value, the
+prelude branches on it at analysis time, and `upper`/`lower`/`length`/`trim`/
+`position` have migrated out of the TS core into `prelude.tetaue`.
 
 Goal: make per-dialect SQL lowering a property of a **first-class `sql_dialect`
 value** that `prelude-sql.tetaue` can read, instead of a large bespoke dispatch
@@ -27,31 +26,46 @@ not leak" direction), while dialect differences stay a *library* concern.
 - **Tests** (`test/dialect.test.ts`): seeding, typing, per-dialect lowering,
   and the short-circuit behavior.
 
-## The `position` follow-up (why it is not migrated yet)
+## What has migrated
 
-`position` lowers to `POSITION(needle IN value)` on postgresql/trino — an
-argument-reordered **infix** form, not `NAME(args)`. `sql_func` cannot express
-that shape, so the renderer's `SPECIAL_CALLS` entry for `position` must stay
-until `sql_func` grows an infix/binary form (e.g. a `sql_infix` or an explicit
-operator-name argument). This is the natural next increment; it also needs the
-function's type scheme preserved at the prelude binding (`position : string ->
-string -> int`).
+- `upper`, `lower`, `length`, `trim` — no per-dialect variance, plain
+  `sql_func "UPPER"/"LOWER"/"LENGTH"/"TRIM"` wrappers with precise
+  annotations.
+- `position` — varies per dialect in BOTH the function name and the argument
+  order. The prelude branches on `sql_dialect.name` and composes the
+  argument-reordered `POSITION(needle IN value)` form with the `sql_infix`
+  primitive:
+  ```
+  export position: string -> string -> int = x => n => case sql_dialect.name {
+      "postgresql" => (sql_func) "POSITION" [(sql_infix) "IN" n x],
+      "trino"      => (sql_func) "POSITION" [(sql_infix) "IN" n x],
+      "mysql"      => (sql_func) "LOCATE" [n, x],
+      _            => (sql_func) "INSTR" [x, n],
+  }
+  ```
+  The renderer's `SPECIAL_CALLS` entry and `case 'position'` are gone.
 
-## The current flow (what changed)
+- `reverse` stays a core builtin: sqlite lowers it to a **scalar recursive
+  CTE**, which is query-shape, not a scalar call — `sql_func`/`sql_infix`
+  cannot express it.
 
-Today the dialect reaches the renderer only:
+## The implemented flow
+
+The dialect is threaded into analysis, so the prelude sees it during
+evaluation:
 
 ```
 cli --dialect sqlite
   └─ compileModuleText(..., { dialect })
-       └─ analyzeProject(...)        # evaluation: dialect NOT available
-       └─ renderQuery(query, DIALECTS['sqlite'])   # dialect used here
+       └─ checkProject(..., { dialect: DIALECTS['sqlite'] })   # seeds sql_dialect
+       └─ renderQuery(query, DIALECTS['sqlite'])               # renderer still lowers
 ```
 
-`analyzeProject` / `checkProject` evaluate the prelude and user code with no
-knowledge of the dialect, so nothing in `prelude.tetaue` can branch on it. All
-dialect logic lives in `render.ts` (`DialectSpec.functions`, `renderCall`,
-`DATE_FUNCTIONS`, `SPECIAL_CALLS`) and `capabilities.ts`.
+`analyzeProject` / `checkProject` seed a first-class `sql_dialect` record into
+every module's prelude environment, so `prelude.tetaue` can branch on
+`sql_dialect.name` at analysis time. The renderer keeps the query-shape
+lowering (`renderCall`, `DATE_FUNCTIONS`, joins, windows, `case`); scalar
+function-name and argument-order choices have moved into the prelude.
 
 ## Design
 

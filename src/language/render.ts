@@ -498,7 +498,7 @@ const SPECIAL_CALLS = new Set<BuiltinName>([
     'date_add', 'date_diff', 'date_trunc', 'date_format', 'date_parse',
     'to_unixtime', 'from_unixtime',
     // scalar family
-    'concat', 'greatest', 'least', 'substring', 'position', 'reverse', 'left_substring', 'right_substring',
+    'concat', 'greatest', 'least', 'substring', 'reverse', 'left_substring', 'right_substring',
     'lpad', 'rpad', 'cast',
     'from_maybe', 'is_true', 'is_false', 'is_unknown', 'div',
 ]);
@@ -530,12 +530,6 @@ function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): s
             const len = node.args[2] ? x(2) : null;
             if (d === 'sqlite') return len ? `SUBSTR(${x()}, ${x(1)}, ${len})` : `SUBSTR(${x()}, ${x(1)})`;
             return len ? `SUBSTRING(${x()}, ${x(1)}, ${len})` : `SUBSTRING(${x()}, ${x(1)})`;
-        }
-        case 'position': {
-            // position(value, needle) — SQL's POSITION(needle IN value)
-            if (d === 'postgresql' || d === 'trino') return `POSITION(${x(1)} IN ${x()})`;
-            if (d === 'mysql') return `LOCATE(${x(1)}, ${x()})`;
-            return `INSTR(${x()}, ${x(1)})`; // sqlite, hive
         }
         case 'reverse':
             if (d === 'sqlite') {

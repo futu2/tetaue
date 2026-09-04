@@ -61,6 +61,17 @@ export upper: string -> string = x => (sql_func) "UPPER" [x]
 export lower: string -> string = x => (sql_func) "LOWER" [x]
 export length: string -> int = x => (sql_func) "LENGTH" [x]
 export trim: string -> string = x => (sql_func) "TRIM" [x]
+
+# position varies per dialect in BOTH the function name and the argument
+# order, so its lowering branches on the hidden sql_dialect value. The
+# argument-reordered form (POSITION(needle IN value)) is expressed with the
+# sql_infix primitive.
+export position: string -> string -> int = x => n => case sql_dialect.name {
+    "postgresql" => (sql_func) "POSITION" [(sql_infix) "IN" n x],
+    "trino"      => (sql_func) "POSITION" [(sql_infix) "IN" n x],
+    "mysql"      => (sql_func) "LOCATE" [n, x],
+    _            => (sql_func) "INSTR" [x, n],
+}
 `.trimStart(),
 ].join('\n');
 

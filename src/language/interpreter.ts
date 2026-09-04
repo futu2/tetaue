@@ -2702,23 +2702,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
 
     // --- strings ----------------------------------------------------------
     reverse: stringFnBuiltin('reverse', 'string'),
-    position: () => fn('position', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `position expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'position', at ?? arg.ast, ctx)) return ERROR;
-        return fn('position', (needleArg, at2, ctx2) => {
-            const needle = exprNode(needleArg);
-            if (!needle || (needle.type !== 'string' && needle.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? needleArg.ast, message: `position expects a string pattern, got ${needle ? `type ${typeName(needle.type)}` : describe(needleArg)}` });
-                return ERROR;
-            }
-            if (forbid(needle, ['agg', 'group', 'order'], 'position', at2 ?? needleArg.ast, ctx2)) return ERROR;
-            return mkExpr({ kind: 'call', name: 'position', args: [node, needle], type: 'int' }, at2);
-        });
-    }),
     replace: () => fn('replace', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
@@ -3061,6 +3044,23 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             }
             return mkExpr({ kind: 'call', name, args, type: 'unknown' }, at2 ?? at);
         });
+    }),
+
+    sql_infix: () => fn('sql_infix', (opArg, at, ctx) => {
+        const op = stringValue(opArg);
+        if (op === null || op.trim().length === 0) {
+            ctx.diagnostics.push({ node: at ?? opArg.ast, message: `sql_infix expects a non-empty SQL operator string, e.g. sql_infix "IN" n x` });
+            return ERROR;
+        }
+        return fn('sql_infix', (leftArg, at2, ctx2) => fn('sql_infix', (rightArg, at3, ctx3) => {
+            const left = exprNode(leftArg);
+            const right = exprNode(rightArg);
+            if (!left || !right) {
+                ctx3.diagnostics.push({ node: at3 ?? leftArg.ast, message: `sql_infix operands must be SQL expressions, got ${describe(leftArg)} and ${describe(rightArg)}` });
+                return ERROR;
+            }
+            return mkExpr({ kind: 'bin', op, left, right, type: 'bool' }, at3 ?? at);
+        }));
     }),
 
     // --- list-argument builtins (homogeneous variadic) -------------------

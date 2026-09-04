@@ -246,13 +246,17 @@ export const BUILTIN_SPECS = [
     // builtin per function. The result type is left open (`b`) — the prelude
     // definition that wraps it pins the type at its use site.
     { name: 'sql_func', category: 'scalar', doc: 'sql_func name [args] — an uninterpreted SQL function call', scheme: u => poly(u, [tVar], t => fun(p('string'), fun(listOf(t), u.fresh()))) },
+    // `sql_infix op left right` emits an uninterpreted infix SQL expression
+    // (`left op right`, e.g. `sql_infix "IN" n x` -> `n IN x`). Composed with
+    // sql_func it expresses argument-reordered forms such as `position`'s
+    // `POSITION(needle IN value)` for postgresql/trino.
+    { name: 'sql_infix', category: 'scalar', doc: 'sql_infix op left right — an uninterpreted infix SQL expression (left op right)', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(p('string'), fun(a, fun(b, p('bool'))))) },
 
     // --- strings ---------------------------------------------------------
     // `trim` lives in prelude.tetaue (a plain `sql_func "TRIM"` wrapper).
     // `reverse` stays a core builtin: sqlite lowers it to a recursive CTE,
     // which sql_func cannot express yet (see sql-dialect.md).
     { name: 'reverse', category: 'string', doc: 'REVERSE (dialect fallback where needed)', scheme: () => mono(fun(p('string'), p('string'))) },
-    { name: 'position', category: 'string', doc: 'POSITION / LOCATE / INSTR', scheme: () => mono(fun(p('string'), fun(p('string'), p('int')))) },
     { name: 'replace', category: 'string', doc: 'REPLACE', scheme: () => mono(fun(p('string'), fun(p('string'), fun(p('string'), p('string'))))) },
     { name: 'left_substring', category: 'string', doc: 'LEFT / SUBSTR', scheme: () => mono(fun(p('string'), fun(p('int'), p('string')))) },
 
