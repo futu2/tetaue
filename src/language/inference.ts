@@ -499,7 +499,25 @@ export class Inferencer {
             this.diag(b, missingBindingExpressionMessage(b.name));
             return;
         }
-        const inferred = this.inferExpr(b.value, this.env);
+        // A binding annotation supplies an unannotated lambda's parameter
+        // type: `f: string -> string = x => x` types the body against
+        // `string` (bidirectional), the same way an explicit `(x: string)`
+        // parameter annotation does.
+        let inferred: Type;
+        const bindingValue = b.value as Expr;
+        // A lambda value parses as an empty Application wrapping the Lambda
+        // (`x => x` -> Application(func=Lambda, args=[])); unwrap it.
+        const valueCore = this.unwrapApplicationExpr(bindingValue);
+        if (b.type && valueCore && isLambda(valueCore) && !valueCore.param?.type) {
+            const annDomain = this.translateType(b.type);
+            const domain = annDomain.kind === 'fun' ? annDomain.from : undefined;
+            const codomain = annDomain.kind === 'fun' ? annDomain.to : undefined;
+            inferred = domain
+                ? this.inferLambda(valueCore, this.env, domain, codomain)
+                : this.inferExpr(bindingValue, this.env);
+        } else {
+            inferred = this.inferExpr(bindingValue, this.env);
+        }
         let t = inferred;
         if (b.type) {
             const ann = this.translateType(b.type);
@@ -773,18 +791,40 @@ export class Inferencer {
         return this.inferExpr(e, env);
     }
 
-    private inferLambda(e: import('./generated/ast.js').Lambda, env: Map<string, Scheme>): Type {
+    private inferLambda(e: import('./generated/ast.js').Lambda, env: Map<string, Scheme>, expectedParam?: Type, expectedResult?: Type): Type {
         const p = e.param!;
         const newEnv = new Map(env);
         const rigidVars: number[] = [];
         let paramType: Type;
         if (p.type) {
             paramType = this.translateType(p.type, true, new Map(), rigidVars); // annotation vars are rigid inside the body
+        } else if (expectedParam) {
+            // A binding annotation supplies the lambda's parameter type
+            // (`f: string -> string = x => x` types the body against
+            // `string`). Rigidify its variables so the body cannot extend an
+            // open row beyond what the annotation declares, then release them
+            // at the use site (the annotation still generalizes).
+            paramType = expectedParam;
+            for (const id of this.u.freeVars(paramType)) {
+                rigidVars.push(id);
+                this.u.setVarRigid(id, true);
+            }
         } else {
             paramType = this.u.fresh('flex');
         }
         newEnv.set(p.name ?? '', { vars: [], type: paramType });
         const body = this.inferExpr(e.body as unknown as UnaryExpression, newEnv);
+        // The binding annotation's codomain is also a signature: bind the
+        // body's fresh result (e.g. a `sql_func` call's open type) to the
+        // declared result, so `f: string -> int = x => sql_func "LENGTH" [x]`
+        // types the call as int.
+        if (expectedResult !== undefined) {
+            try {
+                this.u.unify(body, expectedResult);
+            } catch (err) {
+                if (!(err instanceof UnifyError)) throw err;
+            }
+        }
         // Release the rigidity of annotated params: the body must only use the
         // annotated fields, but at USE the row must still absorb extra fields.
         for (const id of rigidVars) this.u.setVarRigid(id, false);

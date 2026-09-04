@@ -298,12 +298,17 @@ describe('nullability', () => {
 // Type annotations
 // ---------------------------------------------------------------------------
 
-describe('type aliases', () => {
-    test('module-local aliases expand in query schemas and signatures', () => {
-        const src = `type UserRow = query { id: int, name: string, age: int }
-type AdultRow = { age: int | r }
-adult: AdultRow -> bool = u => u.age >= 18
-users: UserRow = table "users"
+describe('types are builtin-only', () => {
+    test('user type aliases are rejected at parse time', () => {
+        // There is no `type Name = T` form in the grammar: types are the
+        // builtin scalars plus the anonymous constructors only.
+        const parsed = services.parser.LangiumParser.parse('type UserRow = query { id: int }');
+        expect(parsed.parserErrors.length).toBeGreaterThan(0);
+    });
+
+    test('inline anonymous types still type-check', () => {
+        const src = `adult: { age: int | r } -> bool = u => u.age >= 18
+users: query { id: int, name: string, age: int } = table "users"
 q = users & filter (adult) & map (u => { id, name })`;
         expect(typeErrors(src)).toEqual([]);
         const model = parseModel(src);
@@ -314,10 +319,6 @@ q = users & filter (adult) & map (u => { id, name })`;
         );
         const usersBinding = model.bindings.find(b => b.name === 'users')!;
         expect(result.typeOf(usersBinding)).toBe('query { age: int, id: int, name: string }');
-    });
-
-    test('recursive aliases are diagnosed, not expanded forever', () => {
-        expect(typeErrors(`type A = A\nt: A = table "t"\nq = t`).join('\n')).toContain("recursive type alias 'A'");
     });
 });
 
@@ -334,8 +335,11 @@ describe('annotations and ascription', () => {
     });
 
     test('binding annotation missing the used field is an error', () => {
+        // The bidirectional annotation check types the lambda body against
+        // the annotation's row, so accessing an undeclared field is caught at
+        // the access with the available fields listed.
         const messages = typeErrors(`${USERS}\nadult: { a: int | r } -> bool = u => u.age >= 18\nq = users & filter (adult)`);
-        expect(messages.join('\n')).toContain('does not match inferred type');
+        expect(messages.join('\n')).toContain("unknown column 'age' — available: a");
     });
 
     test('lambda-parameter annotations check the body against the annotation', () => {
