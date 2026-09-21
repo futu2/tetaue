@@ -18,38 +18,33 @@
  ******************************************************************************/
 
 export type PrimName = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' | 'timestamp';
-export type ScalarTypeClass = 'Num' | 'Frac' | 'Eq' | 'Ord' | 'DateTime' | 'Semigroup' | 'Monoid';
-export type ContainerTypeClass = 'Functor' | 'Applicative' | 'Alternative' | 'Monad';
-export type TypeClass = ScalarTypeClass | ContainerTypeClass;
 
-const TYPE_CLASS_INSTANCES: Readonly<Record<ScalarTypeClass, ReadonlySet<PrimName>>> = {
-    Num: new Set(['int', 'float', 'decimal']),
-    Frac: new Set(['float', 'decimal']),
-    Eq: new Set(['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']),
-    Ord: new Set(['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']),
-    // Calendar-valued scalars: the input/output class of the date family
-    // (extract, date_add, date_diff, date_trunc, date_format, to_unixtime).
-    DateTime: new Set(['date', 'timestamp']),
-    Semigroup: new Set(['string']),
-    Monoid: new Set(['string']),
+/**
+ * Numeric literals stay *category* variables even though the language has no
+ * type classes: a literal is resolved lazily to whatever numeric primitive
+ * its context demands, falling back to the category default when nothing
+ * demands anything. This keeps `u.balance / 2` working on a `float` column
+ * and refuses `u.age + 1.5` on an `int` column, exactly as the old
+ * `Num`/`Frac` constraints did — but the rule lives in unification, not in a
+ * class table.
+ */
+export type LiteralCategory = 'num' | 'frac' | 'decimal';
+
+interface LiteralCategoryInfo {
+    /** The concrete primitives this literal may still resolve to. */
+    candidates: readonly PrimName[];
+    /** The primitive it becomes when nothing constrains it. */
+    fallback: PrimName;
+}
+
+const LITERAL_CATEGORIES: Readonly<Record<LiteralCategory, LiteralCategoryInfo>> = {
+    // `1` — any numeric primitive.
+    num: { candidates: ['int', 'float', 'decimal'], fallback: 'int' },
+    // `1.5` — a fractional primitive, never int.
+    frac: { candidates: ['float', 'decimal'], fallback: 'float' },
+    // `1.5d` — an explicit decimal literal.
+    decimal: { candidates: ['decimal'], fallback: 'decimal' },
 };
-
-/** Whether a primitive type implements one of the compiler-owned classes. */
-export function isTypeClassInstance(constraint: ScalarTypeClass, type: PrimName): boolean {
-    return TYPE_CLASS_INSTANCES[constraint].has(type);
-}
-
-/** Closed higher-kinded instances supported by the current runtime. */
-export type FunctorName = 'maybe' | 'list' | 'query';
-
-export function isFunctorInstance(name: FunctorName): boolean {
-    return name === 'maybe' || name === 'list' || name === 'query';
-}
-
-export function isContainerTypeClassInstance(constraint: ContainerTypeClass, name: FunctorName): boolean {
-    if (constraint === 'Functor') return isFunctorInstance(name);
-    return name === 'maybe' || name === 'list';
-}
 
 export type Type =
     | { kind: 'var'; id: number }
@@ -82,9 +77,26 @@ export type Type =
     /** A group-mode expression (`group o.user_id`). Transparent in unification. */
     | { kind: 'group'; of: Type }
     /** A window-only expression (`row_number`, `lag`, ...) that must be wrapped by `over`. */
-    | { kind: 'window'; of: Type };
+    | { kind: 'window'; of: Type }
+    /**
+     * An overload set: one name bound to several definitions distinguished by
+     * type (`abs : int -> int`, `abs : float -> float`, ...). It is transparent
+     * to the value-level evaluator — `selectOverload` picks the alternative
+     * whose arguments the actual ones unify with — but it is what makes
+     * name overloading expressible WITHOUT type classes, so a base library can
+     * declare `ceil` once per numeric type instead of relying on a `Num`
+     * constraint the compiler owns.
+     */
+    | { kind: 'overload'; alternatives: readonly Type[] };
 
 export type VarKind = 'type' | 'row';
+
+/** A rollback point for a speculative unification run (overload trials). */
+export interface UniverseSnapshot {
+    bindings: Map<number, Type>;
+    infos: Map<number, VarInfo>;
+    nextId: number;
+}
 
 export interface VarInfo {
     /** Kind once pinned by a row/type constraint; 'flex' until then. */
@@ -98,14 +110,19 @@ export interface VarInfo {
      * binding shares one unsolved metavariable until unification fills it.
      */
     hole: boolean;
-    /** Type-class constraints which must hold when this variable is bound. */
-    classes: ReadonlySet<TypeClass>;
+    /**
+     * A numeric literal's category (`1`, `1.5`, `1.5d`), or null for every
+     * other variable. A literal variable still resolves to a concrete numeric
+     * primitive, but which one is decided by unification (or by the category
+     * fallback), so `1` adapts to an int, float, or decimal context.
+     */
+    literal: LiteralCategory | null;
     absorbAsMaybe?: boolean;
 }
 
 export interface Scheme {
     /** Quantified variables, in order. */
-    vars: { id: number; kind: VarKind; name: string | null; classes: readonly TypeClass[] }[];
+    vars: { id: number; kind: VarKind; name: string | null }[];
     type: Type;
 }
 
@@ -117,16 +134,6 @@ export class UnifyError extends Error {
         super('cannot unify');
         this.a = a;
         this.b = b;
-    }
-}
-
-/** Raised when a type does not implement a required type class. */
-export class ConstraintError extends UnifyError {
-    constraint: TypeClass;
-    constructor(constraint: TypeClass, type: Type) {
-        super(type, type);
-        this.constraint = constraint;
-        this.message = `type does not implement ${constraint}`;
     }
 }
 
@@ -187,6 +194,38 @@ export function windowOf(t: Type): Type {
     return t.kind === 'window' ? t : { kind: 'window', of: t };
 }
 
+export type ModeName = 'agg' | 'group' | 'window';
+
+/** Whether `t` is in one of the listed SQL modes (`agg t`, `group t`, `window t`). */
+export function isModeOf(t: Type, ...modes: ModeName[]): t is Type & { kind: ModeName; of: Type } {
+    return (t.kind === 'agg' || t.kind === 'group' || t.kind === 'window')
+        && modes.includes(t.kind);
+}
+
+/** Wrap `t` in one of the SQL modes (`agg t`, `group t`, `window t`). */
+export function modeOf(mode: ModeName, t: Type): Type {
+    switch (mode) {
+        case 'agg': return aggOf(t);
+        case 'group': return groupOf(t);
+        case 'window': return windowOf(t);
+    }
+}
+
+/** The payload of a mode-wrapped type, or null when `t` carries no mode. */
+export function modePayload(t: Type): Type | null {
+    return t.kind === 'agg' || t.kind === 'group' || t.kind === 'window' ? t.of : null;
+}
+
+/**
+ * Build an overload set from a name's several definitions. A single-element
+ * set collapses to that alternative, so ordinary bindings are unaffected.
+ */
+export function overloadOf(alternatives: readonly Type[]): Type {
+    return alternatives.length === 1
+        ? alternatives[0]!
+        : { kind: 'overload', alternatives };
+}
+
 export function rowOf(fields: [string, Type][], tail: Type | null = null): Type {
     const map = new Map<string, Type>();
     for (const [label, type] of fields) map.set(label, type);
@@ -205,19 +244,37 @@ export class TypeUniverse {
     fresh(
         kind: 'flex' | 'type' | 'row' = 'flex',
         name: string | null = null,
-        classes: readonly TypeClass[] = [],
     ): Type {
         const id = this.nextId++;
-        const constrainedKind = kind === 'flex' && classes.length > 0 ? 'type' : kind;
         this.infos = new Map(this.infos).set(id, {
-            kind: constrainedKind,
+            kind,
             rigid: false,
             name,
             hole: false,
-            classes: new Set(classes),
+            literal: null,
             absorbAsMaybe: false,
         });
         return { kind: 'var', id };
+    }
+
+    /** A variable standing for a numeric literal (`1`, `1.5`, `1.5d`). */
+    freshLiteral(category: LiteralCategory): Type {
+        const id = this.nextId++;
+        this.infos = new Map(this.infos).set(id, {
+            kind: 'type',
+            rigid: false,
+            name: null,
+            hole: false,
+            literal: category,
+            absorbAsMaybe: false,
+        });
+        return { kind: 'var', id };
+    }
+
+    /** Whether `t` (resolved) is an unresolved numeric literal. */
+    isLiteral(t: Type): boolean {
+        const r = this.resolve(t);
+        return r.kind === 'var' && this.varInfo(r.id).literal !== null;
     }
 
     /** Create a hole (`?name`): flexible, named, and never generalized. */
@@ -228,7 +285,7 @@ export class TypeUniverse {
             rigid: false,
             name,
             hole: true,
-            classes: new Set(),
+            literal: null,
             absorbAsMaybe: false,
         });
         return { kind: 'var', id };
@@ -255,52 +312,13 @@ export class TypeUniverse {
     }
 
     /** Require `t` to implement a type class, preserving the constraint on variables. */
-    constrain(t: Type, constraint: TypeClass): void {
-        const snapshot = this.snapshot();
-        try {
-            this.constrainInternal(t, constraint);
-        } catch (err) {
-            this.restore(snapshot);
-            throw err;
-        }
+    /** `t` must not need a type class: the language no longer has any. */
+    constrain(_t: Type, _constraint: string): void {
+        // Type classes were removed from the language; every call site that
+        // used to constrain now relies on plain unification. Kept as a no-op
+        // so external callers (and older plugins) do not crash.
     }
 
-    private constrainInternal(t: Type, constraint: TypeClass): void {
-        const r = this.resolve(t);
-        if (r.kind === 'var') {
-            const info = this.varInfo(r.id);
-            if (info.kind === 'row') throw new ConstraintError(constraint, r);
-            if (!info.classes.has(constraint)) {
-                this.infos = new Map(this.infos).set(r.id, {
-                    ...info,
-                    kind: info.kind === 'flex' ? 'type' : info.kind,
-                    classes: new Set([...info.classes, constraint]),
-                });
-            }
-            return;
-        }
-        const functorName: FunctorName | null = r.kind === 'maybe' || r.kind === 'list' || r.kind === 'query'
-            ? r.kind
-            : null;
-        if ((constraint === 'Functor' || constraint === 'Applicative' || constraint === 'Alternative' || constraint === 'Monad')
-            && functorName !== null && isContainerTypeClassInstance(constraint, functorName)) {
-            return;
-        }
-        if (r.kind === 'builtin' || r.kind === 'maybe' || r.kind === 'agg'
-            || r.kind === 'group' || r.kind === 'window') {
-            this.constrainInternal(r.of, constraint);
-            return;
-        }
-        if (r.kind === 'list' && (constraint === 'Semigroup' || constraint === 'Monoid')) {
-            return;
-        }
-        if (r.kind === 'prim'
-            && constraint !== 'Functor' && constraint !== 'Applicative' && constraint !== 'Alternative' && constraint !== 'Monad'
-            && isTypeClassInstance(constraint, r.name)) {
-            return;
-        }
-        throw new ConstraintError(constraint, r);
-    }
 
     /** Follow variable bindings to the root type. */
     resolve(t: Type): Type {
@@ -347,6 +365,7 @@ export class TypeUniverse {
                 case 'query': visit(r.row); break;
                 case 'builtin':
                 case 'agg': case 'group': case 'window': visit(r.of); break;
+                case 'overload': for (const alt of r.alternatives) visit(alt); break;
                 case 'prim': case 'truth': case 'order': break;
             }
         };
@@ -389,7 +408,7 @@ export class TypeUniverse {
             this.infos = new Map(this.infos).set(r.id, {
                 ...other,
                 kind: otherKind,
-                classes: new Set([...other.classes, ...info.classes]),
+                literal: info.literal ?? other.literal,
                 absorbAsMaybe: info.absorbAsMaybe || other.absorbAsMaybe,
             });
         } else {
@@ -403,7 +422,13 @@ export class TypeUniverse {
             } else if (thisKind === 'type' && r.kind === 'row') {
                 throw new UnifyError({ kind: 'var', id: varId }, t);
             }
-            for (const constraint of info.classes) this.constrainInternal(r, constraint);
+            // A numeric literal only resolves to a primitive its category
+            // admits: `1.5` can meet a float/decimal column but never an int
+            // one, while `1` fits all three.
+            if (info.literal !== null && r.kind === 'prim'
+                && !LITERAL_CATEGORIES[info.literal].candidates.includes(r.name)) {
+                throw new UnifyError({ kind: 'var', id: varId }, t);
+            }
         }
         if (thisKind !== info.kind) {
             this.infos = new Map(this.infos).set(varId, { ...info, kind: thisKind });
@@ -412,26 +437,18 @@ export class TypeUniverse {
     }
 
     /**
-     * A rigid (skolemized) variable may be pinned to a concrete type when it
-     * is a numeric *literal* (carries a `Num`/`Frac` class) and every one of
-     * its classes is satisfied by the target. This lets an annotation
-     * specialize a polymorphic numeric literal — `adult: { age: int | r } ->
-     * bool = u => u.age >= 18` — where inference proposes `age : Num t, Ord t`.
-     * All other rigid bindings remain forbidden.
+     * A rigid (skolemized) numeric literal may still be pinned to a concrete
+     * numeric primitive its category admits. This lets an annotation
+     * specialize a literal — `adult: { age: int | r } -> bool = u => u.age >=
+     * 18` compares `age` against the literal `18` — while every other rigid
+     * binding stays forbidden, so an annotation can never be satisfied by
+     * silently narrowing a genuine type variable.
      */
     private canSpecializeRigidNumeric(info: VarInfo, t: Type): boolean {
+        if (info.literal === null) return false;
         const r = this.resolve(t);
         if (r.kind !== 'prim') return false;
-        let numeric = false;
-        for (const c of info.classes) {
-            // Container classes cannot be satisfied by a concrete scalar.
-            if (c === 'Functor' || c === 'Applicative' || c === 'Alternative' || c === 'Monad') {
-                return false;
-            }
-            if (c === 'Num' || c === 'Frac') numeric = true;
-            if (!isTypeClassInstance(c as ScalarTypeClass, r.name)) return false;
-        }
-        return numeric;
+        return LITERAL_CATEGORIES[info.literal].candidates.includes(r.name);
     }
 
     /**
@@ -448,28 +465,27 @@ export class TypeUniverse {
         }
     }
 
-    /** Unify two types and require the result to implement a class atomically. */
-    unifyConstrained(a: Type, b: Type, constraint: TypeClass): Type {
-        const snapshot = this.snapshot();
-        try {
-            const unified = this.unifyInternal(a, b);
-            this.constrainInternal(unified, constraint);
-            return unified;
-        } catch (err) {
-            this.restore(snapshot);
-            throw err;
-        }
-    }
-
-    /** O(1) transaction markers: maps are copy-on-write, so old states stay valid. */
-    private snapshot(): { bindings: Map<number, Type>; infos: Map<number, VarInfo>; nextId: number } {
+    /**
+     * O(1) transaction markers: maps are copy-on-write, so old states stay
+     * valid. Public because overload resolution runs speculative trials that
+     * must be rolled back — see `Inferencer.resolveOverload`.
+     */
+    snapshotForTrial(): UniverseSnapshot {
         return { bindings: this.bindings, infos: this.infos, nextId: this.nextId };
     }
 
-    private restore(snapshot: { bindings: Map<number, Type>; infos: Map<number, VarInfo>; nextId: number }): void {
+    restoreTrial(snapshot: UniverseSnapshot): void {
         this.bindings = snapshot.bindings;
         this.infos = snapshot.infos;
         this.nextId = snapshot.nextId;
+    }
+
+    private snapshot(): UniverseSnapshot {
+        return this.snapshotForTrial();
+    }
+
+    private restore(snapshot: UniverseSnapshot): void {
+        this.restoreTrial(snapshot);
     }
 
     /** Unify two types structurally (no implicit Maybe conversion). Throws UnifyError. */
@@ -750,28 +766,21 @@ export class TypeUniverse {
         const vars: Scheme['vars'] = [];
         for (const id of free) {
             const info = this.infos.get(id)!;
-            // Haskell-style defaulting for ambiguous numeric *literals*: when
-            // the whole type IS a single numeric literal variable (e.g.
-            // `x = 1`, `x = 1.5`, `x = 1 + 2.5`) it is pinned to its default
-            // (`int` for Num, `float` for Frac) rather than left polymorphic,
-            // so a constant reads as a concrete number. Variables that occur
-            // inside a row/function/list (`add = x => y => x + y`,
-            // `xs = [1]`) are unaffected and stay quantified.
-            if (whole.kind === 'var' && whole.id === id) {
-                if (info.classes.has('Frac')) {
-                    this.bindings.set(id, prim('float'));
-                    continue;
-                }
-                if (info.classes.has('Num')) {
-                    this.bindings.set(id, prim('int'));
-                    continue;
-                }
+            // Ambiguous numeric *literals* default to a concrete type: when
+            // the whole type IS a single literal variable (`x = 1`,
+            // `x = 1.5`), it is pinned to `int` / `float` rather than left
+            // polymorphic, so a constant reads as a number. Literal variables
+            // inside a function/row/list (`add = x => y => x + y`) are NOT
+            // defaulted — they generalize like any other variable, and the
+            // repository's default numeric type is `int`.
+            if (whole.kind === 'var' && whole.id === id && info.literal !== null) {
+                this.bindings = new Map(this.bindings).set(id, prim(LITERAL_CATEGORIES[info.literal].fallback));
+                continue;
             }
             vars.push({
                 id,
                 kind: info.kind === 'row' ? 'row' : 'type',
                 name: info.name,
-                classes: [...info.classes],
             });
         }
         return { vars, type: t };
@@ -782,7 +791,12 @@ export class TypeUniverse {
         if (s.vars.length === 0) return s.type;
         const subst = new Map<number, Type>();
         for (const v of s.vars) {
-            const fresh = this.fresh(v.kind === 'row' ? 'row' : 'flex', v.name, v.classes);
+            // A quantified literal variable is re-created with its category so
+            // a polymorphic numeric definition keeps its adaptivity.
+            const info = this.infos.get(v.id);
+            const fresh = info?.literal != null
+                ? this.freshLiteral(info.literal)
+                : this.fresh(v.kind === 'row' ? 'row' : 'flex', v.name);
             subst.set(v.id, fresh);
         }
         return this.substitute(subst, s.type);
@@ -827,6 +841,7 @@ export class TypeUniverse {
             case 'agg': return aggOf(this.substitute(subst, r.of));
             case 'group': return groupOf(this.substitute(subst, r.of));
             case 'window': return windowOf(this.substitute(subst, r.of));
+            case 'overload': return overloadOf(r.alternatives.map(a => this.substitute(subst, a)));
             case 'prim': case 'truth': case 'order': return r;
         }
     }
@@ -874,6 +889,7 @@ export class TypeUniverse {
                 case 'agg': return `agg ${p(r.of, false)}`;
                 case 'group': return `group ${p(r.of, false)}`;
                 case 'window': return `window ${p(r.of, false)}`;
+                case 'overload': return r.alternatives.map(a => p(a, true)).join(' | ');
                 case 'fun': {
                     const s = `${p(r.from, true)} -> ${p(r.to, false)}`;
                     return paren ? `(${s})` : s;
@@ -881,15 +897,8 @@ export class TypeUniverse {
                 case 'order': return 'order';
             }
         };
-        const body = p(t, false);
-        const constraints: string[] = [];
-        for (const id of this.freeVars(t)) {
-            const info = this.varInfo(id);
-            for (const typeClass of info.classes) {
-                constraints.push(`${typeClass} ${p({ kind: 'var', id }, false)}`);
-            }
-        }
-        return constraints.length > 0 ? `${constraints.join(', ')} => ${body}` : body;
+        // Type classes no longer exist, so a type never renders constraints.
+        return p(t, false);
     }
 
     /** Pretty-print a row for "available: ..." lists: `id, name, age`. */

@@ -39,7 +39,7 @@
  *     list.
  ******************************************************************************/
 import {
-    type PrimName, type Scheme, type Type, type TypeClass, type TypeUniverse, type VarKind,
+    type PrimName, type Scheme, type Type, type TypeUniverse, type VarKind,
     fun, listOf, maybeOf, modeOf, prim, queryOf, rowOf, truthType,
 } from './types.js';
 
@@ -74,13 +74,11 @@ export interface BuiltinSpec {
 export const CORE_TYPE_NAMES = ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp'] as const;
 export type CoreTypeName = (typeof CORE_TYPE_NAMES)[number];
 
-/** Build a polymorphic scheme: named free variables, generalized.
- *  `constraints` attach type classes to the variables by position
- *  (`['DateTime']` on the first variable makes it `DateTime t => ...`). */
-function poly(u: TypeUniverse, vars: [string, VarKind][], build: (...types: Type[]) => Type, constraints: Record<number, TypeClass> = {}): Scheme {
+/** Build a polymorphic scheme: named free variables, generalized. */
+function poly(u: TypeUniverse, vars: [string, VarKind][], build: (...types: Type[]) => Type): Scheme {
     const types: Type[] = [];
-    for (const [i, [name, kind]] of vars.entries()) {
-        types.push(u.fresh(kind === 'row' ? 'row' : 'flex', name, i in constraints ? [constraints[i]!] : []));
+    for (const [name, kind] of vars) {
+        types.push(u.fresh(kind === 'row' ? 'row' : 'flex', name));
     }
     return u.generalize([], build(...types));
 }
@@ -192,20 +190,20 @@ export const BUILTIN_SPECS = [
     { name: 'timestamp', category: 'constant', doc: 'timestamp "2024-01-01 12:00:00" — ISO timestamp literal', scheme: () => mono(fun(p('string'), p('timestamp'))) },
     { name: 'current_date', category: 'date', doc: 'CURRENT_DATE', scheme: () => mono(p('date')) },
     { name: 'current_timestamp', category: 'constant', doc: 'CURRENT_TIMESTAMP', scheme: () => mono(p('timestamp')) },
-    { name: 'extract', category: 'date', doc: 'extract x "field"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('int'))), { 0: 'DateTime' }) },
-    { name: 'year', category: 'date', doc: 'year of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
-    { name: 'month', category: 'date', doc: 'month of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
-    { name: 'day', category: 'date', doc: 'day of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
-    { name: 'day_of_week', category: 'date', doc: 'day of week of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
-    { name: 'hour', category: 'date', doc: 'hour of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
-    { name: 'minute', category: 'date', doc: 'minute of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
-    { name: 'second', category: 'date', doc: 'second of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
-    { name: 'date_add', category: 'date', doc: 'date_add x "day" 1', scheme: u => poly(u, [tVar, aVar], (t, n) => fun(t, fun(p('string'), fun(n, t))), { 0: 'DateTime', 1: 'Num' }) },
-    { name: 'date_diff', category: 'date', doc: 'date_diff x "day" other', scheme: u => poly(u, [tVar, aVar], (t, other) => fun(t, fun(p('string'), fun(other, p('int')))), { 0: 'DateTime', 1: 'DateTime' }) },
-    { name: 'date_trunc', category: 'date', doc: 'date_trunc x "month" — date stays date, timestamp stays timestamp', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), t)), { 0: 'DateTime' }) },
-    { name: 'date_format', category: 'date', doc: 'date_format x "%Y-%m-%d"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('string'))), { 0: 'DateTime' }) },
+    { name: 'extract', category: 'date', doc: 'extract x "field"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('int')))) },
+    { name: 'year', category: 'date', doc: 'year of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'month', category: 'date', doc: 'month of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'day', category: 'date', doc: 'day of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'day_of_week', category: 'date', doc: 'day of week of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'hour', category: 'date', doc: 'hour of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'minute', category: 'date', doc: 'minute of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'second', category: 'date', doc: 'second of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
+    { name: 'date_add', category: 'date', doc: 'date_add x "day" 1', scheme: u => poly(u, [tVar, aVar], (t, n) => fun(t, fun(p('string'), fun(n, t)))) },
+    { name: 'date_diff', category: 'date', doc: 'date_diff x "day" other', scheme: u => poly(u, [tVar, aVar], (t, other) => fun(t, fun(p('string'), fun(other, p('int'))))) },
+    { name: 'date_trunc', category: 'date', doc: 'date_trunc x "month" — date stays date, timestamp stays timestamp', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), t))) },
+    { name: 'date_format', category: 'date', doc: 'date_format x "%Y-%m-%d"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('string')))) },
     { name: 'date_parse', category: 'date', doc: 'date_parse x "%Y-%m-%d"', scheme: () => mono(fun(p('string'), fun(p('string'), p('date')))) },
-    { name: 'to_unixtime', category: 'date', doc: 'date to unix seconds', scheme: u => poly(u, [tVar], t => fun(t, p('int')), { 0: 'DateTime' }) },
+    { name: 'to_unixtime', category: 'date', doc: 'date to unix seconds', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
     { name: 'from_unixtime', category: 'date', doc: 'unix seconds to timestamp', scheme: u => poly(u, [tVar], t => fun(p('int'), p('timestamp'))) },
 
     // --- math ------------------------------------------------------------
@@ -221,8 +219,8 @@ export const BUILTIN_SPECS = [
     { name: 'list_filter', category: 'list', doc: 'list.filter p xs — keep elements matching a predicate (a -> Bool) -> [a] -> [a]', scheme: u => poly(u, [aVar], a => fun(fun(a, p('bool')), fun(listOf(a), listOf(a)))) },
     { name: 'list_fold', category: 'list', doc: 'list.fold f z xs — left fold (b -> a -> b) -> b -> [a] -> b', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(fun(b, fun(a, b)), fun(b, fun(listOf(a), b)))) },
     { name: 'list_foldr', category: 'list', doc: 'list.foldr f z xs — right fold (a -> b -> b) -> b -> [a] -> b', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(fun(a, fun(b, b)), fun(b, fun(listOf(a), b)))) },
-    { name: 'list_sum', category: 'list', doc: 'list.sum xs — fold (+) over numeric elements', scheme: u => poly(u, [aVar], a => fun(listOf(a), a), { 0: 'Num' }) },
-    { name: 'list_product', category: 'list', doc: 'list.product xs — fold (*) over numeric elements', scheme: u => poly(u, [aVar], a => fun(listOf(a), a), { 0: 'Num' }) },
+    { name: 'list_sum', category: 'list', doc: 'list.sum xs — fold (+) over numeric elements', scheme: u => poly(u, [aVar], a => fun(listOf(a), a)) },
+    { name: 'list_product', category: 'list', doc: 'list.product xs — fold (*) over numeric elements', scheme: u => poly(u, [aVar], a => fun(listOf(a), a)) },
     { name: 'list_length', category: 'list', doc: 'list.length xs — element count (empty = 0)', scheme: u => poly(u, [aVar], a => fun(listOf(a), p('int'))) },
     { name: 'list_reverse', category: 'list', doc: 'list.reverse xs — elements in reverse order', scheme: u => poly(u, [aVar], a => fun(listOf(a), listOf(a))) },
     { name: 'list_concat', category: 'list', doc: 'list.concat xss — flatten a list of lists', scheme: u => poly(u, [aVar], a => fun(listOf(listOf(a)), listOf(a))) },
@@ -238,9 +236,15 @@ export const BUILTIN_SPECS = [
     // `sql_func name [args]` emits an uninterpreted SQL function call. It is
     // the building block the source prelude uses to express per-dialect
     // lowerings (branched on the hidden `sql_dialect` value) without a new TS
-    // builtin per function. The result type is left open (`b`) — the prelude
-    // definition that wraps it pins the type at its use site.
-    { name: 'sql_func', category: 'scalar', doc: 'sql_func name [args] — an uninterpreted SQL function call', scheme: u => poly(u, [tVar], t => fun(p('string'), fun(listOf(t), u.fresh()))) },
+    // builtin per function. The arguments are *scalars* — never records,
+    // queries, or lists — which is what keeps `abs u.some_record` a static
+    // error even without type classes; the concrete scalar (int vs string) is
+    // only known once the prelude wrapper pins it. The result type is left
+    // open (`b`) for the same reason.
+    { name: 'sql_func', category: 'scalar', doc: 'sql_func name [args] — an uninterpreted SQL function call', scheme: u => {
+        const a = u.fresh('flex', 'a');
+        return poly(u, [tVar], b => fun(p('string'), fun(listOf(a), b)));
+    } },
     // `sql_infix op left right` emits an uninterpreted infix SQL expression
     // (`left op right`, e.g. `sql_infix "IN" n x` -> `n IN x`). The result
     // type is left open (`c`) — a comparison is bool, `div` is int, etc. —

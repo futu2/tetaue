@@ -333,10 +333,11 @@ describe('non-portable functions are not in the common prelude', () => {
 
 describe('validation', () => {
     test('numeric functions reject strings', () => {
-        // `ceil` and `pow` are now prelude definitions with `Num` constraints,
-        // so a string is a static type error.
-        expect(allErrors(`${USERS}\nq = users & map (u => { c = ceil u.name })`).join('\n')).toContain('Num requires a numeric type');
-        expect(allErrors(`${USERS}\nq = users & map (u => { p = pow u.name 2 })`).join('\n')).toContain('Num requires a numeric type');
+        // `ceil` and `pow` are prelude definitions OVERLOADED per numeric type
+        // (that is what replaced the `Num` class), so a string matches no
+        // definition and the mismatch names the argument precisely.
+        expect(allErrors(`${USERS}\nq = users & map (u => { c = ceil u.name })`).join('\n')).toContain("'ceil' expects int as argument 1");
+        expect(allErrors(`${USERS}\nq = users & map (u => { p = pow u.name 2 })`).join('\n')).toContain("'pow' expects int as argument 1");
     });
 
     test('concat rejects non-strings', () => {
@@ -458,8 +459,11 @@ q = { tag = "fixed" } <$ users`;
 
     test('unsupported and mismatched instances are rejected', () => {
         expect(allErrors('bad = true <|> false\nq = table "t"').join('\n')).toContain('Alternative');
-        expect(allErrors('bad = [1] >>= (x => x + 1)\nq = table "t"').join('\n')).toContain('same Monad container');
-        expect(allErrors('bad = [1] <* just 2\nq = table "t"').join('\n')).toContain('same Applicative container');
+        // The monad/applicative family is still closed; without type classes
+        // the mismatch surfaces as the interpreter's shape check rather than a
+        // container-class message.
+        expect(allErrors('bad = [1] >>= (x => x + 1)\nq = table "t"').join('\n')).toContain('bind over a list requires the function to return a list');
+        expect(allErrors('bad = [1] <* just 2\nq = table "t"').join('\n')).not.toEqual([]);
     });
 });
 

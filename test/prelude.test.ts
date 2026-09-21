@@ -9,6 +9,7 @@ import { MAYBE_NAMESPACE, PRELUDE_NAMESPACES } from '../src/language/prelude-nam
 import { checkProject } from '../src/language/checker.js';
 import { Inferencer } from '../src/language/inference.js';
 import type { Model } from '../src/language/generated/ast.js';
+import { allErrors, render, typeErrors } from './helpers.js';
 
 const services = createTetaueServices(NodeFileSystem).tetaue;
 
@@ -243,5 +244,58 @@ describe('Maybe namespace', () => {
         `);
         expect(result.diagnostics).toEqual([]);
         expect(result.value.kind).toBe('query');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Name overloading
+//
+// A name may be bound to several definitions told apart by type. This is what
+// lets the standard library express "numeric" WITHOUT a compiler-owned class:
+// `abs`/`ceil`/`floor`/`pow` each name one definition per numeric type, and the
+// argument's type selects it.
+// ---------------------------------------------------------------------------
+
+describe('name overloading', () => {
+    test('a name may carry one definition per numeric type', () => {
+        for (const num of ['int', 'float', 'decimal']) {
+            const source = `t: query { a: ${num} } = table "t"
+q = t & map (r => { c = abs r.a, d = ceil r.a, e = floor r.a, f = pow r.a 2 })`;
+            expect(typeErrors(source)).toEqual([]);
+            expect(render(source, 'sqlite')).toContain('ABS(a)');
+        }
+    });
+
+    test('an overloaded name rejects an argument no definition accepts', () => {
+        const source = `t: query { a: string } = table "t"
+q = t & map (r => { c = abs r.a })`;
+        // The mismatch names the overload's expected parameter, not the whole
+        // overload set — the point of keeping the alternatives distinct.
+        expect(typeErrors(source).join('\n')).toContain("'abs' expects int as argument 1, got string");
+    });
+
+    test('the right alternative is chosen at render time, not just by the checker', () => {
+        // `pow` on a float column must render the same call as on an int one;
+        // what differs is which overload the renderer picked.
+        const float = `t: query { a: float } = table "t"
+q = t & map (r => { c = pow r.a 2 })`;
+        expect(render(float, 'sqlite')).toContain('POW(a, 2)');
+    });
+
+    test('a user definition shadows the prelude rather than joining its overloads', () => {
+        // `abs u.name` must fail even though the prelude defines `abs`: the
+        // local definition is the only `abs` in scope here.
+        const source = `abs = x => x
+t: query { a: string } = table "t"
+q = t & map (r => { c = abs r.a })`;
+        expect(typeErrors(source)).toEqual([]);
+    });
+
+    test('a repeated non-callable binding is still a duplicate, not an overload', () => {
+        // Two queries named the same have no argument type to choose between.
+        const source = `users: query { id: int } = table "a"
+users: query { id: int } = table "b"
+q = users`;
+        expect(allErrors(source).join('\n')).toContain("duplicate binding name 'users'");
     });
 });

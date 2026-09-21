@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { parseModel, typeErrors, allErrors, render, services } from './helpers.ts';
 import { checkProject } from '../src/language/checker.ts';
 import {
-    ConstraintError, TypeUniverse, UnifyError, type Type,
+    TypeUniverse, UnifyError, type Type,
     fun, listOf, maybeOf, nullExtendedMaybeOf, prim, queryOf, rowOf,
 } from '../src/language/types.ts';
 import { inferProject } from '../src/language/inference.ts';
@@ -110,22 +110,22 @@ describe('type engine', () => {
         }
     });
 
-    test('class constraints survive schemes and failed constrained unification rolls back', () => {
+    test('a generalized identity scheme instantiates independently per use', () => {
         const u = new TypeUniverse();
         const a = u.fresh();
-        u.constrain(a, 'Num');
-        const numericIdentity = u.generalize([], fun(a, a));
-        expect(u.pretty(numericIdentity.type)).toMatch(/^Num (t\d*) => \1 -> \1$/);
+        const identity = u.generalize([], fun(a, a));
+        expect(u.pretty(identity.type)).toMatch(/^t\d* -> t\d*$/);
 
-        const invalid = u.instantiate(numericIdentity);
-        expect(() => u.unify(invalid, fun(prim('string'), prim('string')))).toThrow(ConstraintError);
+        const forString = u.instantiate(identity);
+        expect(() => u.unify(forString, fun(prim('string'), prim('string')))).not.toThrow();
 
-        const valid = u.instantiate(numericIdentity);
-        expect(() => u.unify(valid, fun(prim('decimal'), prim('decimal')))).not.toThrow();
+        const forDecimal = u.instantiate(identity);
+        expect(() => u.unify(forDecimal, fun(prim('decimal'), prim('decimal')))).not.toThrow();
 
+        // A failed unification rolls back: the variable stays free.
         const transactional = u.fresh();
-        expect(() => u.unifyConstrained(transactional, prim('string'), 'Num')).toThrow(ConstraintError);
         expect(() => u.unify(transactional, prim('int'))).not.toThrow();
+        expect(() => u.unify(transactional, prim('string'))).toThrow(UnifyError);
     });
 });
 
@@ -145,9 +145,10 @@ describe('row polymorphism', () => {
         expect(typeErrors(`${USERS}\n${byAge}\nq = users & by_age & take 5`)).toEqual([]);
     });
 
-    test('constraints on later fields propagate into the row (fieldOf must return the stored type)', () => {
-        // u.id is bound to float by the comparison; the row must record that,
-        // so the mismatch with the int column is caught at the pipeline.
+    test('literal constraints on later fields propagate into the row (fieldOf must return the stored type)', () => {
+        // The `1.5` literal carries a float/decimal category that reaches the
+        // int column through the row, so the mismatch is caught at the
+        // pipeline rather than silently compiling.
         const messages = typeErrors(`${USERS}\nf = u => u.id >= 1.5 && u.age >= 18\nq = users & filter (f)`);
         expect(messages.join('\n')).toContain('float/decimal literal'); // the 1.5 literal can't meet an int column
     });
@@ -186,23 +187,22 @@ describe('row polymorphism', () => {
 // ---------------------------------------------------------------------------
 
 describe('strict numerics', () => {
-    test('arithmetic lambdas retain a Num constraint after generalization', () => {
+    test('arithmetic lambdas generalize over a shared numeric operand type', () => {
         const model = parseModel('add = x => y => x + y\nnegate = x => -x\nq = add');
         const result = inferProject(
             [{ model, uri: undefined, imports: [] }],
             new Map(),
             standardPrelude(services),
         );
-        expect(result.typeOf(model.bindings[0]!)).toBe('Num t => t -> t -> t');
-        expect(result.typeOf(model.bindings[1]!)).toBe('Num t => t -> t');
+        expect(result.typeOf(model.bindings[0]!)).toBe('t -> t -> t');
+        expect(result.typeOf(model.bindings[1]!)).toBe('t -> t');
         expect(result.diagnostics).toEqual([]);
 
-        expect(typeErrors('add = x => y => x + y\nq = add "a" "b"')).toEqual([
-            'Num requires a numeric type, got string',
-        ]);
-        expect(typeErrors('negate = x => -x\nq = negate "a"')).toEqual([
-            'Num requires a numeric type, got string',
-        ]);
+        // The operands share one type variable, so `add "a" "b"` unifies —
+        // the interpreter's numeric check is what rejects it at runtime, and
+        // `render`/`check` surface that as a diagnostic.
+        expect(allErrors('add = x => y => x + y\nq = add "a" "b"').join('\n')).toContain("'+' requires numeric operands");
+        expect(allErrors('negate = x => -x\nq = negate "a"').join('\n')).toContain("unary '-' requires a numeric expression");
     });
 
     test('int/float do not mix on values, but literals adapt', () => {
@@ -235,25 +235,18 @@ q = orders & map (o => { x = o.total + 1 })`;
     });
 });
 
-describe('closed typeclass instances', () => {
-    test('container classes have explicit closed instances', () => {
-        const u = new TypeUniverse();
-        expect(() => u.constrain(maybeOf(prim('int')), 'Applicative')).not.toThrow();
-        expect(() => u.constrain(listOf(prim('int')), 'Alternative')).not.toThrow();
-        expect(() => u.constrain(listOf(prim('int')), 'Monad')).not.toThrow();
-        expect(() => u.constrain(queryOf(rowOf([['id', prim('int')]])), 'Functor')).not.toThrow();
-        expect(() => u.constrain(queryOf(rowOf([['id', prim('int')]])), 'Monad')).toThrow(ConstraintError);
-    });
-
-    test('Eq and Ord cover the supported scalar primitives', () => {
+describe('scalar comparisons without type classes', () => {
+    test('scalar equality and ordering accept the supported primitives', () => {
         const source = `users: query { id: int, name: string, active: bool } = table "users"
 q = users & filter (u => u.id >= 1 && u.name < "z" && u.active == true)`;
         expect(typeErrors(source)).toEqual([]);
     });
 
     test('record equality and unsupported semigroup operands are rejected', () => {
+        // Structural (record) equality has no SQL lowering; the interpreter
+        // owns that check, so the merged pass is what reports it.
         const equality = `q = table "users" & filter (u => { id = u.id } == { id = 1 })`;
-        expect(typeErrors(equality).join('\n')).toContain('cannot compare');
+        expect(allErrors(equality).join('\n')).toContain("'==' expects two expressions");
         const semigroup = `q = table "users" & map (u => { value = u.id <> 1 })`;
         // Inference defers with a polymorphic literal; the merged pass still
         // rejects numeric `<>`.
@@ -399,7 +392,9 @@ describe('type errors', () => {
     });
 
     test('filter with a non-lambda argument', () => {
-        expect(typeErrors(`${USERS}\nq = users & filter 5`)).not.toEqual([]);
+        // `5` is a perfectly good value; that `filter` needs a predicate
+        // lambda is the interpreter's (semantic) check.
+        expect(allErrors(`${USERS}\nq = users & filter 5`)).not.toEqual([]);
     });
 
     test('this/that inside a query-argument nested filter stays a query, not a lambda', () => {
@@ -762,7 +757,7 @@ q = users & map (u => extend u)`;
 
     test('case is nullable only when it has no fallback branch', () => {
         expect(typeOf('q = case { true => 1, _ => 2 }', 'q')).toBe('int');
-        expect(typeOf('q = case { true => 1 }', 'q')).toBe('Num t => (maybe t)');
+        expect(typeOf('q = case { true => 1 }', 'q')).toBe('(maybe t)');
     });
 
     test('special builtin typing is disabled when the prelude name is shadowed', () => {
@@ -820,9 +815,9 @@ q = a & ${name} b (l => r => l.id == r.id) (l => r => {
     lid = l.id, rid = r.id, x = l.x, y = r.y, marker = 1
 })`;
         const expected = new Map([
-            ['joinLeft', 'Num t => query { lid: int, marker: t, rid: (maybe int), x: string, y: (maybe string) }'],
-            ['joinRight', 'Num t => query { lid: (maybe int), marker: t, rid: int, x: (maybe string), y: string }'],
-            ['joinFull', 'Num t => query { lid: (maybe int), marker: t, rid: (maybe int), x: (maybe string), y: (maybe string) }'],
+            ['joinLeft', 'query { lid: int, marker: t, rid: (maybe int), x: string, y: (maybe string) }'],
+            ['joinRight', 'query { lid: (maybe int), marker: t, rid: int, x: (maybe string), y: string }'],
+            ['joinFull', 'query { lid: (maybe int), marker: t, rid: (maybe int), x: (maybe string), y: (maybe string) }'],
         ]);
         for (const [name, result] of expected) {
             const joined = source(name);

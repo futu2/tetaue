@@ -11,7 +11,7 @@ import type { NumberLiteral } from './generated/ast.js';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBooleanLiteral,
     isCaseExpression, isIdentifier, isLambda, isLetExpression, isListLiteral,
-    isListType, isMapLiteral,
+    isFunType, isListType, isMapLiteral,
     isNullLiteral, isNumberLiteral, isOperatorSection, isQueryType, isRecordType, isStringLiteral,
     isTypeAtom, isTypeHole, isTypeParen, isTypeVar, isUnaryMinus,
     type Application, type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
@@ -149,9 +149,13 @@ export interface Diagnostic {
 
 export type Value =
     | { kind: 'query'; query: Query; ast?: AstNode }
-    | { kind: 'fn'; name: string; apply: (arg: Value, at: AstNode | undefined, ctx: Ctx) => Value; ast?: AstNode }
+    | { kind: 'fn'; name: string; apply: (arg: Value, at: AstNode | undefined, ctx: Ctx) => Value; ast?: AstNode;
+        /** Declared first-parameter SQL type, for overload selection. */
+        paramType?: TypeOrNull }
     | { kind: 'step'; name: string; apply: (q: Query, at: AstNode | undefined, ctx: Ctx) => Query | null; ast?: AstNode }
-    | { kind: 'lambda'; params: string[]; body: Expr; closure: Map<string, Value>; ast?: AstNode }
+    | { kind: 'lambda'; params: string[]; body: Expr; closure: Map<string, Value>; ast?: AstNode;
+        /** Declared first-parameter SQL type (`(x: float) => ...`), for overload selection. */
+        paramType?: TypeOrNull }
     /**
      * A first-class record value. Field access (`r.name`) works over records.
      * A row inside a lambda is a record whose schema comes from the pipeline
@@ -179,7 +183,14 @@ export type Value =
      * already evaluated and shared by reference; polymorphism is only a
      * type-level concern (handled by inference).
      */
-    | { kind: 'module'; name: string; exports: Map<string, Value>; ast?: AstNode };
+    | { kind: 'module'; name: string; exports: Map<string, Value>; ast?: AstNode }
+    /**
+     * One name bound to several definitions (`abs` given once per numeric
+     * type). Applying it picks the FIRST alternative whose SQL argument types
+     * the actual arguments satisfy, mirroring the static overload choice. The
+     * alternatives are ordinary functions in declaration order.
+     */
+    | { kind: 'overload'; name: string; alternatives: Value[]; ast?: AstNode };
 
 export interface Ctx {
     env: Map<string, Value>;
@@ -252,6 +263,7 @@ export function describe(v: Value): string {
         case 'expr': return `an expression of type ${typeName(v.node.type)}`;
         case 'list': return 'a list';
         case 'module': return `module '${v.name}'`;
+        case 'overload': return `an overloaded function (${v.name})`;
 
         case 'error': return 'an error';
         case 'mempty': return 'the monoid identity (mempty)';
@@ -600,8 +612,78 @@ function prepareQueryForStep(q: Query, stepName: string): Query {
 // Application
 // ---------------------------------------------------------------------------
 
+/**
+ * Pick the alternative of an overload set that accepts `arg`.
+ *
+ * The runtime matches on the argument's SQL type, which is exactly the
+ * granularity an overload is written at: the prelude declares `abs` once per
+ * numeric type, and the argument's type names which one. An alternative that
+ * declares no parameter type accepts anything, and several surviving
+ * alternatives mean the set is genuinely ambiguous for this argument.
+ *
+ * A partially applied set (`negate = abs`) keeps its alternatives and is
+ * re-picked on the next application.
+ */
+function selectOverload(
+    f: { name: string; alternatives: Value[]; ast?: AstNode },
+    arg: Value,
+    at: AstNode | undefined,
+    ctx: Ctx,
+): Value | null {
+    const argType = valueSqlType(arg);
+    const scored: { value: Value; score: number }[] = [];
+    for (const alternative of f.alternatives) {
+        const param = declaredParamType(alternative);
+        if (param === null) continue; // not a function: the ordinary path reports it
+        if (param === 'any' || argType === 'unknown') {
+            scored.push({ value: alternative, score: 0 });
+        } else if (param === argType) {
+            scored.push({ value: alternative, score: 2 });
+        } else if (isNumeric(param) && isNumeric(argType)) {
+            scored.push({ value: alternative, score: 1 });
+        }
+    }
+    if (scored.length === 0) return null;
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored[0]!;
+    const tied = scored.filter(s => s.score === best.score);
+    if (tied.length > 1) {
+        ctx.diagnostics.push({
+            node: at ?? f.ast,
+            message: `'${f.name}' is ambiguous for ${typeName(argType)} — annotate the argument to pick one of its ${f.alternatives.length} definitions`,
+        });
+        return null;
+    }
+    return best.value;
+}
+
+/** The parameter type an alternative declares, or null when it is not a function. */
+function declaredParamType(v: Value): TypeOrNull | 'any' | null {
+    if (v.kind === 'fn' || v.kind === 'lambda') return v.paramType ?? 'any';
+    return null;
+}
+
+/** Whether a value can take part in an overload set (callable, not a query/record). */
+function isOverloadable(v: Value): boolean {
+    return v.kind === 'fn' || v.kind === 'lambda' || v.kind === 'step';
+}
+
+/** The SQL type of a value, for overload matching. */
+function valueSqlType(v: Value): TypeOrNull | 'unknown' {
+    return v.kind === 'expr' ? v.node.type : 'unknown';
+}
+
 export function applyWith(f: Value, arg: Value, at: AstNode | undefined, ctx: Ctx): Value {
     if (isError(f) || isError(arg)) return ERROR;
+    // An overloaded name picks the alternative whose parameter accepts this
+    // argument. The pick runs BEFORE the ordinary application, and the chosen
+    // alternative is applied exactly as a direct call would be — so a numeric
+    // overload (`abs` on int vs float) resolves the same way statically and at
+    // runtime, and no SQL lowering is duplicated.
+    if (f.kind === 'overload') {
+        const chosen = selectOverload(f, arg, at, ctx);
+        return chosen ? applyWith(chosen, arg, at, ctx) : ERROR;
+    }
     switch (f.kind) {
         case 'fn':
             return f.apply(arg, at, ctx);
@@ -852,6 +934,44 @@ function expandMemptyAnnotation(t: import('./generated/ast.js').Type, ctx: Ctx):
     if (isTypeVar(cur) && cur.name === 'string') return mkExpr(lit('', 'string'));
     return null;
 }
+/**
+ * The SQL type a parameter annotation declares (`(x: float) => ...` ->
+ * `float`), or null when the annotation names no concrete scalar. Only scalar
+ * primitives are reported: those are the granularity overloads are written at,
+ * and anything else (`maybe T`, a row, a function) leaves the choice open.
+ */
+function sqlTypeOfAnnotation(t: unknown): TypeOrNull | null {
+    let cur = t as import('./generated/ast.js').Type | undefined;
+    for (;;) {
+        if (!cur) return null;
+        if (isTypeParen(cur)) { cur = cur.type; continue; }
+        if (isTypeAtom(cur)) {
+            if (cur.maybeType) { cur = cur.maybeType; continue; }
+            if (cur.base) { cur = cur.base; continue; }
+        }
+        break;
+    }
+    if (isTypeVar(cur)) {
+        const name = cur.name;
+        if ((PRIM_TYPE_NAMES as readonly string[]).includes(name)) return name as TypeOrNull;
+    }
+    return null;
+}
+
+/** The first parameter's SQL type from a `T -> U` binding annotation. */
+function firstParamTypeOfAnnotation(t: import('./generated/ast.js').Type): TypeOrNull | null {
+    let cur: import('./generated/ast.js').Type = t;
+    for (;;) {
+        if (isTypeParen(cur)) { cur = cur.type; continue; }
+        break;
+    }
+    if (!isFunType(cur)) return null;
+    return sqlTypeOfAnnotation(cur.left);
+}
+
+/** Scalar primitives usable as an overload discriminator. */
+const PRIM_TYPE_NAMES = ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp'] as const;
+
 function memptyFromAnnotation(t: import('./generated/ast.js').Type, at: AstNode | undefined, ctx: Ctx): Value {
     let cur: import('./generated/ast.js').Type = t;
     for (;;) {
@@ -1452,7 +1572,17 @@ function evalExprWithInner(e: Expr, ctx: Ctx): Value {
     }
     if (isLambda(e)) {
         // Snapshot the current scope: lambdas see only bindings defined so far.
-        return { kind: 'lambda', params: [lambdaParam(e)], body: e.body as unknown as Expr, closure: new Map(ctx.env), ast: e };
+        // A parameter annotation (`(x: float) => ...`) is recorded as an SQL
+        // type so an overload set can be selected at render time.
+        const declared = sqlTypeOfAnnotation((e as { param?: { type?: unknown } }).param?.type);
+        return {
+            kind: 'lambda',
+            params: [lambdaParam(e)],
+            body: e.body as unknown as Expr,
+            closure: new Map(ctx.env),
+            ast: e,
+            ...(declared ? { paramType: declared } : {}),
+        };
     }
     if (isOperatorSection(e)) {
         return operatorSectionValue(e.value, e, ctx);
@@ -1617,8 +1747,13 @@ function evalCase(e: CaseExpression, ctx: Ctx): Value {
 // Builtins
 // ---------------------------------------------------------------------------
 
-function fn(name: string, impl: (arg: Value, at: AstNode | undefined, ctx: Ctx) => Value): Value {
-    return { kind: 'fn', name, apply: impl };
+/**
+ * `paramType` lets an overloaded name be selected at render time: a prelude
+ * definition annotated `abs: float -> float` records `float` here, so the
+ * runtime can tell its alternatives apart exactly as the checker does.
+ */
+function fn(name: string, impl: (arg: Value, at: AstNode | undefined, ctx: Ctx) => Value, paramType?: TypeOrNull): Value {
+    return { kind: 'fn', name, apply: impl, ...(paramType ? { paramType } : {}) };
 }
 
 function sqlNodeReferences(node: SqlNode, target: SqlNode): boolean {
@@ -3993,6 +4128,11 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         // Each module gets its OWN immutable scope: prelude, imports, then
         // local bindings. The environment is threaded through the binding
         // fold; nothing is reassigned on a shared context object.
+        // Every module — including one marked `# no prelude` — starts from the
+        // PRIMITIVE core environment (SQL builtins, operator intrinsics, the
+        // hidden `sql_dialect` value). `# no prelude` only suppresses the
+        // automatic injection of the standard library's exported bindings.
+        const isNoPrelude = module.noPrelude === true;
         let env = createPreludeEnv(dialect);
         const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
         const moduleDiagnostics: Diagnostic[] = [];
@@ -4007,7 +4147,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         for (const [alias, selected] of imported.namespaces) {
             env.set(alias, { kind: 'module', name: alias, exports: new Map(selected), ast: module.model.imports.find(imp => imp.alias === alias) });
         }
-        if (module !== prelude) {
+        if (!isNoPrelude && module !== prelude) {
             for (const [name, standardValue] of standardValues) {
                 if (!env.has(name)) env.set(name, standardValue);
             }
@@ -4032,10 +4172,13 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
             moduleDiagnostics.push({ node: cycle, message: recursiveBindingMessage(cycle.name) });
         }
         for (const binding of order) {
-            if (scope.has(binding.name)) {
-                // The program is invalid either way; keep evaluating so
-                // downstream errors still surface, but report the conflict.
-                moduleDiagnostics.push({ node: binding, message: conflictMessage(binding.name, scope.get(binding.name)!, 'a local binding') });
+            // A name brought in by an import may not also be bound locally:
+            // that would silently shadow the import. A REPEATED local name is
+            // different — it is a second definition of an overload set, and
+            // the two are told apart by their parameter types.
+            const claimedBy = scope.get(binding.name);
+            if (claimedBy !== undefined && claimedBy !== `local binding '${binding.name}'`) {
+                moduleDiagnostics.push({ node: binding, message: conflictMessage(binding.name, claimedBy, 'a local binding') });
             }
             scope.set(binding.name, `local binding '${binding.name}'`);
             const result = checkBinding(binding, env, moduleBindings, seen);
@@ -4303,9 +4446,10 @@ export function topoOrderBindings(bindings: readonly Binding[]): { order: readon
 export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBindings: ReadonlySet<string>, seen: ReadonlySet<string>, ctxExtras: Partial<Ctx> = {}): BindingResult {
     const diagnostics: Diagnostic[] = [];
     const nextSeen = new Set(seen);
-    if (nextSeen.has(binding.name)) {
-        diagnostics.push({ node: binding, message: `duplicate binding name '${binding.name}'` });
-    }
+    // A repeated name is NOT a duplicate: it is a second definition of an
+    // overload set (`abs` per numeric type), and the definitions are told
+    // apart by their parameter types. A repeated name whose definitions are
+    // not callable has no way to choose, so it stays an error below.
     nextSeen.add(binding.name);
     if (!binding.value) {
         const value = ERROR;
@@ -4315,6 +4459,13 @@ export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBi
     const ctx: Ctx = { env, diagnostics, moduleBindings: new Set(moduleBindings), ...ctxExtras };
     let v = evalExprWith(binding.value, ctx);
     v = stampQueryTypeAnnotation(v, binding.type, binding, ctx);
+    // A BINDING annotation is the other way to declare a parameter type
+    // (`abs: float -> float = x => ...`). Overload selection reads it, so the
+    // prelude can spell its alternatives exactly as inference sees them.
+    if (binding.type && v.kind === 'lambda' && v.paramType === undefined) {
+        const declared = firstParamTypeOfAnnotation(binding.type);
+        if (declared) v = { ...v, paramType: declared };
+    }
     // A bare `mempty` with a binding annotation picks the instance from the
     // annotation (`x: [int] = mempty`) — same type-directed rule as
     // `x = (mempty : [int])`. Non-maybe annotations only; a query-typed
@@ -4339,6 +4490,28 @@ export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBi
         v = { kind: 'query', query: { ...v.query, name: binding.name }, ast: v.ast };
     }
     const nextEnv = new Map(env);
+    // A second definition of the same name is an OVERLOAD, not a duplicate:
+    // `abs` may be given once per numeric type. The environment holds the set
+    // and `applyWith` picks the alternative the argument's SQL type selects.
+    // Only definitions from THIS module overload each other — `seen` is
+    // exactly the set of names this module has already bound — so a definition
+    // here SHADOWS a prelude/import of the same name outright.
+    const prior = seen.has(binding.name) ? env.get(binding.name) : undefined;
+    if (prior !== undefined) {
+        // A repeated name is an overload ONLY when both definitions are
+        // callable — that is what lets a reader pick one by argument type.
+        // Two queries (or two records, two lists) named the same have no such
+        // discriminator, so the repeat is still an error.
+        const priorCallable = prior.kind === 'overload' || isOverloadable(prior);
+        if (!priorCallable || !isOverloadable(v)) {
+            diagnostics.push({ node: binding, message: `duplicate binding name '${binding.name}'` });
+        } else {
+            nextEnv.set(binding.name, prior.kind === 'overload'
+                ? { kind: 'overload', name: binding.name, alternatives: [...prior.alternatives, v], ast: binding }
+                : { kind: 'overload', name: binding.name, alternatives: [prior, v], ast: binding });
+            return { value: v, env: nextEnv, seen: nextSeen, diagnostics };
+        }
+    }
     nextEnv.set(binding.name, v);
     return { value: v, env: nextEnv, seen: nextSeen, diagnostics };
 }

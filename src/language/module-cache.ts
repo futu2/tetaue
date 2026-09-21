@@ -181,6 +181,12 @@ export function parseModel(text: string, uri: string, services: TetaueServices):
     return result.value as Model;
 }
 
+/** Detect a `# no prelude` directive in the first comment of a file. */
+export function detectNoPrelude(text: string): boolean {
+    const firstLine = text.split(/\r?\n/, 2)[0] ?? '';
+    return /^\s*#\s*no\s+prelude\b/i.test(firstLine);
+}
+
 /** Null out every AST node's `$cstNode` so the parse's CST tree can be GC'd. */
 function dropCst(model: Model): void {
     for (const node of AstUtils.streamAst(model)) {

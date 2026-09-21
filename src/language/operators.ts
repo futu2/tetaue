@@ -10,25 +10,28 @@ export type BinaryOperator = (typeof BINARY_OPERATORS)[number];
 
 /**
  * SQL-aware primitive behind each public prelude operator binding. These names
- * are deliberately absent from the builtin catalog: they exist only so the
- * checked `prelude.tetaue` module can define `_+_` and friends. Operators
- * expressible as ordinary lambdas (`>>>`, `<<<`, `&`, `$`) have no core
- * intrinsic.
+ * are deliberately distinct from the public ones, so a module can shadow `+`
+ * without touching the intrinsic: the checked `prelude.tetaue` module binds
+ * `_+_` and friends to them. They are spelled WITHOUT a `@` prefix so they
+ * lex as ordinary identifiers (an `@` would be a lexer error), and the
+ * public `_*_` section name never collides with them.
+ * Operators expressible as ordinary lambdas (`>>>`, `<<<`, `&`, `$`) have no
+ * core intrinsic.
  */
 export const OPERATOR_INTRINSICS = {
-    '*': '@op_multiply',
-    '/': '@op_divide',
-    '+': '@op_add',
-    '-': '@op_subtract',
-    '<>': '@op_merge',
-    '==': '@op_equal',
-    '!=': '@op_not_equal',
-    '<': '@op_less_than',
-    '<=': '@op_less_than_or_equal',
-    '>': '@op_greater_than',
-    '>=': '@op_greater_than_or_equal',
-    '&&': '@op_and',
-    '||': '@op_or',
+    '*': 'op_multiply',
+    '/': 'op_divide',
+    '+': 'op_add',
+    '-': 'op_subtract',
+    '<>': 'op_merge',
+    '==': 'op_equal',
+    '!=': 'op_not_equal',
+    '<': 'op_less_than',
+    '<=': 'op_less_than_or_equal',
+    '>': 'op_greater_than',
+    '>=': 'op_greater_than_or_equal',
+    '&&': 'op_and',
+    '||': 'op_or',
 } as const satisfies Partial<Record<BinaryOperator, string>>;
 
 export type IntrinsicOperator = keyof typeof OPERATOR_INTRINSICS;

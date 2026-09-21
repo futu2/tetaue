@@ -27,9 +27,9 @@ import {
 } from './generated/ast.js';
 import type { Type as LangiumType } from './generated/ast.js';
 import {
-    ConstraintError, TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
-    builtinOf, fun, isTypeClassInstance, listOf, maybeOf, modeOf, modePayload, nullExtendedMaybeOf, prim, queryOf, rowOf, truthType,
-    type ScalarTypeClass, type TypeClass,
+    TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
+    builtinOf, fun, isModeOf, listOf, maybeOf, modeOf, modePayload, nullExtendedMaybeOf, overloadOf, prim, queryOf, rowOf, truthType,
+    type ModeName,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
@@ -45,6 +45,16 @@ import {
     INTRINSIC_OPERATORS, isBinaryOperator, isIntrinsicOperator, operatorIntrinsicName,
     sectionName, sectionSpelling, type BinaryOperator, type IntrinsicOperator,
 } from './operators.js';
+
+/** An overloaded application waiting for its argument types to settle. */
+interface PendingOverload {
+    name: string;
+    set: readonly Scheme[];
+    e: import('./generated/ast.js').Application;
+    argTypes: Type[];
+    /** The result variable the application already returned. */
+    result: Type;
+}
 
 export interface InferDiagnostic {
     node: AstNode | undefined;
@@ -102,22 +112,15 @@ function numberLiteralType(e: NumberLiteral): 'int' | 'float' {
     return e.$cstNode?.text.includes('.') ? 'float' : 'int';
 }
 
-/**
- * A numeric literal is polymorphic, like Haskell's `fromIntegral`: an integer
- * literal (`1`) is `Num t => t` (int | float | decimal), and a decimal-point
- * literal (`1.5`) is `Frac t => t` (float | decimal). The literal adapts to
- * whatever numeric type the surrounding expression forces, so `sum ($ 1 +
- * r.total)` works whether `total` is int, float, or decimal — while `int` and
- * `float` still never mix on values. Unconstrained literals default at
- * generalization (`x = 1 : int`, `x = 1.5 : float`); annotate to pin them.
- */
 function numericLiteralScheme(u: TypeUniverse, e: NumberLiteral): Type {
-    const cls: ScalarTypeClass = e.$cstNode?.text.includes('.') ? 'Frac' : 'Num';
-    return u.fresh('type', null, [cls]);
+    // An integer literal is any numeric primitive; a decimal-point literal
+    // never fits an int column. Both stay unresolved until their context (or
+    // the category fallback) picks one.
+    return u.freshLiteral(e.$cstNode?.text.includes('.') ? 'frac' : 'num');
 }
 
 function isNumericPrim(t: Type): boolean {
-    return t.kind === 'prim' && isTypeClassInstance('Num', t.name);
+    return t.kind === 'prim' && (t.name === 'int' || t.name === 'float' || t.name === 'decimal');
 }
 
 /**
@@ -158,6 +161,29 @@ export class Inferencer {
      * (so prelude namespaces are always in scope, like the flat prelude).
      */
     preludeNamespaces = new Map<string, Map<string, Scheme>>();
+    /**
+     * Names the standard library exports. Used by name-keyed rules that must
+     * also cover prelude *bindings* (not just core builtins) while still
+     * exempting a user's own definition of the same name.
+     */
+    preludeNames = new Set<string>();
+    /**
+     * Overloaded names: every definition of a name that has more than one.
+     * A module may define `abs` three times (`int`, `float`, `decimal`); the
+     * TYPE those definitions share is an overload set, and this map is its
+     * source. The environment keeps ONE representative scheme per name (for
+     * ordinary lookup, hover and completion) while the set drives the actual
+     * selection at an application.
+     */
+    private overloads = new Map<string, Scheme[]>();
+    /** Names THIS module bound, so a shadow of a prelude/import name is not an overload. */
+    private moduleOwnNames = new Set<string>();
+    /**
+     * Overloaded applications whose alternative could not be chosen yet: inside
+     * a row lambda the argument types are still variables, so the pick waits
+     * for the row to settle (see `resolveOverloads`).
+     */
+    private deferredOverloads: PendingOverload[] = [];
     /**
      * Namespace aliases of the CURRENT module (`import "x.tetaue" as t`):
      * alias -> the target module's exported binding schemes. Qualified access
@@ -213,6 +239,16 @@ export class Inferencer {
 
     /** Resolve deferred checks once unification has bound all row variables. */
     flushDeferred(): void {
+        this.flushDeferredFrom(0, 0);
+    }
+
+    /**
+     * Run the pending checks added since the given marks. Scoping the flush
+     * to one binding is what makes a diagnostic land on the module that
+     * produced it: `checkProject` drains diagnostics per module, so a check
+     * deferred past the drain would be lost.
+     */
+    private flushDeferredFrom(deferredMark: number, overloadMark: number): void {
         const strip = (t: Type): Type => {
             let r = this.u.peel(t);
             while (r.kind === 'maybe') r = this.u.peel(r.of);
@@ -222,7 +258,7 @@ export class Inferencer {
             const r = strip(t);
             return r.kind === 'prim' ? r.name : this.u.pretty(t, true);
         };
-        for (const check of this.deferred) {
+        for (const check of this.deferred.slice(deferredMark)) {
             const a = strip(check.a);
             const b = strip(check.b);
             const compatible = a.kind === 'prim' && b.kind === 'prim'
@@ -231,13 +267,16 @@ export class Inferencer {
                 this.diag(check.node, `${check.message}, got ${nameOf(check.a)} and ${nameOf(check.b)}`);
             }
         }
-        this.deferred = [];
+        this.deferred = this.deferred.slice(0, deferredMark);
         // `mempty` instance resolution: the use site has unified the type by
         // now (annotation, `<>` operand, list-argument element check, ...).
         for (const use of this.pendingMempty) {
             this.checkMemptyResolved(use);
         }
         this.pendingMempty = [];
+        // Overload picks come LAST: they need the very rows this flush just
+        // settled (a numeric wrapper argument is resolved by the loop above).
+        this.resolveOverloads(overloadMark);
     }
 
     /** Validate one resolved `mempty` use against the closed Monoid instances. */
@@ -338,15 +377,12 @@ export class Inferencer {
             case '&&': case '||':
                 return fun(prim('bool'), fun(prim('bool'), prim('bool')));
             case '==': case '!=':
-                this.u.constrain(a, 'Eq');
                 return fun(a, fun(a, prim('bool')));
             case '<': case '<=': case '>': case '>=':
-                this.u.constrain(a, 'Ord');
                 return fun(a, fun(a, prim('bool')));
             case '/': return fun(prim('float'), fun(prim('float'), prim('float')));
             case '<>': return fun(a, fun(b, c));
             case '+': case '-': case '*':
-                this.u.constrain(a, 'Num');
                 return fun(a, fun(a, a));
         }
     }
@@ -399,6 +435,7 @@ export class Inferencer {
             );
             exportsByModule.set(module, exported);
             if (module === prelude) {
+                this.preludeNames = new Set([...this.preludeNames, ...exported.keys()]);
                 this.preludeEnv = new Map([...this.preludeEnv, ...exported]);
             }
         }
@@ -419,8 +456,18 @@ export class Inferencer {
         imports: readonly ResolvedImportEdge[],
         exportsByModule: ReadonlyMap<ProjectModule, ReadonlyMap<string, Scheme>>,
     ): { scope: ReadonlyMap<string, string> } {
-        this.env = new Map(this.preludeEnv);
-        this.modules = new Map([...this.preludeNamespaces].map(([alias, ns]) => [alias, new Map(ns)]));
+        // Overload sets are per module: a module's own definitions shadow the
+        // prelude wholesale rather than extending it.
+        this.overloads = new Map();
+        this.moduleOwnNames = new Set();
+        const isNoPrelude = module.noPrelude === true;
+        if (!isNoPrelude) {
+            this.env = new Map(this.preludeEnv);
+            this.modules = new Map([...this.preludeNamespaces].map(([alias, ns]) => [alias, new Map(ns)]));
+        } else {
+            this.env = new Map();
+            this.modules = new Map();
+        }
         const imported = resolveImportScope(module, imports, exportsByModule);
         for (const d of imported.diagnostics) this.diag(d.node, d.message);
         for (const [name, scheme] of imported.flat) this.env.set(name, scheme);
@@ -450,12 +497,13 @@ export class Inferencer {
         // here; the interpreter reports the same message for dedupe).
         const { order, cycles } = topoOrderBindings(module.model.bindings);
         for (const binding of order) {
-            this.inferBinding(binding, exported, scope);
+            this.inferBindingReporting(binding, exported, scope);
         }
         for (const binding of cycles) {
             this.diag(binding, recursiveBindingMessage(binding.name));
-            this.inferBinding(binding, exported, scope);
+            this.inferBindingReporting(binding, exported, scope);
         }
+
         // --- re-exports: `export * from "x"` / `export { a as b } from "x"` ---
         // Mirror the interpreter's merge (same wording) so diagnostics dedupe.
         for (const { target, exportNode } of reexports) {
@@ -483,10 +531,28 @@ export class Inferencer {
         return exported;
     }
 
+    /**
+     * `inferBinding` plus a scoped deferred flush. The flush runs per binding
+     * because a check that needs settled rows (a numeric wrapper argument, a
+     * `mempty` instance) must be recorded while its MODULE's diagnostics are
+     * still being collected — `checkProject` drains diagnostics per module, so
+     * anything deferred past that point would be lost.
+     */
+    private inferBindingReporting(b: Binding, exported: Map<string, Scheme>, scope?: ReadonlyMap<string, string>): void {
+        const deferredStart = this.deferred.length;
+        const overloadStart = this.deferredOverloads.length;
+        this.inferBinding(b, exported, scope, false);
+        this.flushDeferredFrom(deferredStart, overloadStart);
+        this.deferred.length = deferredStart;
+    }
+
     inferBinding(b: Binding, exported: Map<string, Scheme>, scope?: ReadonlyMap<string, string>, reportScopeConflict = true): void {
-        if (scope && scope.has(b.name)) {
+        // A repeated LOCAL name is an overload (see `overloads`), not a
+        // conflict; only an import/alias of the same name clashes.
+        const claimedBy = scope?.get(b.name);
+        if (scope && claimedBy !== undefined && claimedBy !== `local binding '${b.name}'`) {
             if (reportScopeConflict) {
-                this.diag(b, conflictMessage(b.name, scope.get(b.name)!, 'a local binding'));
+                this.diag(b, conflictMessage(b.name, claimedBy, 'a local binding'));
             }
             // The local binding wins at runtime (the interpreter's env
             // override replaces the module value) — stop treating the
@@ -578,10 +644,183 @@ export class Inferencer {
         this.nodeTypes.set(b, t);
         const envTypes = [...this.env.values()].map(s => s.type);
         const scheme = this.u.generalize(envTypes, t);
+        // A second definition of the same name in one module is an OVERLOAD,
+        // not a conflict: `abs` may be given once per numeric type. The
+        // environment keeps the newest definition as the name's representative
+        // scheme (so hover, completion, and single-definition lookups are
+        // unchanged), while the full set drives selection at an application.
+        const existing = this.overloads.get(b.name);
+        if (existing) {
+            existing.push(scheme);
+        } else if (this.env.has(b.name) && this.moduleOwnNames.has(b.name)) {
+            this.overloads.set(b.name, [this.env.get(b.name)!, scheme]);
+        }
         this.env.set(b.name, scheme);
+        this.moduleOwnNames.add(b.name);
         // Exported bindings are the module's public surface: importers see
         // their generalized schemes (polymorphism survives qualified access).
-        if (b.export) exported.set(b.name, scheme);
+        // An over-exported name exports its TYPE as the whole overload set, so
+        // an importer resolves `abs` against every definition the library gave.
+        if (b.export) {
+            const set = this.overloads.get(b.name);
+            exported.set(b.name, set ? { ...scheme, type: overloadOf(set.map(s => s.type)) } : scheme);
+        }
+    }
+
+    /**
+     * Resolve an overloaded callee against the actual arguments. Returns the
+     * application's result type when `name` is genuinely overloaded, or null
+     * when it has a single definition (the ordinary path handles it).
+     *
+     * The choice is made by SHAPE, not by guessing: each alternative is
+     * instantiated and its parameter types are unified with the arguments. A
+     * run with exactly one surviving alternative picks it; a run with several
+     * is a genuine ambiguity (reported), and a run with none falls back to the
+     * first alternative so the ordinary application path reports the mismatch
+     * with its usual wording.
+     */
+    private beginOverload(
+        name: string,
+        e: import('./generated/ast.js').Application,
+        env: Map<string, Scheme>,
+    ): Type | null {
+        const set = this.overloads.get(name) ?? this.overloadsFromEnv(env, name);
+        if (!set || set.length < 2) return null;
+        const argTypes = e.arguments.map(a => this.inferArg(a, env));
+        const result = this.u.fresh();
+        this.deferredOverloads.push({ name, set, e, argTypes, result });
+        return result;
+    }
+
+    /**
+     * Pick each pending overload's alternative now that argument types have
+     * settled, and unify the winner with the result variable the application
+     * already returned. Runs from `flushDeferred`, alongside the other checks
+     * that need concrete rows.
+     */
+    private resolveOverloads(from: number): void {
+        const pending = this.deferredOverloads.slice(from);
+        this.deferredOverloads.length = from;
+        for (const use of pending) this.resolveOneOverload(use);
+    }
+
+    private resolveOneOverload(use: PendingOverload): void {
+        // Trial 1: which alternatives accept the (now concrete) arguments?
+        const winners: number[] = [];
+        for (const [i, scheme] of use.set.entries()) {
+            const snapshot = this.u.snapshotForTrial();
+            try {
+                if (this.trialApply(this.u.instantiate(scheme), use.argTypes) !== null) winners.push(i);
+            } catch {
+                // this alternative does not accept these arguments
+            } finally {
+                this.u.restoreTrial(snapshot);
+            }
+        }
+        if (winners.length === 0) {
+            // Nothing fits. Apply the first alternative for real so the
+            // ordinary mismatch wording is produced at the argument.
+            const first = use.set[0]!;
+            try {
+                const applied = this.applyOverload(first, use.argTypes);
+                this.u.unify(use.result, applied);
+                this.reportOverloadMismatch(use, 0);
+            } catch (err) {
+                if (err instanceof UnifyError) this.reportOverloadMismatch(use, 0);
+                else throw err;
+            }
+            return;
+        }
+        // Trial 2: of the survivors, which produce DISTINCT results? Two
+        // alternatives with the same result shape are the same choice —
+        // `abs : int -> int` and `abs : float -> float` are not ambiguous just
+        // because both accept a still-polymorphic argument.
+        const byResult = new Map<string, number>();
+        for (const i of winners) {
+            const snapshot = this.u.snapshotForTrial();
+            try {
+                const applied = this.trialApply(this.u.instantiate(use.set[i]!), use.argTypes)!;
+                const key = this.u.pretty(applied, true);
+                if (!byResult.has(key)) byResult.set(key, i);
+            } catch {
+                // ruled out above
+            } finally {
+                this.u.restoreTrial(snapshot);
+            }
+        }
+        if (byResult.size > 1) {
+            this.diag(use.e, `'${use.name}' is ambiguous here — it matches ${byResult.size} definitions (${[...byResult.keys()].join(' | ')}); annotate the argument to pick one`);
+            return;
+        }
+        // Commit the surviving choice on the live universe and tie it to the
+        // result variable this application already handed back.
+        const chosen = use.set[[...byResult.values()][0]!]!;
+        try {
+            this.u.unify(use.result, this.applyOverload(chosen, use.argTypes));
+        } catch (err) {
+            if (err instanceof UnifyError) this.reportOverloadMismatch(use, [...byResult.values()][0]!);
+            else throw err;
+        }
+    }
+
+    /** Point at the argument that fits no definition of an overloaded name. */
+    private reportOverloadMismatch(use: PendingOverload, chosen: number): void {
+        const scheme = use.set[chosen]!;
+        const expected = this.u.instantiate(scheme);
+        let f = expected;
+        for (const [i, argType] of use.argTypes.entries()) {
+            const r = this.u.peel(f);
+            if (r.kind !== 'fun') break;
+            const snapshot = this.u.snapshotForTrial();
+            try {
+                this.u.unify(r.from, argType);
+            } catch {
+                this.u.restoreTrial(snapshot);
+                const arg = use.e.arguments[i];
+                this.diag(arg, `'${use.name}' expects ${this.u.pretty(r.from, true)} as argument ${i + 1}, got ${this.u.pretty(argType, true)}`);
+                return;
+            }
+            f = r.to;
+        }
+    }
+
+    /** Apply an alternative, committing its unifications (no rollback). */
+    private applyOverload(scheme: Scheme, argTypes: readonly Type[]): Type {
+        let f = this.u.instantiate(scheme);
+        for (const argType of argTypes) {
+            const param = this.u.fresh();
+            const result = this.u.fresh();
+            this.u.unify(f, fun(param, result));
+            this.u.unify(param, argType);
+            f = result;
+        }
+        return f;
+    }
+
+    /** The overload set an imported/prelude name carries, if any. */
+    private overloadsFromEnv(env: Map<string, Scheme>, name: string): Scheme[] | null {
+        const scheme = env.get(name);
+        if (!scheme) return null;
+        const r = this.u.peel(scheme.type);
+        if (r.kind !== 'overload') return null;
+        return r.alternatives.map(type => ({ vars: scheme.vars, type }));
+    }
+
+    /**
+     * Try to apply a candidate to already-inferred arguments. Returns the
+     * result type when the candidate accepts every argument, or null when it
+     * does not. Never commits: the caller rolls the universe back.
+     */
+    private trialApply(candidate: Type, argTypes: readonly Type[]): Type | null {
+        let f = candidate;
+        for (const argType of argTypes) {
+            const r = this.u.peel(f);
+            if (r.kind === 'overload') return null;
+            if (r.kind !== 'fun') return null;
+            this.u.unify(r.from, argType);
+            f = r.to;
+        }
+        return f;
     }
 
     /**
@@ -600,10 +839,13 @@ export class Inferencer {
         topoCycleNames: ReadonlySet<string> = new Set(),
     ): { env: Map<string, Value>; seen: Set<string>; value: Value; diagnostics: Diagnostic[] } {
         const diagnostics: Diagnostic[] = [];
-        if (scope.has(b.name)) {
+        // Mirrors `inferBinding`: a repeated local name is an overload, while a
+        // name already claimed by an import is still a conflict.
+        const claimedBy = scope.get(b.name);
+        if (claimedBy !== undefined && claimedBy !== `local binding '${b.name}'`) {
             diagnostics.push({
                 node: b,
-                message: `name '${b.name}' (a local binding) conflicts with ${scope.get(b.name)!}`,
+                message: `name '${b.name}' (a local binding) conflicts with ${claimedBy}`,
             });
         }
 
@@ -697,14 +939,7 @@ export class Inferencer {
             return this.inferExpr(e.body as Expr, newEnv);
         }
         if (isUnaryMinus(e)) {
-            const t = this.inferExpr(e.operand, env);
-            try {
-                this.u.constrain(t, 'Num');
-            } catch (err) {
-                if (!(err instanceof ConstraintError)) throw err;
-                this.diag(e, `unary '-' requires a numeric expression, got ${this.u.pretty(t)}`);
-            }
-            return t;
+            return this.inferExpr(e.operand, env);
         }
         if (isBinaryExpression(e)) return this.inferBinary(e as unknown as import('./generated/ast.js').BinaryExpression, env);
         if (isAccessExpression(e)) return this.inferAccess(e, env);
@@ -1081,7 +1316,6 @@ export class Inferencer {
                         this.diag(node, `comparison expects non-null values — use is_null/is_not_null or from_maybe, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                         return prim('bool');
                     }
-                    this.u.constrain(lt, op === '==' || op === '!=' ? 'Eq' : 'Ord');
                 }
             } catch (err) {
                 if (err instanceof UnifyError) {
@@ -1105,8 +1339,8 @@ export class Inferencer {
             }
             return prim('bool');
         }
-        // `<>` has closed Semigroup/Monoid instances for strings and lists;
-        // records retain their structural right-biased merge behavior.
+        // `<>` concatenates strings and lists; records retain their structural
+        // right-biased merge behavior.
         if (op === '<>') {
             const left = this.u.peel(lt);
             const right = this.u.peel(rt);
@@ -1140,10 +1374,10 @@ export class Inferencer {
             }
             if (!rowLike(left) && !rowLike(right)) {
                 try {
-                    return this.u.unifyConstrained(lt, rt, 'Semigroup');
+                    return this.u.unify(lt, rt);
                 } catch (err) {
                     if (err instanceof UnifyError) {
-                        this.diag(node, `'<>' requires matching Semigroup operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                        this.diag(node, `'<>' requires matching operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                         return this.u.fresh();
                     }
                     throw err;
@@ -1168,15 +1402,18 @@ export class Inferencer {
             }
             return prim('float');
         }
-        // + - *: constrained polymorphism, `Num t => t -> t -> t`.
+        // + - *: operands must share one numeric type.
         if (this.rejectModeOperand(node, op, lt, rt)) return this.u.fresh();
         try {
-            return this.u.unifyConstrained(lt, rt, 'Num');
+            return this.u.unify(lt, rt);
         } catch (err) {
             if (err instanceof UnifyError) {
                 const rl = this.u.peel(lt);
                 const rr = this.u.peel(rt);
-                if (rl.kind === 'prim' && rr.kind === 'prim' && isNumericPrim(rl) && isNumericPrim(rr)) {
+                const literalClash = this.literalClashMessage(lt, rt);
+                if (literalClash) {
+                    this.diag(node, `'${op}' requires ${literalClash}`);
+                } else if (rl.kind === 'prim' && rr.kind === 'prim' && isNumericPrim(rl) && isNumericPrim(rr)) {
                     this.diag(node, `'${op}' requires numeric operands of the same type, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                 } else {
                     this.diag(node, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
@@ -1186,6 +1423,21 @@ export class Inferencer {
             }
             return this.u.fresh();
         }
+    }
+
+    /**
+     * Wording for a numeric literal meeting a primitive it can never be: a
+     * `1.5` literal is float-or-decimal and must not fit an `int` column.
+     * Null when the mismatch involves no literal.
+     */
+    private literalClashMessage(a: Type, b: Type): string | null {
+        for (const [literal, other] of [[a, b], [b, a]] as const) {
+            if (!this.u.isLiteral(literal)) continue;
+            const r = this.u.peel(other);
+            if (r.kind !== 'prim' || !isNumericPrim(r)) continue;
+            return `a float/decimal literal — write a literal of the matching type (e.g. 18 for an int)`;
+        }
+        return null;
     }
 
     // -----------------------------------------------------------------------
@@ -1246,31 +1498,6 @@ export class Inferencer {
         return current;
     }
 
-    /** Human wording for a failed type-class constraint, or null to stay
-     *  silent. `fnName` is the builtin being applied (when known) and lets
-     *  the date family keep its established "expects a date or timestamp
-     *  expression" message. A DateTime failure against a non-prim argument
-     *  (an unannotated lambda whose row fields fail later) returns null: the
-     *  constraint only surfaces there after deferred row unification, where
-     *  the interpreter already reports the exact field precisely — a static
-     *  echo would just print the whole lambda type as noise. */
-    private constraintMessage(err: ConstraintError, arg: Type, fnName: string | null): string | null {
-        if (err.constraint === 'Num') {
-            // `date_add`'s amount keeps its established wording (a test pins it).
-            return fnName === 'date_add'
-                ? `date_add expects a numeric amount, got type ${this.u.pretty(arg)}`
-                : `${err.constraint} requires a numeric type, got ${this.u.pretty(arg)}`;
-        }
-        if (err.constraint === 'Frac') return `a float/decimal literal cannot fit the type required here — write a literal of the matching type (e.g. 18 for an int)`;
-        if (err.constraint === 'DateTime') {
-            if (this.u.peel(arg).kind !== 'prim') return null;
-            return fnName
-                ? `${fnName} expects a date or timestamp expression, got type ${this.u.pretty(arg)}`
-                : `cannot apply — expects a date or timestamp value, got ${this.u.pretty(arg)}`;
-        }
-        return `${err.constraint} requires a supported instance, got ${this.u.pretty(arg)}`;
-    }
-
     private applyInferredFunction(f: Type, arg: Type, node: AstNode, name: string | null): Type {
         const param = this.u.fresh();
         const result = this.u.fresh();
@@ -1278,11 +1505,6 @@ export class Inferencer {
             this.u.unify(f, fun(param, result));
             this.u.unify(param, arg);
         } catch (err) {
-            if (err instanceof ConstraintError) {
-                const message = this.constraintMessage(err, arg, name);
-                if (message !== null) this.diag(node, message);
-                return this.u.fresh();
-            }
             if (err instanceof UnifyError) {
                 if (!this.reportNumericMix(node, err)) this.argError(name, 0, node, arg, param, f);
                 return this.u.fresh();
@@ -1308,6 +1530,16 @@ export class Inferencer {
             : null;
         if (operatorName && isBinaryOperator(operatorName)) {
             return this.inferOperatorApplication(operatorName, e, env, rawF);
+        }
+        // An overloaded name (`abs` given once per numeric type) is resolved
+        // against the ACTUAL argument types. Inside a row lambda those types
+        // are not concrete yet (`abs r.a` sees `r.a` as a fresh variable), so
+        // the choice is DEFERRED: the pending application records the result
+        // variable, and `flushDeferred` picks the alternative once the row has
+        // settled. Deferring keeps one code path for concrete and in-row uses.
+        if (e.func && isIdentifier(e.func)) {
+            const pending = this.beginOverload(e.func.name, e, env);
+            if (pending) return pending;
         }
         // `param "name"` — all occurrences of the same parameter name share
         // one named type hole, so conflicting uses cannot both type-check and
@@ -1447,11 +1679,7 @@ export class Inferencer {
             try {
                 this.u.unify(param, argType);
             } catch (err) {
-                if (err instanceof ConstraintError) {
-                    const message = this.constraintMessage(err, argType, funcName);
-                    if (message !== null) this.diag(argExpr, message);
-                    return this.u.fresh();
-                } else if (err instanceof UnifyError) {
+                if (err instanceof UnifyError) {
                     // Blindly unifying failed (the transactional unify already
                     // rolled back). If the expected parameter is a curried
                     // function, re-check the argument against its two expected
@@ -1495,11 +1723,6 @@ export class Inferencer {
         return f;
     }
 
-    /**
-     * `coalesce [a, b, c]` — the list form has the same typing as the
-     * curried two-argument form: every element is `maybe T` and the result is
-     * `maybe T`.
-     */
     private inferCoalesceList(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
         const listExpr = e.arguments[0]!;
         if (!isListLiteral(listExpr)) return this.u.fresh(); // interpreter reports the shape
@@ -1836,7 +2059,7 @@ export class Inferencer {
         const firstExpr = e.arguments[0]!;
         const first = this.inferArg(firstExpr, env);
         const raw = this.u.peel(first);
-        if (raw.kind !== 'mode' || raw.mode === 'group') {
+        if (!isModeOf(raw, 'agg', 'window')) {
             this.argError('over', 0, firstExpr, first, undefined, undefined);
             return this.u.fresh();
         }
@@ -2171,7 +2394,7 @@ export class Inferencer {
         const groupSigs = new Set<string>();
         for (const [key, ft] of res.fields) {
             const raw = this.u.peel(ft);
-            if (raw.kind !== 'mode' || raw.mode !== 'group') continue;
+            if (!isModeOf(raw, 'group')) continue;
             const groupArg = this.groupArgumentOf(entryNodes?.get(key));
             const sig = this.accessSignature(groupArg);
             if (sig) groupSigs.add(sig);
@@ -2180,7 +2403,8 @@ export class Inferencer {
         let modes = 0;
         for (const [key, ft] of res.fields) {
             const raw = this.u.peel(ft);
-            if (raw.kind === 'mode' && raw.mode === 'agg') {
+            const mode: ModeName | null = isModeOf(raw, 'agg', 'group', 'window') ? raw.kind : null;
+            if (mode === 'agg') {
                 const entry = entryNodes?.get(key);
                 const caseNode = this.unwrapApplicationExpr(entry);
                 if (caseNode && isCaseExpression(caseNode)) {
@@ -2191,10 +2415,10 @@ export class Inferencer {
                     }
                 }
                 modes++;
-                out.push([key, raw.of]);
-            } else if (raw.kind === 'mode' && raw.mode === 'group') {
+                out.push([key, modePayload(raw) ?? ft]);
+            } else if (mode === 'group') {
                 modes++;
-                out.push([key, raw.of]);
+                out.push([key, modePayload(raw) ?? ft]);
             } else {
                 this.diag(entryNodes?.get(key) ?? argExpr, `fold entry '${key}' must be wrapped in an aggregate (count, sum, ...) or group`);
                 out.push([key, ft]);
@@ -2270,20 +2494,21 @@ export class Inferencer {
         const out: [string, Type][] = [];
         for (const [key, ft] of res.fields) {
             const raw = this.u.peel(ft);
-            if (raw.kind === 'mode' && raw.mode === 'group') {
+            const mode: ModeName | null = isModeOf(raw, 'agg', 'group', 'window') ? raw.kind : null;
+            if (mode === 'group') {
                 this.diag(entryNodes?.get(key) ?? argExpr, `projection entry '${key}' cannot contain group`);
             } else if (raw.kind === 'order') {
                 this.diag(entryNodes?.get(key) ?? argExpr, `projection entry '${key}' cannot contain order items (asc/desc)`);
-            } else if (raw.kind === 'mode' && raw.mode === 'window') {
+            } else if (mode === 'window') {
                 const entry = entryNodes?.get(key);
                 const fnName = this.windowFunctionNameOf(entry) ?? 'window function';
                 // Anchor on the enclosing pipeline so this diagnostic and the
                 // interpreter's validateWindowUses message dedupe exactly.
                 this.diag(this.pipelineAnchorOf(e), `${fnName} must be wrapped in over (...) — e.g. over (${fnName}) { partition = [u.dept], order = [desc u.salary] }`);
-                out.push([key, raw.of]);
+                out.push([key, modePayload(raw) ?? ft]);
                 continue;
             }
-            out.push([key, raw.kind === 'mode' && raw.mode === 'agg' ? raw.of : ft]);
+            out.push([key, mode === 'agg' ? (modePayload(raw) ?? ft) : ft]);
         }
         return fun(queryOf(r.from), queryOf(rowOf(out, res.tail)));
     }
@@ -2634,6 +2859,17 @@ export class Inferencer {
             }
             return true;
         }
+        // A numeric literal that can never meet the primitive it was unified
+        // with: `u.age + 1.5` on an int column. The literal is still a
+        // category variable at this point, so the generic "cannot apply"
+        // wording would hide the real cause.
+        for (const [literal, other] of [[err.a, err.b], [err.b, err.a]] as const) {
+            if (!this.u.isLiteral(literal)) continue;
+            const r = this.u.peel(other);
+            if (r.kind !== 'prim' || !isNumericPrim(r)) continue;
+            this.diag(node, `a float/decimal literal cannot fit ${this.u.pretty(other)} — write a literal of the matching type (e.g. 18 for an int)`);
+            return true;
+        }
         return false;
     }
 
@@ -2749,15 +2985,11 @@ export class Inferencer {
     /** Post-unification checks the scheme types don't capture (numeric, date, order, literals). */
     private postCheckArg(name: string, index: number, argExpr: Expr, argType: Type, node: AstNode): void {
         const r = this.u.peel(argType);
-        // A numeric literal now types as a `Num`/`Frac` variable; it is still
-        // definitively not a date (and not a plain numeric elided by the
-        // prim-only check), so treat such literal variables as concrete values.
-        const isNumericLiteralVar = (rs: Type): boolean => rs.kind === 'var'
-            && (this.u.varInfo(rs.id).classes.has('Num') || this.u.varInfo(rs.id).classes.has('Frac'));
+        // A bare numeric literal is still an unresolved variable (there are
+        // no type classes left to pin it), but it is definitively not a date —
+        // unlike an unannotated table column, whose type is genuinely open.
+        const isNumericLiteralVar = (rs: Type): boolean => this.u.isLiteral(rs);
         if (DATE_VALUE_ARGUMENTS.has(name) && index === 0) {
-            // The DateTime class constraint catches concrete non-date prims
-            // during unification; a numeric *literal* is an unconstrained
-            // Nat variable until defaulted, so it is rejected here instead.
             if (isNumericLiteralVar(r)) {
                 this.diag(node, `${name} expects a date or timestamp expression, got type ${this.u.pretty(argType)}`);
             }
@@ -2780,6 +3012,10 @@ export class Inferencer {
         if ((name === 'sum' || name === 'avg' || name === 'abs'
             || name === 'ceil' || name === 'floor' || name === 'sqrt'
             || name === 'round') && index === 0) {
+            // Without a `Num` class the argument is an ordinary variable, so
+            // the numeric requirement is checked here once a concrete
+            // primitive is known: `abs u.name` must be a static error, while
+            // `abs u.age` / `abs u.balance` are fine.
             if (r.kind === 'prim' && !isNumericPrim(r)) {
                 this.diag(node, `${name} expects a numeric expression, got type ${this.u.pretty(argType)}`);
             }
@@ -2867,23 +3103,10 @@ export class Inferencer {
         }
         if (isTypeHole(t)) return this.typeHole(t.name, names);
         if (isConstrainedType(t)) {
-            // `Num t => t -> t` — apply each typeclass constraint to its type
-            // variable, then translate the body with those vars in scope.
-            for (const c of t.constraints) {
-                const classNames: readonly TypeClass[] = ['Num', 'Frac', 'Eq', 'Ord', 'DateTime', 'Semigroup', 'Monoid', 'Functor', 'Applicative', 'Alternative', 'Monad'];
-                if (!classNames.includes(c.name as TypeClass)) {
-                    this.diag(c, `unknown typeclass '${c.name}' — the closed typeclasses are: ${classNames.join(', ')}`);
-                    continue;
-                }
-                const tv = this.typeOrRowVar(c.var, 'type', rigid, names, rigidVars);
-                try {
-                    this.u.constrain(tv, c.name as TypeClass);
-                } catch (err) {
-                    if (err instanceof ConstraintError) {
-                        this.diag(c, `'${c.name}' does not apply here`);
-                    } else if (!(err instanceof UnifyError)) throw err;
-                }
-            }
+            // Type-class constraints are no longer part of the language: a
+            // constrained signature is accepted but the constraint itself is
+            // ignored (the body is still translated with its variables in
+            // scope), so old `Num t => t -> t` spellings keep parsing.
             return this.translateType(t.type, rigid, names, rigidVars);
         }
         if (isFunType(t)) return fun(this.translateType(t.left, rigid, names, rigidVars), this.translateType(t.right, rigid, names, rigidVars));

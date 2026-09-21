@@ -1,3 +1,4 @@
+# no prelude
 # The standard library is intentionally ordinary tetaue code. SQL
 # primitives and scalar types are native builtin names; only reusable
 # functional definitions live here.
@@ -76,16 +77,39 @@ export right_substring: string -> int -> string = s => n => case sql_dialect.nam
 export mod: int -> int -> int = a => b => sql_func "MOD" [a, b]
 export like: string -> string -> bool = x => p => sql_infix "LIKE" x p
 
-# Polymorphic math unaries carry a Num typeclass constraint, so abs u.name
-# is a static error. The lowering is a plain function call in every dialect.
-export abs: Num t => t -> t = x => sql_func "ABS" [x]
-export ceil: Num t => t -> t = x => case sql_dialect.name {
+# ceil is spelled differently on sqlite; the shared body keeps that branch in
+# ONE place instead of repeating it per overload. It is private (unexported),
+# so it never becomes part of the prelude's public surface.
+ceil_impl = x => case sql_dialect.name {
     "sqlite" => sql_func "CEILING" [x],
     _        => sql_func "CEIL" [x],
 }
-export floor: Num t => t -> t = x => sql_func "FLOOR" [x]
-export sqrt: Num t => t -> t = x => sql_func "SQRT" [x]
-export pow: Num a => Num b => a -> b -> float = x => y => sql_func "POW" [x, y]
+
+# Numeric math unaries are OVERLOADED, one definition per numeric type —
+# this is what replaces the compiler-owned Num class: the argument's type
+# selects the definition (abs u.age takes the int one, abs u.balance the
+# float one), and a non-numeric argument matches no definition at all.
+# The lowering is a plain function call in every dialect.
+export abs: int -> int = x => sql_func "ABS" [x]
+export abs: float -> float = x => sql_func "ABS" [x]
+export abs: decimal -> decimal = x => sql_func "ABS" [x]
+
+export ceil: int -> int = x => ceil_impl x
+export ceil: float -> float = x => ceil_impl x
+export ceil: decimal -> decimal = x => ceil_impl x
+
+export floor: int -> int = x => sql_func "FLOOR" [x]
+export floor: float -> float = x => sql_func "FLOOR" [x]
+export floor: decimal -> decimal = x => sql_func "FLOOR" [x]
+
+export sqrt: float -> float = x => sql_func "SQRT" [x]
+export sqrt: decimal -> decimal = x => sql_func "SQRT" [x]
+
+export pow: int -> int -> int = x => y => sql_func "POW" [x, y]
+export pow: float -> float -> float = x => y => sql_func "POW" [x, y]
+export pow: decimal -> decimal -> decimal = x => y => sql_func "POW" [x, y]
+
+
 
 # position varies per dialect in BOTH the function name and the argument
 # order, so its lowering branches on the hidden sql_dialect value. The

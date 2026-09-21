@@ -23,7 +23,7 @@ import { collectModuleTree, moduleOf } from './imports.js';
 import type { ResolvedImportEdge, ResolvedExportEdge } from './imports.js';
 import type { ProjectModule } from './imports.js';
 import { createImportResolver } from './resolve.js';
-import { createModuleLoader, parseModel } from './module-cache.js';
+import { createModuleLoader, parseModel, detectNoPrelude } from './module-cache.js';
 import type { Model } from './generated/ast.js';
 import { standardPrelude } from './prelude.js';
 import { stringEscapeWarningsFor } from './strings.js';
@@ -189,6 +189,16 @@ export function compileModuleText(
     // not at the importing file).
     const prelude = standardPrelude(services);
     const anchorModules = [...modules, prelude];
+    // Attach noPrelude meta based on source text
+    const readMyFile = (uri: string) => moduleLoader.read(uri);
+    if (detectNoPrelude(rootText)) main.noPrelude = true;
+    // Propagate noPrelude for all collected modules by re-reading their source
+    for (const m of modules) {
+        if (m.uri) {
+            const txt = readMyFile(m.uri) ?? '';
+            if (detectNoPrelude(txt)) m.noPrelude = true;
+        }
+    }
     const { value, diagnostics: merged } = checkProject(modules, {
         requireQuery,
         // Strict main by default for render/check; `build` opts in via

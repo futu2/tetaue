@@ -30,6 +30,8 @@ export interface ProjectModule {
      * `ModuleTree.exportsByModule` for tree-resolved re-exports.
      */
     exports?: readonly ResolvedExportEdge[];
+    /** If true, the module opts out of the default prelude injection. */
+    noPrelude?: boolean;
 }
 
 export interface ResolvedImportEdge {

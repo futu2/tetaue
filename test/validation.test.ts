@@ -18,6 +18,9 @@ describe('semantic errors', () => {
     });
 
     test('duplicate binding name', () => {
+        // Two CALLABLE definitions of one name are an overload (a reader picks
+        // by argument type); two queries have no such discriminator, so a
+        // repeated non-callable name stays an error.
         expect(errors(`${USERS}\nusers: query { a: int } = table "x"`).join('\n')).toContain("duplicate binding name 'users'");
     });
 
