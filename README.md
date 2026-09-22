@@ -599,8 +599,11 @@ sides render as subqueries). Because the merger picks the output columns explici
 overlapping column names are not an error — rename them in the merger instead.
 For outer joins, only the side that can be absent is nullable inside the merger:
 the right side of `joinLeft`, the left side of `joinRight`, and both sides of
-`joinFull`. Columns projected from the guaranteed side and literal values keep
-their original non-null types.
+`joinFull`. Nullability is **per column**, not per row: an outer join never
+drops the whole joined row, it sets each of its columns to NULL. So in a
+`joinLeft` merger `o.total` has type `(maybe float)` and is read directly — no
+whole-row unwrapping — while columns from the guaranteed side and literal
+values keep their original non-null types.
 
 ```
 by_age = sort (u => [desc u.age])

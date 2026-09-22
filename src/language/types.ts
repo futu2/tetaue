@@ -56,6 +56,21 @@ export type Type =
     | { kind: 'list'; of: Type }
     /** A record row: unordered label → type map, plus an optional tail variable. */
     | { kind: 'row'; fields: Map<string, Type>; tail: Type | null }
+    /**
+     * The FIELD-WISE SQL null extension of a row: `nullRow s` is the schema of
+     * the null-extended side of an outer join. Every field `a: τ` of `s`
+     * becomes `a: (maybe τ)` (idempotently — an already-maybe field does not
+     * gain a second layer), while the row itself is always present.
+     *
+     * This is what the merger of `joinLeft`/`joinRight`/`joinFull` sees, and
+     * it is NOT the same type as `maybe s`:
+     *   - `maybe s`   — the whole row may be absent (no such case in SQL);
+     *   - `nullRow s` — the row is present, each of its fields may be NULL.
+     * `nullRow` reduces lazily: it stays symbolic while `of` is an unbound row
+     * variable and expands into a concrete all-maybe row once `of` is known
+     * (see TypeUniverse.reduceNullRow, applied by `peel`).
+     */
+    | { kind: 'nullRow'; of: Type; tail: Type | null }
     | { kind: 'query'; row: Type }
     /** An ORDER BY item (`asc`/`desc`). */
     | { kind: 'order' }
@@ -160,6 +175,13 @@ export function maybeOf(t: Type): Type {
 /** SQL null extension is idempotent even though explicit Maybe nesting is not. */
 export function nullExtendedMaybeOf(t: Type): Type {
     return t.kind === 'maybe' ? t : { kind: 'maybe', of: t, flattenNullExtension: true };
+}
+
+/** The field-wise null extension of a row: `nullRow r` (see the `Type` union). */
+export function nullRowOf(t: Type, tail: Type | null = null): Type {
+    // An idempotent wrapper never stacks (same rule as nullExtendedMaybeOf).
+    if (t.kind === 'nullRow') return t;
+    return { kind: 'nullRow', of: t, tail };
 }
 
 export function fun(from: Type, to: Type): Type {
@@ -340,7 +362,38 @@ export class TypeUniverse {
             if (inner.kind !== 'maybe') break;
             r = inner;
         }
+        // A null extension whose row is now known expands into an all-maybe
+        // row, so every structural consumer (field access, unification,
+        // printing) sees it as an ordinary row.
+        if (r.kind === 'nullRow') r = this.reduceNullRow(r);
         return r;
+    }
+
+    /**
+     * Expand `nullRow r` into the concrete row `r` with every field
+     * null-extended (idempotently). Returns the `nullRow` unchanged while its
+     * inner row is still an unbound variable — the extension stays symbolic
+     * until the row's fields are known, which is what lets an outer-join
+     * merger be typed before (or independently of) the joined schema.
+     */
+    private reduceNullRow(r: Extract<Type, { kind: 'nullRow' }>): Type {
+        const inner = this.peel(r.of);
+        if (inner.kind !== 'row') return r;
+        const resolved = this.resolveRow(inner);
+        const fields = new Map<string, Type>();
+        for (const [label, type] of resolved.fields) fields.set(label, this.nullExtend(type));
+        return { kind: 'row', fields, tail: resolved.tail ?? r.tail };
+    }
+
+    /** Add SQL nullability without nesting an existing Maybe (field-wise). */
+    nullExtend(t: Type): Type {
+        return this.peel(t).kind === 'maybe' ? t : nullExtendedMaybeOf(t);
+    }
+
+    /** Public form of `reduceNullRow` for callers outside the universe. */
+    reduceNullRowType(t: Type): Type {
+        const r = this.resolve(t);
+        return r.kind === 'nullRow' ? this.reduceNullRow(r) : r;
     }
 
         /** Resolve a type through variable bindings. */
@@ -360,6 +413,10 @@ export class TypeUniverse {
                 case 'list': visit(r.of); break;
                 case 'row':
                     for (const f of r.fields.values()) visit(f);
+                    if (r.tail) visit(r.tail);
+                    break;
+                case 'nullRow':
+                    visit(r.of);
                     if (r.tail) visit(r.tail);
                     break;
                 case 'query': visit(r.row); break;
@@ -492,6 +549,13 @@ export class TypeUniverse {
     private unifyInternal(a: Type, b: Type): Type {
         a = this.peelNullExtension(a);
         b = this.peelNullExtension(b);
+        // A field-wise null-extended row unifies as the all-maybe row it
+        // denotes, so an outer-join merger's parameter can meet either a
+        // `nullRow s` from the scheme or a hand-written `{ a: (maybe τ) }`
+        // annotation. Symbolic `nullRow` (inner row still variable) stays as
+        // is and unifies only with another null row or a row variable.
+        a = this.reduceNullRowType(a);
+        b = this.reduceNullRowType(b);
         if (a === b) return a;
         if (a.kind === 'var' && b.kind === 'var' && a.id === b.id) return a;
 
@@ -573,6 +637,15 @@ export class TypeUniverse {
                     return a;
                 }
                 break;
+            case 'nullRow':
+                // Only reachable for a SYMBOLIC extension (a known inner row
+                // was already reduced above): unify the rows being extended, so
+                // the fields materialize on both sides when the schema arrives.
+                if (b.kind === 'nullRow') {
+                    this.unifyRow(this.resolve(a.of), this.resolve(b.of));
+                    return a;
+                }
+                break;
             case 'order':
                 if (b.kind === 'order') return a;
                 break;
@@ -594,6 +667,9 @@ export class TypeUniverse {
             if (inner.kind !== 'maybe') break;
             r = inner;
         }
+        // Keep the reduction consistent with `peel`: a null extension over a
+        // known row is the all-maybe row, not a wrapper.
+        if (r.kind === 'nullRow') r = this.reduceNullRow(r);
         return r;
     }
 
@@ -837,6 +913,12 @@ export class TypeUniverse {
                 return { kind: 'row', fields, tail };
             }
             case 'query': return queryOf(this.substitute(subst, r.row));
+            case 'nullRow': {
+                // Substituting the inner row can make the extension reducible.
+                const of = this.substitute(subst, r.of);
+                const tail = r.tail ? this.substitute(subst, r.tail) : null;
+                return this.reduceNullRowType(nullRowOf(of, tail));
+            }
             case 'builtin': return builtinOf(r.name, this.substitute(subst, r.of));
             case 'agg': return aggOf(this.substitute(subst, r.of));
             case 'group': return groupOf(this.substitute(subst, r.of));
@@ -884,6 +966,10 @@ export class TypeUniverse {
                     const tailText = tail ? ` | ${p(tail, false)}` : '';
                     return `{ ${body}${tailText} }`;
                 }
+                case 'nullRow':
+                    // A symbolic extension prints as the null extension of the
+                    // row it wraps; a reducible one already peeled to a row.
+                    return `${p(this.resolve(r.of), true)}?`;
                 case 'query': return `query ${p(r.row, false)}`;
                 case 'builtin': return p(r.of, paren);
                 case 'agg': return `agg ${p(r.of, false)}`;

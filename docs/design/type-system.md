@@ -45,6 +45,11 @@ user-declared type and **no** type alias: a module can only bind values, and
 annotations are written inline. This keeps the core small and the grammar
 flat — see `docs/design/core.md`.
 
+One constructor is internal rather than writable: `nullRow r`, the field-wise
+SQL null extension an outer join applies to the null side (see §4). It has no
+surface syntax — it appears in a join's type and in hover, and it unifies with
+the all-maybe record a user can write by hand.
+
 ## 3. Type syntax
 
 ```
@@ -92,11 +97,27 @@ tail       ::= lowercase-row-variable | '?hole_name'
 - Scalar SQL functions (`upper`, `length`, `trim`, date functions, ...) take
   and return non-maybe values; SQL NULL propagation is achieved explicitly
   with `from_maybe`/`coalesce`, not by implicit lifting.
-- **Outer joins** expose the null-extended input as a maybe row to the merger:
-  `joinLeft` makes the right row maybe, `joinRight` makes the left row maybe,
-  and `joinFull` makes both maybe. Field access through a maybe row produces a
-  maybe field (without adding a second layer to an already-maybe field), so
-  fields from a guaranteed side and constant projections remain non-null.
+- **Outer joins** expose the null-extended input as a FIELD-WISE null-extended
+  row to the merger: `joinLeft` null-extends the right row, `joinRight` the
+  left, and `joinFull` both. The extension is written `nullRow r` and means
+  "the row `r`, with every field made `(maybe τ)`" — NOT `(maybe r)`:
+
+  ```
+  nullRow { id: int, name: string }  =  { id: (maybe int), name: (maybe string) }
+  ```
+
+  The distinction is the SQL one: an outer join never makes the whole joined
+  row absent, it makes each of its fields NULL. So a merger reads the joined
+  fields directly (`r.y : (maybe string)`) instead of being forced to unwrap a
+  whole-row maybe that no query can produce. A field that is already `maybe`
+  does not gain a second layer, so fields from the guaranteed side and constant
+  projections stay non-null.
+
+  The extension is idempotent and reduces lazily: `nullRow r` stays symbolic
+  while `r` is still an unbound row variable (the joined schema arrives later)
+  and expands to the all-maybe row once `r` is known. Unification treats the
+  two spellings as the same type, so a `nullRow` parameter also accepts a
+  hand-written `{ id: (maybe int) }` annotation.
 - **Aggregates** that SQL can make NULL on empty/all-null input
   (`sum`, `avg`, `min`, `max`) produce maybe results:
   `sum : numeric -> agg (maybe numeric)`. `count : a -> agg int` and
@@ -181,11 +202,11 @@ drop        : int -> query r -> query r
 joinInner   : forall r s t. query s -> (r -> s -> bool)
                 -> (r -> s -> {t}) -> query r -> query {t}
 joinLeft    : forall r s t. query s -> (r -> s -> bool)
-                -> (r -> (maybe s) -> {t}) -> query r -> query {t}
+                -> (r -> (nullRow s) -> {t}) -> query r -> query {t}
 joinRight   : forall r s t. query s -> (r -> s -> bool)
-                -> ((maybe r) -> s -> {t}) -> query r -> query {t}
+                -> ((nullRow r) -> s -> {t}) -> query r -> query {t}
 joinFull    : forall r s t. query s -> (r -> s -> bool)
-                -> ((maybe r) -> (maybe s) -> {t}) -> query r -> query {t}
+                -> ((nullRow r) -> (nullRow s) -> {t}) -> query r -> query {t}
 union       : forall r. query r -> query r -> query r
 
 fmap        : closed dispatch for `(a -> b) -> (maybe a) -> (maybe b)`,

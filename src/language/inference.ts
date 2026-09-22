@@ -28,7 +28,7 @@ import {
 import type { Type as LangiumType } from './generated/ast.js';
 import {
     TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
-    builtinOf, fun, isModeOf, listOf, maybeOf, modeOf, modePayload, nullExtendedMaybeOf, overloadOf, prim, queryOf, rowOf, truthType,
+    builtinOf, fun, isModeOf, listOf, maybeOf, modeOf, modePayload, nullExtendedMaybeOf, nullRowOf, overloadOf, prim, queryOf, rowOf, truthType,
     type ModeName,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
@@ -1077,7 +1077,7 @@ export class Inferencer {
 
     /** Add SQL outer-join nullability without nesting an existing Maybe. */
     private nullExtend(t: Type): Type {
-        return this.u.peel(t).kind === 'maybe' ? t : nullExtendedMaybeOf(t);
+        return this.u.nullExtend(t);
     }
 
     /**
@@ -1138,14 +1138,51 @@ export class Inferencer {
     }
 
     /**
+     * When `param` is a curried two-argument function standing for an outer
+     * join's `on`/merger slot, return its two parameter types so the argument
+     * can be CHECKED against them instead of inferred blind. Undefined
+     * otherwise. A side counts when it is a field-wise null extension
+     * (`nullRow`) OR the all-maybe row that extension reduces to — a scheme
+     * whose joined schema is already known has been reduced by `peel`.
+     */
+    private nullRowPairOf(param: Type): { left: Type; right: Type } | null {
+        const f = this.u.peel(param);
+        if (f.kind !== 'fun') return null;
+        const g = this.u.peel(f.to);
+        if (g.kind !== 'fun') return null;
+        const isNullExtended = (t: Type): boolean =>
+            this.u.resolve(t).kind === 'nullRow' || this.isAllMaybeRow(t);
+        return isNullExtended(f.from) || isNullExtended(g.from)
+            ? { left: f.from, right: g.from }
+            : null;
+    }
+
+    /**
+     * Whether `t` is a row in which EVERY field is nullable — the reduced
+     * shape of a `nullRow` extension (and the text a merger parameter prints
+     * once the joined schema is known). An empty row is not one, so an
+     * unconstrained parameter never matches.
+     */
+    private isAllMaybeRow(t: Type): boolean {
+        const r = this.u.peel(t);
+        if (r.kind !== 'row') return false;
+        const { fields } = this.u.resolveRow(r);
+        if (fields.size === 0) return false;
+        for (const type of fields.values()) {
+            if (this.u.peel(type).kind !== 'maybe') return false;
+        }
+        return true;
+    }
+
+    /**
      * Fallback for the generic application loop: when blindly unifying a
      * higher-order argument fails (transactional `unify` has already rolled
      * back), if the expected parameter is a curried function `f => g => rest`,
      * re-check the argument against the two expected parameter types. This is
      * what lets bound/partially-applied outer-join steps (`step = joinLeft r`,
      * `step = joinRight r`) type-check: the null-extended side of the scheme is
-     * `maybe row`, which a freshly-inferred lambda's open-row parameters cannot
-     * unify with. Returns null when there is nothing useful to check (the
+     * `nullRow row`, which a freshly-inferred lambda's open-row parameters
+     * cannot unify with. Returns null when there is nothing useful to check (the
      * argument is not a function argument we can re-check).
      */
     private tryFetchCheckedArgType(param: Type, e: Expr, env: Map<string, Scheme>): Type | null {
@@ -1201,7 +1238,15 @@ export class Inferencer {
             return this.u.fresh();
         }
         const nullExtended = r.kind === 'maybe';
-        const fieldReceiver = nullExtended ? r.of : recv;
+        // A field-wise null-extended row (`nullRow s`) behaves like the row it
+        // wraps for LOOKUP purposes, but every field it yields is a maybe.
+        // The wrapper must be read from the RAW resolved type: `peel` already
+        // reduces a resolvable nullRow to its all-maybe row, so inspecting the
+        // peeled type alone would mistake a still-symbolic extension (the
+        // joined schema arrives later) for an ordinary row and lose the maybe.
+        const rawRecv = this.u.resolve(recv);
+        const nullRow = rawRecv.kind === 'nullRow' ? rawRecv : null;
+        const fieldReceiver = nullExtended ? r.of : nullRow?.of ?? recv;
         const receiverRow = this.u.peel(fieldReceiver);
         if (receiverRow.kind === 'query') {
             this.diag(e, `tables have no fields — access columns through a row parameter inside a lambda, e.g. map (u => u.${property})`);
@@ -1224,7 +1269,24 @@ export class Inferencer {
             this.diag(e, `unknown column '${property}'${labels.length > 0 ? ` — available: ${labels.join(', ')}` : ''}`);
             return this.u.fresh();
         }
-        return nullExtended ? this.nullExtend(field.type) : field.type;
+        if (!nullExtended && !nullRow) return field.type;
+        // Null-extended access: the field may be NULL, so bind it to `(maybe τ)`
+        // — idempotently. Reading through a SYMBOLIC extension adds the field to
+        // the inner row by this very read, so the maybe must be attached NOW: a
+        // later reduction would come too late for a check like `r.id + 1` on the
+        // null side. Reading through an already-reduced extension usually finds
+        // the maybe stored in the row, and is a no-op here.
+        const fieldType = field.type;
+        if (this.u.peel(fieldType).kind === 'maybe') return fieldType;
+        const extended = nullExtendedMaybeOf(fieldType);
+        try {
+            this.u.unify(fieldType, extended);
+        } catch {
+            // A rigid annotated field cannot be rewrapped; hand back the maybe
+            // form so the diagnostic names the nullability contract.
+            return extended;
+        }
+        return fieldType;
     }
 
     private inferBinary(e: import('./generated/ast.js').BinaryExpression, env: Map<string, Scheme>): Type {
@@ -1640,8 +1702,6 @@ export class Inferencer {
         const argTypes: Type[] = [];
         for (let i = 0; i < e.arguments.length; i++) {
             const argExpr = e.arguments[i]!;
-            let argType = this.inferArg(argExpr, env);
-            argTypes.push(argType);
             const param = this.u.fresh();
             const result = this.u.fresh();
             let failed = false;
@@ -1649,11 +1709,26 @@ export class Inferencer {
                 this.u.unify(f, fun(param, result));
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    this.argError(funcName, i, argExpr, argType, param, f);
+                    this.argError(funcName, i, argExpr, this.inferArg(argExpr, env), param, f);
                     return this.u.fresh();
                 }
                 throw err;
             }
+            // A curried higher-order parameter whose sides carry SQL null
+            // extension (`nullRow`, from a bound/partially-applied outer-join
+            // step) must be CHECKED, not inferred blind: inferring the argument
+            // on its own gives its parameters plain rows, so the null side loses
+            // its per-field maybes and a `r.id + 1` there would go unreported.
+            // Check against the expected parameter types first, exactly like the
+            // direct join path; otherwise infer the argument as usual.
+            let argType: Type;
+            const expectedPair = this.nullRowPairOf(param);
+            if (expectedPair) {
+                argType = this.inferCheckedTwoArg(argExpr, env, expectedPair.left, expectedPair.right);
+            } else {
+                argType = this.inferArg(argExpr, env);
+            }
+            argTypes.push(argType);
             // A `merge` merger passed to a curried higher-order step (reached
             // through a bound/partially-applied value) under-specifies the
             // result row under blind inference (the union row stays open).
@@ -2158,8 +2233,10 @@ export class Inferencer {
             }
             return this.u.fresh();
         }
-        const mergerLeft = kindName === 'right' || kindName === 'full' ? maybeOf(r) : r;
-        const mergerRight = kindName === 'left' || kindName === 'full' ? maybeOf(s) : s;
+        // SQL null extension is field-wise: the merger sees each null-extended
+        // side as `nullRow s` (every field maybe), never as `maybe s`.
+        const mergerLeft = kindName === 'right' || kindName === 'full' ? nullRowOf(r) : r;
+        const mergerRight = kindName === 'left' || kindName === 'full' ? nullRowOf(s) : s;
         const mergerT = this.inferCheckedTwoArg(e.arguments[2]!, env, mergerLeft, mergerRight);
         const expectedMerger = fun(mergerLeft, fun(mergerRight, t));
         // A plain `merge` is the advertised full-row-union shorthand. The
@@ -2726,9 +2803,17 @@ export class Inferencer {
      * both sides.
      */
     private mergeRowShape(t: Type, at: AstNode, which: 'first' | 'second'): { fields: Map<string, Type>; tail: Type | null; varId: number | null; nullExtended: boolean } | null {
-        const outer = this.u.peel(t);
-        const nullExtended = outer.kind === 'maybe';
-        const r = this.u.peel(nullExtended ? outer.of : outer);
+        const peeled = this.u.peel(t);
+        // Read the null-extension wrapper from the RAW resolved type: `peel`
+        // already reduces a resolvable `nullRow` to an all-maybe row, so a
+        // symbolic extension (inner row still a variable, its fields
+        // materialized later) would otherwise be mistaken for a plain row and
+        // lose the per-field maybes on the joined side.
+        const raw = this.u.resolve(t);
+        const isNullRow = raw.kind === 'nullRow';
+        const outer = isNullRow ? this.u.reduceNullRowType(raw) : peeled;
+        const nullExtended = outer.kind === 'maybe' || isNullRow;
+        const r = this.u.peel(nullExtended && outer.kind === 'maybe' ? outer.of : outer);
         if (r.kind === 'row') {
             const resolved = this.u.resolveRow(r);
             const fields = new Map<string, Type>();

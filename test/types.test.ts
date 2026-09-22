@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import type { AstNode } from 'langium';
 import { parseModel, typeErrors, allErrors, render, services } from './helpers.ts';
 import { checkProject } from '../src/language/checker.ts';
 import {
@@ -782,6 +783,40 @@ describe('post-review design fixes', () => {
         return b ? result.typeOf(b) : undefined;
     }
 
+    /** Rendered types of every Lambda node under binding `binding`. */
+    function mergerLambdaTypes(text: string, binding: string): string[] {
+        const model = parseModel(text);
+        const result = inferProject(
+            [{ model, uri: undefined, imports: [] }],
+            new Map(),
+            standardPrelude(services),
+        );
+        const root = model.bindings.find(x => x.name === binding)!;
+        const out: string[] = [];
+        const seen = new Set<AstNode>();
+        const walk = (n: AstNode): void => {
+            if (seen.has(n)) return;
+            seen.add(n);
+            if ((n as unknown as { $type: string }).$type === 'Lambda') {
+                const t = result.typeOf(n);
+                if (t) out.push(t);
+            }
+            for (const key of Object.keys(n)) {
+                if (key.startsWith('$')) continue;
+                const value = (n as unknown as Record<string, unknown>)[key];
+                if (Array.isArray(value)) {
+                    for (const v of value) {
+                        if (v && typeof v === 'object' && '$type' in (v as object)) walk(v as AstNode);
+                    }
+                } else if (value && typeof value === 'object' && '$type' in (value as object)) {
+                    walk(value as AstNode);
+                }
+            }
+        };
+        walk(root);
+        return out;
+    }
+
     test('param names share one project-wide type', () => {
         const src = `users: query { id: int, name: string } = table "users"
 q = users & map (u => { n = param "x" + 1, s = upper (param "x") })`;
@@ -831,6 +866,40 @@ q = a & ${name} b (l => r => l.id == r.id) (l => r => {
 b: query { id: int } = table "b"
 q = a & joinLeft b (l => r => l.id == r.id) (l => r => { id = r.id + 1 })`;
         expect(typeErrors(src).join('\n')).toContain('non-null numeric operands');
+    });
+
+    test('outer join null-extends the merged row COLUMN-WISE, not as (maybe row)', () => {
+        // The merger sees the null-extended side as a row whose every column
+        // is maybe — not a maybe row. SQL never omits the joined row, it NULLs
+        // its columns, so a whole-row maybe would demand an impossible case.
+        // Pin the merger's own parameter type so a regression names the bug.
+        const source = (name: string) => `a: query { id: int, x: string } = table "a"
+b: query { id: int, y: string } = table "b"
+q = a & ${name} b (l => r => l.id == r.id) (l => r => { lid = l.id, rid = r.id, x = l.x, y = r.y })`;
+        const expected = new Map([
+            ['joinInner', '{ id: int, x: string } -> { id: int, y: string } -> { lid: int, rid: int, x: string, y: string }'],
+            ['joinLeft', '{ id: int, x: string } -> { id: (maybe int), y: (maybe string) } -> { lid: int, rid: (maybe int), x: string, y: (maybe string) }'],
+            ['joinRight', '{ id: (maybe int), x: (maybe string) } -> { id: int, y: string } -> { lid: (maybe int), rid: int, x: (maybe string), y: string }'],
+            ['joinFull', '{ id: (maybe int), x: (maybe string) } -> { id: (maybe int), y: (maybe string) } -> { lid: (maybe int), rid: (maybe int), x: (maybe string), y: (maybe string) }'],
+        ]);
+        for (const [name, mergerType] of expected) {
+            const src = source(name);
+            expect(typeErrors(src)).toEqual([]);
+            expect(mergerLambdaTypes(src, 'q')).toContain(mergerType);
+            // No whole-row maybe survives in any join's merger signature.
+            expect(mergerLambdaTypes(src, 'q').some(t => t.includes('(maybe {'))).toBe(false);
+        }
+    });
+
+    test('nullRow unifies with a hand-written all-maybe record annotation', () => {
+        // The internal null extension is not surface syntax, but it must agree
+        // with the all-maybe record a user writes by hand. Naming the merger's
+        // parameter with an explicit annotation exercises exactly that unify.
+        const src = `a: query { id: int } = table "a"
+b: query { id: int } = table "b"
+q = a & joinLeft b (l => r => l.id == r.id) (l => (r: { id: (maybe int) }) => { id = r.id })`;
+        expect(typeErrors(src)).toEqual([]);
+        expect(typeOf(src, 'q')).toBe('query { id: (maybe int) }');
     });
 
     test('null extension does not nest an existing nullable column', () => {

@@ -31,6 +31,7 @@ Prim    ::= int | float | decimal | string | bool | date | timestamp
           | [τ]                     -- lists (types.ts:166)
           | { ℓ: τ, …, | ρ }        -- open record row (types.ts:189)
           | query τ                 -- tables / pipelines (types.ts:170)
+          | nullRow τ               -- field-wise SQL null extension (types.ts:73)
           | order                   -- asc/desc items (builtin.ts:151-152)
           | mode m τ                -- m ∈ {agg, group, window} (types.ts:180)
           | truth                   -- bool ∨ maybe bool (types.ts:147)
@@ -219,13 +220,21 @@ their payload — but the type-checking pass deliberately re-inspects the raw,
 `from_maybe : a -> maybe a -> a`, `is_null : maybe a -> bool` (builtin.ts:243-248).
 There is **no** implicit `T → maybe T`.
 
-**Outer joins** expose the null-extended input as a maybe *row* to the merger
-(`joinScheme`, builtin.ts:108): `joinLeft` makes the right row maybe,
-`joinRight` the left, `joinFull` both. Field access through a maybe row
-produces a maybe field without double-nesting: `nullExtend` (inference.ts:793)
-is the idempotent null extension (`nullExtendedMaybeOf`, types.ts:158), and a
-maybe row accessed twice stays `maybe τ` (verified: `main : query { cid: (maybe int), oid: int }`
-for a joinLeft).
+**Outer joins** expose the null-extended input as a **field-wise** null-extended
+row to the merger (`joinScheme`, builtin.ts:108): `joinLeft` null-extends the
+right row, `joinRight` the left, `joinFull` both — written `nullRow r`, meaning
+"the row `r` with every field made `maybe τ`". It is deliberately *not*
+`maybe r`: an outer join never makes the whole joined row absent, it makes each
+of its fields NULL. Field access through the extension produces a maybe field
+without double-nesting (`nullExtend` / `TypeUniverse.nullExtend`,
+inference.ts:1079, types.ts:389), and a field already `maybe` keeps its single
+layer (verified: `main : query { cid: (maybe int), oid: int }` for a joinLeft).
+
+`nullRow` reduces **lazily**: it stays symbolic while its inner row is an
+unbound variable (the joined schema may arrive later) and expands to the
+all-maybe row once the row is known (`TypeUniverse.reduceNullRow`, types.ts:379;
+`peel`/`unifyInternal` both reduce). Unification therefore treats `nullRow r`
+and a hand-written `{ id: (maybe int) }` as the same type.
 
 The implementation detail behind the idempotence is the **`flattenNullExtension`
 flag** on the maybe constructor: null extension is a *partial* order — `maybe
@@ -312,14 +321,18 @@ The reflection that shapes v5 — each entry names the fix, what it costs, and
 what it would take to eliminate:
 
 1. **`absorbAsMaybe` on row tails** (types.ts:93, 597-610; inference.ts:2532).
-   Outer-join nullability is threaded through *unification-time field
-   absorption*, not through a type constructor. It is the least compositional
-   rule: the "maybe row" of an outer join is not really a row type, and
-   `maybe (maybe τ)` semantics had to be carved into `flattenNullExtension`.
-   *To eliminate*: a genuine `maybe row` elimination rule
-   (`maybe {ℓ: τ|ρ} ⟶ {ℓ: maybe τ | maybeρ}`) implemented as a structural
-   pass, making outer-join nullability a pure typing rule instead of a
-   hidden mutation.
+   Outer-join nullability is still threaded through *unification-time field
+   absorption* for a row whose tail is extended after the fact, which is the
+   least compositional remaining rule. The main wart this section used to name
+   — that the "maybe row" of an outer join was not really a row type, and that
+   `maybe (maybe τ)` semantics had to be carved into `flattenNullExtension` —
+   is now FIXED: `nullRow r` is a genuine type constructor with a lazy
+   STRUCTURAL reduction (`maybe {ℓ: τ|ρ} ⟶ {ℓ: maybe τ | maybe ρ}`), so
+   outer-join nullability is a pure typing rule rather than a hidden mutation
+   (types.ts:64-73, 379-405). `absorbAsMaybe` remains only as the mechanism for
+   *later-absorbed* fields on an already-open tail.
+   *To eliminate*: express that tail case through `nullRow` too, so no row
+   carries hidden null-extension state.
 2. **`builtin` tags** (types.ts:175, 473-476; inference.ts:288, 331-345).
    Referential transparency is achieved by carrying the builtin's identity
    *inside the type*, then stripping it for structural unification and

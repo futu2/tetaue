@@ -40,7 +40,7 @@
  ******************************************************************************/
 import {
     type PrimName, type Scheme, type Type, type TypeUniverse, type VarKind,
-    fun, listOf, maybeOf, modeOf, prim, queryOf, rowOf, truthType,
+    fun, listOf, maybeOf, modeOf, nullRowOf, prim, queryOf, rowOf, truthType,
 } from './types.js';
 
 export type BuiltinCategory =
@@ -102,8 +102,11 @@ function projectionScheme(u: TypeUniverse): Scheme {
 function joinScheme(kind: 'inner' | 'left' | 'right' | 'full'): (u: TypeUniverse) => Scheme {
     return u => poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
         const on = fun(r, fun(s, p('bool')));       // l => r => bool
-        const mergerLeft = kind === 'right' || kind === 'full' ? maybeOf(r) : r;
-        const mergerRight = kind === 'left' || kind === 'full' ? maybeOf(s) : s;
+        // SQL null extension is FIELD-WISE: an outer join never makes the whole
+        // row absent, it makes each of its fields NULL. So the merger sees
+        // `nullRow s` (each field maybe), not `maybe s` (whole row maybe).
+        const mergerLeft = kind === 'right' || kind === 'full' ? nullRowOf(r) : r;
+        const mergerRight = kind === 'left' || kind === 'full' ? nullRowOf(s) : s;
         const merger = fun(mergerLeft, fun(mergerRight, t));
         return fun(queryOf(s), fun(on, fun(merger, fun(queryOf(r), queryOf(t)))));
     });
