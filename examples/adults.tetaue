@@ -31,7 +31,7 @@ adult: { active: bool, age: int | r } -> bool = u => u.active && u.age >= 18
 # to the `adult` predicate.
 adults = users
     & filter adult
-    & map (u => { id = u.id, name = upper u.name, age = u.age, active = u.active })
+    & map (u => { id = u.id, name = toUpper u.name, age = u.age, active = u.active })
     & sort (u => [asc u.name])
     & take 10
 

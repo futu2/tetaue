@@ -44,7 +44,7 @@ describe('standard prelude', () => {
     });
 
     test('is ordinary tetaue and is checked by the shared pass', () => {
-        const result = checked('q = table "users" & map (compose (u => { name = upper u.name }) id)');
+        const result = checked('q = table "users" & map (((u => { name = toUpper u.name }) <<< id))');
         expect(result.diagnostics).toEqual([]);
         expect(result.value.kind).toBe('query');
     });

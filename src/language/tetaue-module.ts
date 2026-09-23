@@ -62,7 +62,7 @@ class TetaueWorkspaceManager extends DefaultWorkspaceManager {
  *      hover, completion, semantic tokens and folding never lag), but skips
  *      validation while the change arrives;
  *   2. defers the check: once the user stops typing for `validationDelayMs`
- *      (default 500ms), it re-validates exactly the documents that changed,
+ *      (default 200ms), it re-validates exactly the documents that changed,
  *      and diagnostics are published then.
  *
  * The delay is configurable via the `tetaue.validationDelayMs` setting, which
@@ -70,7 +70,7 @@ class TetaueWorkspaceManager extends DefaultWorkspaceManager {
  * `ConfigurationProvider` is wired to that notification automatically).
  */
 class TetaueDocumentBuilder extends DefaultDocumentBuilder {
-    private static readonly DEFAULT_VALIDATION_DELAY_MS = 500;
+    private static readonly DEFAULT_VALIDATION_DELAY_MS = 200;
     private readonly lock: WorkspaceLock;
     private validationDelayMs = TetaueDocumentBuilder.DEFAULT_VALIDATION_DELAY_MS;
     private validationTimer: ReturnType<typeof setTimeout> | undefined;

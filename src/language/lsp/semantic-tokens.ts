@@ -23,6 +23,7 @@ import type { AstNode } from 'langium';
 import { GrammarUtils } from 'langium';
 import { AbstractSemanticTokenProvider, type SemanticTokenAcceptor } from 'langium/lsp';
 import { standardPreludeNames } from '../prelude.js';
+import { BUILTIN_NAMES } from '../builtin.js';
 import type { TetaueServices } from '../tetaue-module.js';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBinding, isBooleanLiteral,
@@ -34,11 +35,22 @@ import type { Model } from '../generated/ast.js';
 import { implicitParamName } from '../strings.js';
 
 export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
+    /**
+     * Every name the language provides without the user declaring it: the
+     * CORE builtins (`table`, `filter`, `map`, `fold`, the joins, the
+     * aggregates, `asc`/`desc`, ... — see builtin.ts) plus the exported
+     * bindings of the source prelude (`id`, `fmap`, `toUpper`, the `_op_`
+     * sections, ...). Both are `function` when referenced. Seeding only the
+     * prelude left all 116 core builtins classified as `variable`.
+     */
     private readonly standardNames: ReadonlySet<string>;
 
     constructor(services: TetaueServices) {
         super(services);
-        this.standardNames = new Set(standardPreludeNames(services));
+        this.standardNames = new Set([
+            ...BUILTIN_NAMES,
+            ...standardPreludeNames(services),
+        ]);
     }
 
     protected highlightElement(node: AstNode, acceptor: SemanticTokenAcceptor): void {
@@ -157,6 +169,39 @@ export class TetaueSemanticTokenProvider extends AbstractSemanticTokenProvider {
             if (node.fallback) acceptor({ node, keyword: '_', type: 'keyword' });
             acceptor({ node, keyword: '=>', type: 'operator' });
             return;
+        }
+
+        // --- zero-argument applications ---------------------------------------
+        // The grammar's `Application` rule accepts zero arguments, so every
+        // bare atom in a lambda body parses as `Application(atom, [])`:
+        // `always = true` is `Application(BooleanLiteral, [])`, not a
+        // `BooleanLiteral`. The literal branches above never see the inner node
+        // when the wrapper is visited first, so classify the wrapped atom here
+        // with the same rules the bare forms use. Without this, `true`/`null`/
+        // a number falls through to the identifier fallback and is reported as
+        // a `variable` reference.
+        if (isApplication(node) && node.arguments.length === 0) {
+            const inner = node.func;
+            if (isBooleanLiteral(inner)) {
+                acceptor({ node: inner, keyword: inner.value, type: 'keyword' });
+                return;
+            }
+            if (isNullLiteral(inner)) {
+                acceptor({ node: inner, keyword: 'null', type: 'keyword' });
+                return;
+            }
+            if (isNumberLiteral(inner)) {
+                acceptor({ node: inner, property: 'value', type: 'number' });
+                return;
+            }
+            if (isStringLiteral(inner)) {
+                acceptor({ node: inner, property: 'value', type: 'string' });
+                return;
+            }
+            if (isOperatorSection(inner)) {
+                acceptor({ node: inner, property: 'value', type: 'operator' });
+                return;
+            }
         }
 
         // --- references -------------------------------------------------------

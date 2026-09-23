@@ -30,7 +30,7 @@ describe('pure query optimization', () => {
         const rendered = renderQuery(normalized, DIALECTS.postgresql!, 'compact');
         expect(rendered).toEqual({
             ok: true,
-            sql: 'SELECT * FROM users WHERE active AND id > 0',
+            sql: 'SELECT id, active FROM users WHERE active AND id > 0',
             parameters: [],
         });
     });
@@ -44,7 +44,7 @@ describe('pure query optimization', () => {
         const rendered = renderQuery(query, DIALECTS.postgresql!, 'compact');
         expect(rendered).toEqual({
             ok: true,
-            sql: 'SELECT * FROM users WHERE active',
+            sql: 'SELECT active FROM users WHERE active',
             parameters: [],
         });
     });
@@ -58,7 +58,7 @@ describe('pure query optimization', () => {
         const rendered = renderQuery(query, DIALECTS.postgresql!, 'compact');
         expect(rendered).toEqual({
             ok: true,
-            sql: 'SELECT * FROM users WHERE name IS NOT NULL',
+            sql: 'SELECT name FROM users WHERE name IS NOT NULL',
             parameters: [],
         });
     });

@@ -72,11 +72,20 @@ and `1 + 2` are the same operation. A local or imported `_+_` binding changes
 both forms. The grammar still owns the finite symbol set, precedence, and
 associativity; adding an entirely new infix symbol requires a grammar change.
 
-A word between the underscores first resolves an exact `_word_` binding, then
-falls back to the ordinary `word` function. Thus `_div_ 5 2` calls the `div`
-builtin, while `_combine_ x y` calls a user binding named either `_combine_`
-or `combine`. The referenced function remains normally curried and
-type-checked; the underscores do not introduce separate SQL lowering.
+A word between the underscores resolves **exactly** its own `_word_` binding:
+there is no fallback to the ordinary `word` function. The prelude ships no word
+sections for its own functions — `div` is called as `div 5 2`, and there is no
+`_div_` (Haskell's backtick idiom is not reproduced here: it would be a second
+spelling of an existing function for no gain). Word sections exist for USER
+functions, which bind their own name: `_combine_ = x => y => ...` makes
+`_combine_ x y` work. One spelling, one lookup. The
+referenced function remains normally curried and type-checked; the underscores
+do not introduce separate SQL lowering.
+
+A `_name_` binding may appear anywhere a binding may, including after another
+binding: the lexer treats `_name_` followed by `:`/`=` as a binding NAME (like
+`ARG_ID`), so it is never swallowed as an application argument of the previous
+expression.
 
 ## Records
 
@@ -194,7 +203,7 @@ numerics: int and float do not mix, like everywhere else in the language).
 
 ## Strings
 
-`trim`, `upper`, `lower`, `length`, and `position` are now ordinary
+`trim`, `toUpper`, `toLower`, `length`, and `position` are now ordinary
 `prelude.tetaue` definitions over the `sql_func`/`sql_infix` primitives (see
 the `sql_dialect` mechanism in [sql-dialect.md](sql-dialect.md)) — only
 `reverse` remains a core builtin because sqlite lowers it to a scalar
@@ -437,8 +446,8 @@ inlining the `OVER` expression would be invalid SQL.
   (`{ name, functions }`) in every module's prelude environment. The prelude
   branches on `sql_dialect.name` at **analysis time** (literal `==` folds and
   `case` short-circuits) and composes `sql_func` / `sql_infix` /
-  `sql_bare` to emit the dialect-specific SQL. Migrated functions: `upper`,
-  `lower`, `length`, `trim`, `replace`, `mod`, `like`, `div`,
+  `sql_bare` to emit the dialect-specific SQL. Migrated functions: `toUpper`,
+  `toLower`, `length`, `trim`, `replace`, `mod`, `like`, `div`,
   `left_substring` / `right_substring`, `abs`, `ceil`, `floor`, `sqrt`,
   `pow`, `position`. `reverse` stays a core builtin (sqlite's scalar
   recursive-CTE fallback is query-shape). See

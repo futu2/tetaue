@@ -22,9 +22,9 @@ active = (users
     & filter (u => is_just u.email && is_nothing u.nickname)
     & map (u => {
         id = u.id,
-        email = lower (from_maybe "" u.email),
+        email = toLower (from_maybe "" u.email),
         contact = coalesce u.nickname u.email,
-        email_upper = upper (from_maybe "" u.email),
+        email_upper = toUpper (from_maybe "" u.email),
         email_len = length (from_maybe "" u.email),
     })
     & distinct) : query {

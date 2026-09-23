@@ -9,7 +9,7 @@ import * as langium from 'langium';
 export const TetaueTerminals = {
     WS: /\s+/,
     COMMENT: /#[^\r\n]*/,
-    OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\?|\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/,
+    OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\?|\+|-|\*|\/|<>|<|>|&|\$)_(?![\w_])|_[a-zA-Z][\w_]*_(?![\w_])(?![ \t\r\n]*[:=])/,
     ARG_ID: /(?=([_a-zA-Z][\w_]*))\1(?![ \t\r\n]*[:=])/,
     ID: /[_a-zA-Z][\w_]*/,
     NUMBER: /[0-9]+(\.[0-9]*)?/,
@@ -110,7 +110,7 @@ export function isApplication(item: unknown): item is Application {
 }
 
 export interface Ascription extends langium.AstNode {
-    readonly $container: AccessExpression | Application | BinaryExpression | Binding | CaseBranch | CaseExpression | Lambda | LetExpression | ListLiteral | MapEntry | MapLiteral | UnaryMinus;
+    readonly $container: AccessExpression | Application | BinaryExpression | Binding | CaseBranch | CaseExpression | Lambda | LetExpression | ListLiteral | MapEntry | UnaryMinus;
     readonly $type: 'Ascription';
     operand?: BinaryExpression;
     type?: Type;
@@ -127,7 +127,7 @@ export function isAscription(item: unknown): item is Ascription {
 }
 
 export interface BinaryExpression extends langium.AstNode {
-    readonly $container: AccessExpression | Application | Ascription | BinaryExpression | Binding | CaseBranch | CaseExpression | Lambda | LetExpression | ListLiteral | MapEntry | MapLiteral | UnaryMinus;
+    readonly $container: AccessExpression | Application | Ascription | BinaryExpression | Binding | CaseBranch | CaseExpression | Lambda | LetExpression | ListLiteral | MapEntry | UnaryMinus;
     readonly $type: 'BinaryExpression';
     left: UnaryExpression;
     operator: '!=' | '$' | '&&' | '&' | '*' | '*>' | '+' | '-' | '/' | '<$' | '<$>' | '<' | '<*' | '<*>' | '<<<' | '<=' | '<>' | '<|>' | '==' | '>' | '>=' | '>>' | '>>=' | '>>>' | '?' | '||';
@@ -374,7 +374,7 @@ export function isLambdaParam(item: unknown): item is LambdaParam {
 }
 
 export interface LetExpression extends langium.AstNode {
-    readonly $container: AccessExpression | Application | BinaryExpression | Binding | CaseBranch | CaseExpression | Lambda | LetExpression | ListLiteral | MapEntry | MapLiteral | UnaryMinus;
+    readonly $container: AccessExpression | Application | BinaryExpression | Binding | CaseBranch | CaseExpression | Lambda | LetExpression | ListLiteral | MapEntry | UnaryMinus;
     readonly $type: 'LetExpression';
     body?: Expression;
     name?: string;
@@ -445,13 +445,11 @@ export interface MapLiteral extends langium.AstNode {
     readonly $container: AccessExpression | Application | BinaryExpression | UnaryMinus;
     readonly $type: 'MapLiteral';
     entries: Array<MapEntry>;
-    receiver?: Expression;
 }
 
 export const MapLiteral = {
     $type: 'MapLiteral',
-    entries: 'entries',
-    receiver: 'receiver'
+    entries: 'entries'
 } as const;
 
 export function isMapLiteral(item: unknown): item is MapLiteral {
@@ -1040,10 +1038,6 @@ export class TetaueAstReflection extends langium.AbstractAstReflection {
                 entries: {
                     name: MapLiteral.entries,
                     defaultValue: [],
-                    optional: true
-                },
-                receiver: {
-                    name: MapLiteral.receiver,
                     optional: true
                 }
             },

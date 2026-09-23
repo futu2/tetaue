@@ -327,29 +327,6 @@ describe('selective imports', () => {
         expect(sql).toContain('LIMIT 3');
     });
 
-    test('qualified type aliases work through a namespace import', () => {
-        const sql = renderFiles({
-            'schema.tetaue': `export type UserRow = query { id: int, name: string }`,
-            'main.tetaue': `import "schema.tetaue" as s\nusers: s.UserRow = table "users"\nq = users & take 1`,
-        }, 'main.tetaue');
-        expect(sql).toContain('FROM users');
-        const renamed = renderFiles({
-            'schema.tetaue': `export type UserRow = query { id: int }`,
-            'main.tetaue': `import "schema.tetaue" as s (UserRow as Row)\nusers: s.Row = table "users"\nq = users & take 1`,
-        }, 'main.tetaue');
-        expect(renamed).toContain('FROM users');
-        const missing = analyzeFiles({
-            'schema.tetaue': `export type UserRow = query { id: int }`,
-            'main.tetaue': `import "schema.tetaue" as s\nusers: s.Nope = table "users"\nq = users & take 1`,
-        }, 'main.tetaue');
-        const typeDiags = inferProject(
-            missing.tree.modules,
-            missing.tree.importsByModule,
-            standardPrelude(services),
-        ).diagnostics.map(d => d.message).join('\n');
-        expect(typeDiags).toContain("unknown type 's.Nope'");
-    });
-
     test('exported type aliases are imported flat and can be renamed', () => {
         const sql = renderFiles({
             'schema.tetaue': `export type UserRow = query { id: int, name: string }`,

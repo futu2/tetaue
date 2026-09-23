@@ -160,7 +160,7 @@ describe('row polymorphism', () => {
             paid = orders & filter (o => o.status == "paid")
             q = users
                 & filter (this.active && this.age >= 18)
-                & map (u => { id = u.id, name = upper u.name, age = u.age })
+                & map (u => { id = u.id, name = toUpper u.name, age = u.age })
                 & sort (u => [asc u.name])
                 & fold (r => { id = group r.id, n = count r.id })
         `)).toEqual([]);
@@ -498,7 +498,7 @@ q = users & map (u => { id = f u.id })`;
     });
 
     test('dynamic tables render whatever columns are referenced', () => {
-        const sql = render(`q = table "users" & map (u => { id = u.id, n = upper u.name })`);
+        const sql = render(`q = table "users" & map (u => { id = u.id, n = toUpper u.name })`);
         expect(sql).toContain([
             'SELECT',
             '    id,',
@@ -745,7 +745,7 @@ describe('review fixes: composition types, merge partials, shadowing, case nulla
     }
 
     test('composition infers a function type, not its result type', () => {
-        expect(typeOf('f = upper <<< lower', 'f')).toBe('string -> string');
+        expect(typeOf('f = toUpper <<< toLower', 'f')).toBe('string -> string');
     });
 
     test('partial application of merge keeps the row union', () => {
@@ -819,7 +819,7 @@ describe('post-review design fixes', () => {
 
     test('param names share one project-wide type', () => {
         const src = `users: query { id: int, name: string } = table "users"
-q = users & map (u => { n = param "x" + 1, s = upper (param "x") })`;
+q = users & map (u => { n = param "x" + 1, s = toUpper (param "x") })`;
         expect(allErrors(src)).not.toEqual([]);
         const ok = `users: query { id: int } = table "users"\nq = users & filter (u => u.id == param "x")`;
         expect(allErrors(ok)).toEqual([]);

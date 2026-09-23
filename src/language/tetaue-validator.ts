@@ -9,7 +9,8 @@
 import { URI, type AstNode, type ValidationAcceptor, type ValidationChecks } from 'langium';
 import * as path from 'node:path';
 import type { Import, TetaueAstType, Model } from './generated/ast.js';
-import { parseStringLiteral, type Diagnostic } from './interpreter.js';
+import { parseStringLiteral } from './strings.js';
+import type { Diagnostic } from './binding-analysis.js';
 import { mergeDiagnostics } from './inference.js';
 import { stringEscapeWarningsFor } from './strings.js';
 import { checkedProjectFor } from './lsp/document-analysis.js';

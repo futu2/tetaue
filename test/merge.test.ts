@@ -29,7 +29,7 @@ describe('merge', () => {
     test('merges two record literals', () => {
         const sql = render(`
             ${USERS}
-            q = users & map (u => merge { a = u.id, b = upper u.name } { c = 1 })
+            q = users & map (u => merge { a = u.id, b = toUpper u.name } { c = 1 })
         `, 'trino');
         expect(sql).toContain('id AS a');
         expect(sql).toContain('UPPER(name) AS b');

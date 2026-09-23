@@ -7,7 +7,7 @@
  * nested queries and scalar expressions as well as top-level steps.
  ******************************************************************************/
 import type { DialectSpec } from './render.js';
-import type { Query, QueryStep, RowNode, SqlNode } from './interpreter.js';
+import type { Query, QueryStep, RowNode, SqlNode } from '../core/ir.js';
 
 export interface CapabilityDiagnostic {
     message: string;

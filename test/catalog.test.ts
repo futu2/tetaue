@@ -8,7 +8,7 @@
  * interpreter cannot drift apart.
  ******************************************************************************/
 import { describe, expect, test } from 'bun:test';
-import { BUILTIN_ALIASES, BUILTIN_NAMES, BUILTIN_SPECS } from '../src/language/catalog.js';
+import { BUILTIN_ALIASES, BUILTIN_NAMES, BUILTIN_SPECS, builtinModeOf } from '../src/language/catalog.js';
 import { BUILTINS } from '../src/language/interpreter.js';
 
 describe('builtin catalog', () => {
@@ -56,9 +56,20 @@ describe('builtin catalog', () => {
                 to: { kind: 'fun' },
             });
         }
+        // The SQL mode of an aggregate / group key / window function is a
+        // property of the NAME (see BUILTIN_MODES), not a wrapper around the
+        // scheme's result type: `Type` has no `agg`/`group`/`window` variant, so
+        // the schemes are plain functions and the mode is checked from the
+        // entry's syntax at the fold/map/over call sites.
         const u = new TypeUniverse();
-        expect(spec.get('sum')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'agg' } });
-        expect(spec.get('group')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'group' } });
+        expect(spec.get('sum')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'maybe' } });
+        expect(spec.get('group')!.scheme(u).type).toMatchObject({ kind: 'fun' });
+        for (const [name, mode] of [['sum', 'agg'], ['count', 'agg'], ['group', 'group'], ['row_number', 'window'], ['lag', 'window']] as const) {
+            expect(builtinModeOf(name)).toBe(mode);
+        }
+        expect(builtinModeOf('lead')).toBe('window');   // via the lag alias
+        expect(builtinModeOf('over')).toBeNull();       // strips window mode
+        expect(builtinModeOf('filter')).toBeNull();
         const names = BUILTIN_SPECS.map(item => item.name) as string[];
         for (const removed of ['join', 'inner', 'left', 'right', 'full']) {
             expect(names).not.toContain(removed);

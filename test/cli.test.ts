@@ -357,7 +357,7 @@ describe('render entrypoint and parameter metadata', () => {
             const cap = captureConsole();
             try {
                 expect(await main(['render', file, '--binding', 'a', '--format', 'compact'])).toBe(0);
-                expect(cap.log.join('\n')).toContain('SELECT * FROM a');
+                expect(cap.log.join('\n')).toContain('SELECT id FROM a');
             } finally {
                 cap.restore();
             }

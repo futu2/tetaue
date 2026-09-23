@@ -19,12 +19,26 @@ const ROOT = resolve(new URL('.', import.meta.url).pathname, '..');
 const CLI = 'src/cli.ts';
 
 const FIXTURE = `
-CREATE TABLE users (id INTEGER, name TEXT, age INTEGER, active INTEGER, email TEXT, nickname TEXT, last_seen TEXT);
+CREATE TABLE users (
+    id INTEGER, name TEXT, age INTEGER, active INTEGER,
+    email TEXT, nickname TEXT, last_seen TEXT,
+    password_hash TEXT, code TEXT, balance REAL, joined TEXT
+);
 CREATE TABLE orders (id INTEGER, user_id INTEGER, total REAL, status TEXT);
-INSERT INTO users VALUES (1, 'Ada', 37, 1, 'ada@example.com', NULL, '2024-01-01 12:00:00');
-INSERT INTO users VALUES (2, 'Lin', 15, 1, 'lin@example.com', 'linny', '2024-02-03 08:30:00');
+CREATE TABLE archived (
+    id INTEGER, name TEXT, code TEXT, balance REAL, active INTEGER,
+    joined TEXT, last_seen TEXT
+);
+CREATE TABLE members (id INTEGER, name TEXT, age INTEGER, active INTEGER, email TEXT, nickname TEXT, code TEXT);
+CREATE TABLE nodes (id INTEGER, parent INTEGER);
+INSERT INTO users VALUES (1, 'Ada', 37, 1, 'ada@example.com', NULL, '2024-01-01 12:00:00', 'hunter2', '0001', 10.5, '2024-01-01');
+INSERT INTO users VALUES (2, 'Lin', 15, 1, 'lin@example.com', 'linny', '2024-02-03 08:30:00', 'pw', 'AB12', 0.0, '2024-02-03');
 INSERT INTO orders VALUES (10, 1, 99.5, 'paid');
 INSERT INTO orders VALUES (11, 2, 4.5, 'unpaid');
+INSERT INTO archived VALUES (1, 'Old', '0001', 10.5, 0, '2020-01-01', '2020-01-01 00:00:00');
+INSERT INTO members VALUES (1, 'Ada', 37, 1, 'ada@example.com', NULL, '0001');
+INSERT INTO members VALUES (2, 'Lin', 15, 1, 'lin@example.com', 'linny', 'AB12');
+INSERT INTO nodes VALUES (1, NULL), (2, 1);
 `;
 
 const FIXTURE_SCHEMA_QUALIFIED = `
@@ -43,12 +57,18 @@ INSERT INTO ecs.dcm_ecs_p_ecis_m_tb1010_sf_f VALUES ('11114344', '1990-06-15', '
 const EXAMPLES = [
     'examples/adults.tetaue',
     'examples/case.tetaue',
+    'examples/dialect-surface.tetaue',
     'examples/joins.tetaue',
+    'examples/lists.tetaue',
     'examples/lpbirthday.tetaue',
+    'examples/namespaced.tetaue',
     'examples/orders.tetaue',
+    'examples/predicates.tetaue',
+    'examples/rename.tetaue',
     'examples/report.tetaue',
     'examples/selective.tetaue',
     'examples/strings.tetaue',
+    'examples/tables.tetaue',
     'examples/lib-project/main.tetaue',
 ];
 

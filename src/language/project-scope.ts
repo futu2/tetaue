@@ -13,7 +13,7 @@
  * runtime `Value`s, inference passes `Scheme`s.
  ******************************************************************************/
 import type { ProjectModule, ResolvedImportEdge } from './imports.js';
-import type { Diagnostic } from './interpreter.js';
+import type { Diagnostic } from './binding-analysis.js';
 import { parseStringLiteral } from './strings.js';
 
 export interface ImportScope<T> {

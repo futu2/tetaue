@@ -32,9 +32,7 @@ export _>>_ = then
 
 export id = x => x
 export const = x => y => x
-export compose = f => g => x => f (g x)
 export flip = f => x => y => f y x
-export pipe = f => g => x => g (f x)
 
 # Derived Maybe helpers belong here rather than in the SQL core.
 export is_nothing = is_null
@@ -44,16 +42,10 @@ export is_not_null = is_just
 # Scalar SQL functions with no per-dialect variance are ordinary prelude
 # definitions over the sql_func primitive, not core builtins. The precise
 # annotation keeps their type exact (length is int, not a fresh variable).
-# The public spellings are Haskell-flavored (toUpper/toLower); the SQL-named
-# exports remain as aliases for compatibility.
 export toUpper: string -> string = x => sql_func "UPPER" [x]
 export toLower: string -> string = x => sql_func "LOWER" [x]
 export length: string -> int = x => sql_func "LENGTH" [x]
 export trim: string -> string = x => sql_func "TRIM" [x]
-
-# SQL-named aliases, kept for compatibility with existing code.
-export upper = toUpper
-export lower = toLower
 
 # More monomorphic scalar lowerings. replace has no per-dialect variance;
 # div (integral division) and left_substring/right_substring vary by

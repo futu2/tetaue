@@ -1,0 +1,114 @@
+# Dialect surface — the per-dialect lowerings, in one module.
+#
+# This example collects the SQL surface that varies per dialect, not just the
+# query-shape features the other examples already cover. The scalar helpers
+# below are defined in
+# prelude.tetaue over the `sql_func` / `sql_infix` / `sql_cast` primitives and
+# branch on the first-class `sql_dialect` value, so every dialect renders its
+# own spelling. See docs/design/sql-dialect.md.
+#
+#   left_substring / right_substring   SUBSTR vs LEFT/RIGHT
+#   lpad / rpad                        native vs a CASE WHEN emulation (sqlite)
+#   substring s 1 3                    SUBSTRING vs SUBSTR
+#   position / div / mod / pow         name and argument-order differences
+#   date_add / date_diff / extract     interval syntax per engine
+#   cast                               dialect type names
+#   concat                             CONCAT vs `||` with NULL semantics
+#
+# Query-SHAPE features that also vary per dialect are covered by the
+# `shape` binding below, each kept as its own module-level query because a
+# single pipeline cannot contain a set operation, a recursive fixed point, a
+# lateral join and a window projection at once:
+#
+#   union / intersect / except         set operations
+#   recursive                          WITH RECURSIVE (unsupported on Hive)
+#   join_lateral                       INNER JOIN LATERAL (PG/MySQL only)
+#   over (...)                         window functions (RANK family)
+#
+# `main` is the scalar binding; the shape queries are library bindings, so
+# render one with `tetaue run examples/dialect-surface.tetaue --binding <name>`.
+
+users: query {
+    id: int,
+    name: string,
+    code: string,
+    balance: float,
+    active: bool,
+    joined: date,
+    last_seen: timestamp,
+} = table "users"
+
+archived: query {
+    id: int,
+    name: string,
+    code: string,
+    balance: float,
+    active: bool,
+    joined: date,
+    last_seen: timestamp,
+} = table "archived"
+
+# Set operations: union, union_all, intersect and except combine two
+# complete relational expressions, so each is a binding of its own.
+scalar_side = users & map (u => { id = u.id, label = toUpper u.name })
+archived_side = archived & map (u => { id = u.id, label = toUpper u.name })
+set_union = scalar_side & union archived_side
+set_union_all = scalar_side & union_all archived_side
+set_intersect = scalar_side & intersect archived_side
+set_except = scalar_side & except archived_side
+
+# Window projection: over (row_number) { partition = [...], order = [...] }.
+windowed = users & map (u => {
+    id = u.id,
+    rn = over (row_number) { partition = [u.active], order = [desc u.balance] },
+    rk = over (rank) { partition = [u.active], order = [desc u.balance] },
+})
+
+# A recursive fixed point: the transitive closure of a parent chain.
+nodes: query { id: int, parent: int } = table "nodes"
+# The lambda body is an ordinary expression, so it would absorb the trailing
+# `& map` step. Parenthesizing the steps AFTER `recursive` delimits them.
+closure = (nodes
+    & recursive (self => (
+        nodes & joinInner self (l => r => l.parent == r.id) (l => r => { id = l.id, parent = r.parent })
+    )))
+    & map (u => { id = u.id, parent = u.parent })
+# Lateral join: the right side is correlated with the current left row.
+ranked = users & map (u => { id = u.id, total = u.balance })
+lateral = users
+    & join_lateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })
+
+main = users
+    & filter (u => u.active && position u.name "a" > 0)
+    & map (u => {
+        id = u.id,
+        left3 = left_substring u.name 3,
+        right2 = right_substring u.name 2,
+        pad = lpad u.code 8 "0",
+        rpad_ = rpad u.code 8 "0",
+        sub = substring u.name 1 3,
+        pos = position u.name "a",
+        quotient = div u.id 2,
+        remainder = mod u.id 2,
+        squared = pow u.id 2,
+        joined_day = extract u.joined "day",
+        joined_month = extract u.joined "month",
+        day_of_week = extract u.joined "day_of_week",
+        shifted = date_add u.joined "day" 7,
+        age_days = date_diff u.joined "day" current_date,
+        label = concat [u.name, u.code],
+        as_int = cast u.balance "int",
+        as_string = cast u.id "string",
+        as_float = cast u.id "float",
+        as_decimal = cast u.id "decimal",
+        as_bool = cast u.active "bool",
+        as_date = cast u.last_seen "date",
+        as_timestamp = cast u.joined "timestamp",
+        when_msg = case {
+            u.balance > 100.0 => "high",
+            u.balance > 10.0 => "mid",
+            _ => "low",
+        },
+    })
+    & sort (u => [asc u.id])
+    & take 25

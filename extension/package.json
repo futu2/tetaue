@@ -68,7 +68,7 @@
         },
         "tetaue.validationDelayMs": {
           "type": "number",
-          "default": 500,
+          "default": 200,
           "minimum": 0,
           "description": "Milliseconds of typing pause before the language server re-checks the document and publishes diagnostics. Higher values make typing feel lighter on large modules; 0 checks on every keystroke."
         },

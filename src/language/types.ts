@@ -50,7 +50,6 @@ export type Type =
     | { kind: 'var'; id: number }
     | { kind: 'prim'; name: PrimName }
     /** A SQL predicate: either bool or maybe bool (three-valued logic). */
-    | { kind: 'truth' }
     | { kind: 'maybe'; of: Type; flattenNullExtension?: boolean }
     | { kind: 'fun'; from: Type; to: Type }
     | { kind: 'list'; of: Type }
@@ -73,7 +72,6 @@ export type Type =
     | { kind: 'nullRow'; of: Type; tail: Type | null }
     | { kind: 'query'; row: Type }
     /** An ORDER BY item (`asc`/`desc`). */
-    | { kind: 'order' }
     /**
      * A prelude builtin reference. Transparent in unification and pretty
      * printing, but the tag survives generalization/instantiation so a
@@ -81,18 +79,6 @@ export type Type =
      * checks — referential transparency at the type level.
      */
     | { kind: 'builtin'; name: string; of: Type }
-    /**
-     * An aggregate-mode expression (`sum o.total`, `count o.id`, ...) — "the
-     * value of type `t`, aggregated". Transparent in unification (like `maybe`),
-     * so comparisons/arithmetic on aggregate results work; the mode is
-     * enforced by the fold/map mode checks in inference, which inspect the
-     * raw (pre-unification) field types.
-     */
-    | { kind: 'agg'; of: Type }
-    /** A group-mode expression (`group o.user_id`). Transparent in unification. */
-    | { kind: 'group'; of: Type }
-    /** A window-only expression (`row_number`, `lag`, ...) that must be wrapped by `over`. */
-    | { kind: 'window'; of: Type }
     /**
      * An overload set: one name bound to several definitions distinguished by
      * type (`abs : int -> int`, `abs : float -> float`, ...). It is transparent
@@ -162,9 +148,7 @@ export function prim(name: PrimName): Type {
 }
 
 /** Internal type accepted by SQL three-valued logic predicates. */
-export function truthType(): Type {
-    return { kind: 'truth' };
-}
+
 
 export function maybeOf(t: Type): Type {
     // Unlike the old `maybe T` design, Maybe is NOT transparent: `maybe T`
@@ -199,43 +183,6 @@ export function queryOf(row: Type): Type {
 /** Tag a prelude scheme so builtin identity survives first-class bindings. */
 export function builtinOf(name: string, of: Type): Type {
     return { kind: 'builtin', name, of };
-}
-
-/** Wrap `t` in the aggregate mode: `agg t` ("an aggregate of `t`"). */
-export function aggOf(t: Type): Type {
-    return t.kind === 'agg' ? t : { kind: 'agg', of: t };
-}
-
-/** Wrap `t` in the group mode: `group t` (a GROUP BY key). */
-export function groupOf(t: Type): Type {
-    return t.kind === 'group' ? t : { kind: 'group', of: t };
-}
-
-/** Wrap `t` in the window mode: `window t` (a window-only function result). */
-export function windowOf(t: Type): Type {
-    return t.kind === 'window' ? t : { kind: 'window', of: t };
-}
-
-export type ModeName = 'agg' | 'group' | 'window';
-
-/** Whether `t` is in one of the listed SQL modes (`agg t`, `group t`, `window t`). */
-export function isModeOf(t: Type, ...modes: ModeName[]): t is Type & { kind: ModeName; of: Type } {
-    return (t.kind === 'agg' || t.kind === 'group' || t.kind === 'window')
-        && modes.includes(t.kind);
-}
-
-/** Wrap `t` in one of the SQL modes (`agg t`, `group t`, `window t`). */
-export function modeOf(mode: ModeName, t: Type): Type {
-    switch (mode) {
-        case 'agg': return aggOf(t);
-        case 'group': return groupOf(t);
-        case 'window': return windowOf(t);
-    }
-}
-
-/** The payload of a mode-wrapped type, or null when `t` carries no mode. */
-export function modePayload(t: Type): Type | null {
-    return t.kind === 'agg' || t.kind === 'group' || t.kind === 'window' ? t.of : null;
 }
 
 /**
@@ -420,10 +367,9 @@ export class TypeUniverse {
                     if (r.tail) visit(r.tail);
                     break;
                 case 'query': visit(r.row); break;
-                case 'builtin':
-                case 'agg': case 'group': case 'window': visit(r.of); break;
+                case 'builtin': visit(r.of); break;
                 case 'overload': for (const alt of r.alternatives) visit(alt); break;
-                case 'prim': case 'truth': case 'order': break;
+                case 'prim': break;
             }
         };
         visit(t);
@@ -573,35 +519,6 @@ export class TypeUniverse {
             return a;
         }
 
-        // A SQL predicate may be either non-null bool or nullable bool. The
-        // dedicated internal type keeps that choice open until a row schema
-        // is known, without making arbitrary scalar types acceptable.
-        if (a.kind === 'truth' || b.kind === 'truth') {
-            const other = a.kind === 'truth' ? b : a;
-            if (other.kind === 'truth') return a;
-            if (other.kind === 'prim' && other.name === 'bool') return a.kind === 'truth' ? a : b;
-            if (other.kind === 'maybe') {
-                const inner = this.resolve(other.of);
-                if (inner.kind === 'prim' && inner.name === 'bool') return a.kind === 'truth' ? a : b;
-            }
-            throw new UnifyError(a, b);
-        }
-
-        // `agg`/`group` mode absorption (transparent): unify the
-        // payloads and re-wrap. Mixed modes never unify (an aggregate result
-        // is not a GROUP BY key and vice versa).
-        const aAgg = a.kind === 'agg' ? a.of : null;
-        const bAgg = b.kind === 'agg' ? b.of : null;
-        const aGroup = a.kind === 'group' ? a.of : null;
-        const bGroup = b.kind === 'group' ? b.of : null;
-        if (aAgg !== null || bAgg !== null || aGroup !== null || bGroup !== null) {
-            if ((aAgg !== null && bGroup !== null) || (aGroup !== null && bAgg !== null)) {
-                throw new UnifyError(a, b);
-            }
-            const inner = this.unifyInternal(aAgg ?? aGroup ?? a, bAgg ?? bGroup ?? b);
-            return aAgg !== null || bAgg !== null ? aggOf(inner) : groupOf(inner);
-        }
-
         switch (a.kind) {
             case 'prim':
                 if (b.kind === 'prim' && a.name === b.name) return a;
@@ -643,15 +560,6 @@ export class TypeUniverse {
                 // the fields materialize on both sides when the schema arrives.
                 if (b.kind === 'nullRow') {
                     this.unifyRow(this.resolve(a.of), this.resolve(b.of));
-                    return a;
-                }
-                break;
-            case 'order':
-                if (b.kind === 'order') return a;
-                break;
-            case 'window':
-                if (b.kind === 'window') {
-                    this.unifyInternal(a.of, b.of);
                     return a;
                 }
                 break;
@@ -920,11 +828,8 @@ export class TypeUniverse {
                 return this.reduceNullRowType(nullRowOf(of, tail));
             }
             case 'builtin': return builtinOf(r.name, this.substitute(subst, r.of));
-            case 'agg': return aggOf(this.substitute(subst, r.of));
-            case 'group': return groupOf(this.substitute(subst, r.of));
-            case 'window': return windowOf(this.substitute(subst, r.of));
             case 'overload': return overloadOf(r.alternatives.map(a => this.substitute(subst, a)));
-            case 'prim': case 'truth': case 'order': return r;
+            case 'prim': return r;
         }
     }
 
@@ -955,7 +860,6 @@ export class TypeUniverse {
                     return info.kind === 'row' ? `r${r.id}` : `t${r.id}`;
                 }
                 case 'prim': return PRIM_NAMES[r.name];
-                case 'truth': return 'bool?';
                 case 'maybe':
                     return `(maybe ${p(r.of, false)})`;
                 case 'list': return `[${p(r.of, false)}]`;
@@ -972,15 +876,11 @@ export class TypeUniverse {
                     return `${p(this.resolve(r.of), true)}?`;
                 case 'query': return `query ${p(r.row, false)}`;
                 case 'builtin': return p(r.of, paren);
-                case 'agg': return `agg ${p(r.of, false)}`;
-                case 'group': return `group ${p(r.of, false)}`;
-                case 'window': return `window ${p(r.of, false)}`;
                 case 'overload': return r.alternatives.map(a => p(a, true)).join(' | ');
                 case 'fun': {
                     const s = `${p(r.from, true)} -> ${p(r.to, false)}`;
                     return paren ? `(${s})` : s;
                 }
-                case 'order': return 'order';
             }
         };
         // Type classes no longer exist, so a type never renders constraints.

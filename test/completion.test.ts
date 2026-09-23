@@ -21,7 +21,7 @@ describe('builtin completion', () => {
     test('suggests prelude builtins in expression positions', async () => {
         const labels = await completionsAt(`${USERS}\nq = users & `, 1, 12);
         for (const name of ['filter', 'map', 'sort', 'take', 'fold', 'distinct',
-            'upper', 'lower', 'count', 'sum', 'coalesce', 'abs',
+            'toUpper', 'toLower', 'count', 'sum', 'coalesce', 'abs',
             'current_date', 'date_add', 'ceil', 'floor', 'concat', 'greatest',
             'substring', 'cast', 'like', 'is_null', 'is_true', 'is_false', 'is_unknown',
             'sql_func', 'sql_infix', 'sql_cast', 'sql_bare']) {
@@ -48,7 +48,7 @@ describe('builtin completion', () => {
         expect(labels).toContain('id');
         expect(labels).toContain('name');
         expect(labels).not.toContain('filter');
-        expect(labels).not.toContain('upper');
+        expect(labels).not.toContain('toUpper');
     });
 
     test('does not suggest builtins inside string literals', async () => {

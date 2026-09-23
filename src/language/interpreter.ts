@@ -7,6 +7,8 @@
  * the CLI renderer (producing a Query value to render to SQL).
  ******************************************************************************/
 import type { AstNode } from 'langium';
+import { lower } from '../hir/lower.js';
+import type { Hir } from '../hir/hir.js';
 import type { NumberLiteral } from './generated/ast.js';
 import {
     isAccessExpression, isApplication, isAscription, isBinaryExpression, isBooleanLiteral,
@@ -14,12 +16,20 @@ import {
     isFunType, isListType, isMapLiteral,
     isNullLiteral, isNumberLiteral, isOperatorSection, isQueryType, isRecordType, isStringLiteral,
     isTypeAtom, isTypeHole, isTypeParen, isTypeVar, isUnaryMinus,
-    type Application, type Binding, type CaseExpression, type Expr, type Lambda, type Model, type QueryType, type UnaryExpression,
+    type Application, type Binding, type CaseExpression, type Expr, type Lambda, type MapEntry, type Model, type QueryType, type UnaryExpression,
 } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
 import { resolveImportScope } from './project-scope.js';
 import { implicitParamName, labelName, parseStringLiteral } from './strings.js';
 export { parseStringLiteral };
+// Binding order + shared diagnostic wording live in an evaluator-free module so
+// the inferencer can use them without importing the interpreter (stage 3).
+import {
+    missingBindingExpressionMessage, recursiveBindingMessage, topoOrderBindings,
+    type Diagnostic, type DialectView,
+} from './binding-analysis.js';
+export { missingBindingExpressionMessage, recursiveBindingMessage, topoOrderBindings };
+export type { Diagnostic, DialectView };
 import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
 import { PRELUDE_NAMESPACES } from './prelude-namespaces.js';
 import { TypeUniverse } from './types.js';
@@ -30,122 +40,22 @@ import {
 } from './operators.js';
 
 // ---------------------------------------------------------------------------
-// SQL model
+// SQL IR — moved to core/ir.ts (stage 1 of docs/design/architecture.md).
+// Re-exported here so every existing import site keeps working unchanged;
+// the definitions live in core/ir.ts, which depends on nothing but Langium's
+// AstNode (no Value, no Ctx), so back ends can import it without a cycle.
 // ---------------------------------------------------------------------------
-
-export type SqlType = 'int' | 'float' | 'decimal' | 'string' | 'bool' | 'date' | 'timestamp' | 'array' | 'unknown';
-export type TypeOrNull = SqlType | 'null';
-
-export interface SqlColumn {
-    readonly type: SqlType;
-    /** Table name for qualification, or null for computed columns. */
-    readonly table: string | null;
-    /**
-     * For derived columns (projections from map/fold): the defining SQL
-     * expression, inlined whenever the column is referenced later in the
-     * pipeline (teta-style). Undefined for base table columns.
-     */
-    readonly expr?: SqlNode;
-}
-export type Schema = ReadonlyMap<string, SqlColumn>;
-
-export type SqlNodeBase =
-    | { readonly kind: 'col'; readonly name: string; readonly table: string | null; readonly type: SqlType }
-    | { readonly kind: 'bare'; readonly name: string; readonly type: SqlType }
-    | { readonly kind: 'lit'; readonly value: number | string | boolean | null; readonly type: TypeOrNull }
-    | { readonly kind: 'bin'; readonly op: string; readonly left: SqlNode; readonly right: SqlNode; readonly type: SqlType }
-    | { readonly kind: 'is-null'; readonly expr: SqlNode; readonly negated: boolean; readonly type: 'bool' }
-    | { readonly kind: 'not'; readonly expr: SqlNode; readonly type: 'bool' }
-    | { readonly kind: 'call'; readonly name: string; readonly args: readonly SqlNode[]; readonly type: SqlType }
-    | { readonly kind: 'param'; readonly name: string; readonly type: SqlType }
-    | { readonly kind: 'current-date'; readonly type: 'date' }
-    | { readonly kind: 'date-literal'; readonly value: string; readonly type: 'date' }
-    | { readonly kind: 'timestamp-literal'; readonly value: string; readonly type: 'timestamp' }
-    | { readonly kind: 'current-timestamp'; readonly type: 'timestamp' }
-    | { readonly kind: 'in'; readonly expr: SqlNode; readonly list: readonly SqlNode[]; readonly negated: boolean; readonly type: 'bool' }
-    | { readonly kind: 'exists'; readonly query: Query; readonly type: 'bool' }
-    | { readonly kind: 'scalar'; readonly query: Query; readonly type: SqlType }
-    | { readonly kind: 'in-query'; readonly expr: SqlNode; readonly query: Query; readonly negated: boolean; readonly type: 'bool' }
-    | { readonly kind: 'agg'; readonly name: string; readonly arg: SqlNode; readonly filter?: SqlNode; readonly type: SqlType }
-    | { readonly kind: 'group'; readonly expr: SqlNode; readonly table: string | null; readonly type: SqlType }
-    | { readonly kind: 'order'; readonly expr: SqlNode; readonly dir: 'ASC' | 'DESC'; readonly type: SqlType }
-    | { readonly kind: 'window'; readonly fn: SqlNode; readonly partition: readonly SqlNode[]; readonly order: readonly { node: SqlNode; dir: 'ASC' | 'DESC' }[]; readonly frame: { start: number; end: number } | null; readonly type: SqlType }
-    | { readonly kind: 'case'; readonly branches: readonly { cond: SqlNode; value: SqlNode }[]; readonly elseValue: SqlNode | null; readonly type: SqlType };
-
-/**
- * Every SQL expression node optionally remembers the source AST node that
- * produced it, so render-time capability errors can be positioned precisely.
- */
-export type SqlNode = SqlNodeBase & { readonly ast?: AstNode };
-
-export interface RowNode {
-    readonly fields: readonly { key: string; node: SqlNode }[];
-}
-
-export type JoinKind = 'inner' | 'left' | 'right' | 'full';
-export type SetOp = 'UNION' | 'UNION ALL' | 'INTERSECT' | 'EXCEPT';
-
-export type QueryStep =
-    | { readonly kind: 'filter'; readonly cond: SqlNode; readonly having: boolean; readonly ast?: AstNode }
-    | { readonly kind: 'map'; readonly proj: RowNode; readonly ast?: AstNode }
-    | { readonly kind: 'sort'; readonly items: readonly { node: SqlNode; dir: 'ASC' | 'DESC' }[]; readonly ast?: AstNode }
-    | { readonly kind: 'take'; readonly n: number; readonly ast?: AstNode }
-    | { readonly kind: 'drop'; readonly n: number; readonly ast?: AstNode }
-    | { readonly kind: 'fold'; readonly proj: RowNode; readonly ast?: AstNode }
-    | { readonly kind: 'join'; readonly joinKind: JoinKind; readonly right: Query; readonly on: SqlNode; readonly proj: RowNode; readonly lateral?: boolean; readonly ast?: AstNode }
-    | { readonly kind: 'set'; readonly op: SetOp; readonly right: Query; readonly ast?: AstNode };
-
-export interface Query {
-    /**
-     * The tetaue binding name this query was assigned, when it came from a
-     * binding (`paid = orders & filter ...`). Rendered SQL prefers it for
-     * generated aliases (derived tables, joined subqueries) over invented
-     * names, so the output reads like the source.
-     */
-    readonly name?: string;
-    readonly root: {
-        readonly name: string;
-        readonly schema: Schema;
-        /**
-         * A derived table: the query is `(SELECT ... FROM ... ) AS name` rather
-         * than a real table. Set when a pipeline step is applied after a fold
-         * (map/join wrap the aggregated result so it can be projected or
-         * joined again, teta-style — a fold ends the flat FROM scope).
-         */
-        readonly from?: Query;
-    };
-    /**
-     * Whether the query's schema is complete. A bare `table "users"` with no
-     * binding annotation has an unknown schema (`known: false`): columns are
-     * synthesized lazily and type checks relax. `map`/`fold` projections and
-     * a schema annotation make it known again.
-     */
-    readonly known: boolean;
-    /**
-     * Table aliases in FROM-clause order (root first). A table name that
-     * appears more than once in one query gets suffixed aliases (users,
-     * users_1, ...) so self-joins stay unambiguous. Column nodes carry the
-     * alias in their `table` field.
-     */
-    readonly aliases: readonly string[];
-    readonly steps: readonly QueryStep[];
-    readonly distinct: boolean;
-    /**
-     * When this query is the RESULT of the recursive step, root.from is the
-     * initial term, recursive.name is the CTE name, and recursive.term is the
-     * recursive term (which references the CTE name as a join source).
-     */
-    readonly recursive?: { readonly name: string; readonly term: Query };
-}
+export type {
+    JoinKind, Query, QueryStep, RowNode, Schema, SetOp, SqlColumn, SqlNode, SqlNodeBase, SqlType, TypeOrNull,
+} from '../core/ir.js';
+import type {
+    JoinKind, Query, QueryStep, RowNode, Schema, SetOp, SqlColumn, SqlNode, SqlNodeBase, SqlType, TypeOrNull,
+} from '../core/ir.js';
 
 // ---------------------------------------------------------------------------
 // Interpreter values
 // ---------------------------------------------------------------------------
 
-export interface Diagnostic {
-    node: AstNode | undefined;
-    message: string;
-}
 
 export type Value =
     | { kind: 'query'; query: Query; ast?: AstNode }
@@ -153,7 +63,7 @@ export type Value =
         /** Declared first-parameter SQL type, for overload selection. */
         paramType?: TypeOrNull }
     | { kind: 'step'; name: string; apply: (q: Query, at: AstNode | undefined, ctx: Ctx) => Query | null; ast?: AstNode }
-    | { kind: 'lambda'; params: string[]; body: Expr; closure: Map<string, Value>; ast?: AstNode;
+    | { kind: 'lambda'; params: string[]; body: Hir; closure: Map<string, Value>; ast?: AstNode;
         /** Declared first-parameter SQL type (`(x: float) => ...`), for overload selection. */
         paramType?: TypeOrNull }
     /**
@@ -463,35 +373,12 @@ function kindLabel(kind: SqlNode['kind']): string {
 // Query helpers
 // ---------------------------------------------------------------------------
 
-function nodeTable(node: SqlNode): string | null {
-    return node.kind === 'col' ? node.table : (node.kind === 'group' ? node.table : null);
-}
-
-export function rowNodeSchema(row: RowNode): Schema {
-    const schema = new Map<string, SqlColumn>();
-    for (const field of row.fields) {
-        if (field.node.type === "null") continue;
-        schema.set(field.key, {
-            type: field.node.type as SqlType,
-            table: nodeTable(field.node),
-            expr: field.node,
-        });
-    }
-    return schema;
-}
-
-export function querySchema(q: Query): Schema {
-    let schema: Schema = new Map(q.root.schema);
-    for (const step of q.steps) {
-        switch (step.kind) {
-            case 'filter': case 'sort': case 'take': case 'drop': case 'set': break;
-            case 'map': case 'fold': schema = rowNodeSchema(step.proj); break;
-            // The join's merger lambda projects the result row (like map).
-            case 'join': schema = rowNodeSchema(step.proj); break;
-        }
-    }
-    return schema;
-}
+// Schema derivation (`rowNodeSchema`, `querySchema`, `nodeTable`) lives in
+// `core/ir.ts` — pure IR -> Schema functions the renderer needs but that must
+// not require the evaluator. Imported for the evaluator's own use below, and
+// re-exported so existing importers keep working.
+import { nodeTable, querySchema, rowNodeSchema } from '../core/ir.js';
+export { querySchema, rowNodeSchema };
 
 function addStep(q: Query, step: QueryStep, at?: AstNode): Query {
     // A projection (map/fold/join-merger) defines the complete schema;
@@ -706,7 +593,7 @@ export function applyWith(f: Value, arg: Value, at: AstNode | undefined, ctx: Ct
             const env = new Map(f.closure);
             env.set(f.params[0]!, arg);
             if (remaining.length === 0) {
-                return evalExprWith(f.body, {
+                return evalHir(f.body, {
                     env,
                     diagnostics: ctx.diagnostics,
                     moduleBindings: ctx.moduleBindings,
@@ -1053,15 +940,16 @@ function operatorSectionValue(raw: string, at: AstNode, ctx: Ctx): Value {
     const scoped = ctx.env.get(raw);
     if (scoped) return scoped;
 
+    // A `_name_` reference resolves ONLY its exact `_name_` binding (or, for an
+    // operator symbol, the intrinsic behind it). There is no fallback to the
+    // bare `name`: one spelling, one lookup.
     const op = sectionName(raw);
     if (!isBinaryOperator(op)) {
-        const named = ctx.env.get(op);
-        if (named) return named;
-        ctx.diagnostics.push({ node: at, message: `unknown operator section '${raw}' — '${op}' is not defined` });
+        ctx.diagnostics.push({ node: at, message: `unknown operator section '${raw}' — '${raw}' is not defined` });
         return ERROR;
     }
     if (isIntrinsicOperator(op)) return operatorIntrinsicValue(op);
-    ctx.diagnostics.push({ node: at, message: `unknown operator section '${raw}' — '${op}' is not defined` });
+    ctx.diagnostics.push({ node: at, message: `unknown operator section '${raw}' — '${raw}' is not defined` });
     return ERROR;
 }
 
@@ -1414,225 +1302,235 @@ function fnArgIndexesOfType(t: Type, u: TypeUniverse): Set<number> {
  */
 function evalArg(expr: Expr, ctx: Ctx): Value {
     const arity = dollarArity(expr, ctx.env);
-    if (arity > 0) return dollarLambda(expr, arity, ctx);
-    return evalUnary(expr as UnaryExpression, ctx);
+    if (arity > 0) return dollarLambda(lower(expr), arity, ctx);
+    return evalExprWith(expr, ctx);
 }
 
-function dollarLambda(body: Expr, arity: number, ctx: Ctx): Value {
+/**
+ * Evaluate an application argument. `this`/`that` sugar turns the argument
+ * into an implicit lambda when it mentions an implicit parameter; the arity
+ * scan runs on the HIR node's AST so `$` collection stays syntax-driven.
+ */
+function evalHirArg(h: Hir, ctx: Ctx): Value {
+    const arity = dollarArity(h.at, ctx.env);
+    if (arity > 0) return dollarLambda(h, arity, ctx);
+    return evalHir(h, ctx);
+}
+
+function dollarLambda(body: Hir, arity: number, ctx: Ctx): Value {
     const params = Array.from({ length: arity }, (_, i) => `$${i + 1}`);
-    return { kind: 'lambda', params, body, closure: new Map(ctx.env), ast: body };
+    return { kind: 'lambda', params, body, closure: new Map(ctx.env), ast: body.at };
 }
 
 export function evalExprWith(e: Expr, ctx: Ctx): Value {
-    const value = evalExprWithInner(e, ctx);
+    // The AST node is still the key for recorded per-node values (hover and
+    // completion look them up by AST node), so the HIR node carries it.
+    const hir = lower(e);
+    const value = evalHir(hir, ctx);
     ctx.nodeValues?.set(e, value);
     return value;
 }
 
-function evalExprWithInner(e: Expr, ctx: Ctx): Value {
-    if (isLetExpression(e)) {
-        // `let x = value in body` — a pure lexical binding. Evaluation
-        // extends the environment immutably; the value is not mutable state.
-        let v = evalExprWith(e.value as Expr, ctx);
-        if (isError(v)) return ERROR;
-        // A query-type annotation on a local bare table defines the schema,
-        // exactly like a top-level binding annotation.
-        if (e.type && v.kind === 'query' && !v.query.known
-            && v.query.steps.every(step => step.kind !== 'join')) {
-            const qt = queryTypeOf(e.type);
-            if (qt) {
-                const schema = schemaFromQueryType(qt, e, ctx);
-                if (schema) {
-                    const alias = v.query.aliases[0] ?? v.query.root.name;
-                    const stamped: Schema = new Map(
-                        [...schema].map(([key, col]) => [key, { ...col, table: alias }]),
-                    );
-                    v = {
-                        kind: 'query',
-                        query: { ...v.query, known: true, root: { ...v.query.root, schema: stamped } },
-                        ast: v.ast,
-                    };
-                }
-            }
-        }
-        const env = new Map(ctx.env);
-        env.set(e.name ?? '', v);
-        return evalExprWith(e.body as Expr, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
-    }
-    if (isAscription(e)) {
-        // Type annotations are erased except for query schemas on plain
-        // tables, where the annotation IS the schema — and `mempty`, where
-        // the annotation picks the monoid instance (type-directed value).
-        const v = evalExprWith(e.operand!, ctx);
-        return stampQueryTypeAnnotation(v, e.type, e, ctx);
-    }
-    if (isUnaryMinus(e)) return evalUnary(e, ctx);
-    if (isBinaryExpression(e)) {
-        const left = evalUnary(e.left, ctx);
-        // `$` keeps implicit-lambda argument behavior (its right operand is
-        // an application argument); all other operators use the ordinary
-        // unary operand evaluation already encoded by the AST.
-        const right = e.operator === '$'
-            ? evalArg(e.right as Expr, ctx)
-            : evalUnary(e.right, ctx);
-        if (!isBinaryOperator(e.operator)) {
-            ctx.diagnostics.push({ node: e, message: `unknown operator '${e.operator}'` });
-            return ERROR;
-        }
-        return applyScopedBinaryOperator(e.operator, left, right, e, ctx);
-    }
-    if (isAccessExpression(e)) {
-        const recv = evalExprWith(e.receiver, ctx);
-        if (isError(recv)) return ERROR;
-        return access(recv, labelName(e.property), e, ctx);
-    }
-    if (isApplication(e)) {
-        // All builtins are ordinary curried functions — including the
-        // list-argument ones (`concat [a, b]`), which take a single list
-        // argument, and the heterogeneous/optional ones (`substring u.name 1
-        // nothing`), which curry position by position with `maybe` optionals.
-        let f = evalExprWith(e.func, ctx);
-        for (const argExpr of e.arguments) {
-            if (isError(f)) {
-                evalArg(argExpr, ctx); // keep collecting diagnostics
-                continue;
-            }
-            const arg = evalArg(argExpr, ctx);
-            f = applyWith(f, arg, argExpr, ctx);
-        }
-        return f;
-    }
-    if (isNumberLiteral(e)) {
-        const t: SqlType = numberLiteralType(e);
-        return mkExpr(lit(e.value, t), e);
-    }
-    if (isStringLiteral(e)) {
-        return mkExpr(lit(parseStringLiteral(e.value), 'string'), e);
-    }
-    if (isBooleanLiteral(e)) {
-        return mkExpr(lit(e.value === 'true', 'bool'), e);
-    }
-    if (isNullLiteral(e)) {
-        return mkExpr(lit(null, 'null'), e);
-    }
-    if (isCaseExpression(e)) {
-        return evalCase(e, ctx);
-    }
-    if (isListLiteral(e)) {
-        const items = e.elements.map(el => evalExprWith(el, ctx));
-        if (items.some(isError)) return ERROR;
-        return { kind: 'list', items, ast: e };
-    }
-    if (isMapLiteral(e)) {
-        // `{ receiver | k = v, ... }` is pure record-update sugar for
-        // `merge receiver { k = v, ... }`; the explicit entries win.
-        let fields: { key: string; value: Value }[];
-        if (e.receiver) {
-            const receiver = evalExprWith(e.receiver, ctx);
-            if (isError(receiver)) return ERROR;
-            if (receiver.kind !== 'record') {
-                const receiverNode = exprNode(receiver);
-                ctx.diagnostics.push({ node: e.receiver, message: `record update expects a record before '|', got ${receiverNode ? `type ${typeName(receiverNode.type)}` : describe(receiver)}` });
-                return ERROR;
-            }
-            const base = recordFields(receiver, e.receiver, ctx);
-            if (base === null) return ERROR;
-            fields = [...base];
-        } else {
-            fields = [];
-        }
-        const literalKeys = new Set<string>();
-        for (const entry of e.entries) {
-            const key = labelName(entry.key);
-            if (literalKeys.has(key)) {
-                ctx.diagnostics.push({ node: entry, message: `duplicate map key '${key}'` });
-            }
-            literalKeys.add(key);
-            let entryValue: Value;
-            if (entry.value) {
-                entryValue = evalExprWith(entry.value, ctx);
-            } else {
-                // Field punning: `{ id }` is `{ id = <lambda param>.id }`.
-                const paramName = enclosingLambdaParamName(entry);
-                if (paramName === null) {
-                    ctx.diagnostics.push({ node: entry, message: `field pun '${key}' requires an enclosing lambda parameter, e.g. map (u => { ${key} })` });
-                    return ERROR;
-                }
-                const rec = ctx.env.get(paramName);
-                if (!rec || rec.kind !== 'record') {
-                    ctx.diagnostics.push({ node: entry, message: `field pun '${key}' expects lambda parameter '${paramName}' to be a record` });
-                    return ERROR;
-                }
-                entryValue = readField(key, rec, entry, ctx);
-                if (isError(entryValue)) return ERROR;
-            }
-            fields = [...fields.filter(f => f.key !== key), { key, value: entryValue }];
-        }
-        return recordValue(fields, e);
-    }
-    if (isLambda(e)) {
-        // Snapshot the current scope: lambdas see only bindings defined so far.
-        // A parameter annotation (`(x: float) => ...`) is recorded as an SQL
-        // type so an overload set can be selected at render time.
-        const declared = sqlTypeOfAnnotation((e as { param?: { type?: unknown } }).param?.type);
-        return {
-            kind: 'lambda',
-            params: [lambdaParam(e)],
-            body: e.body as unknown as Expr,
-            closure: new Map(ctx.env),
-            ast: e,
-            ...(declared ? { paramType: declared } : {}),
-        };
-    }
-    if (isOperatorSection(e)) {
-        return operatorSectionValue(e.value, e, ctx);
-    }
-    if (isIdentifier(e)) {
-        const v = ctx.env.get(e.name);
-        if (v) return v;
-        // `this`/`that` sugar for the first two implicit lambda parameters.
-        const dollar = implicitParamName(e.name);
-        if (dollar) {
-            const param = ctx.env.get(dollar);
-            if (param) return param;
-            ctx.diagnostics.push({ node: e, message: `unknown lambda parameter '${e.name}' — this/that refer to the implicit parameters of the enclosing lambda, e.g. filter (this.active)` });
-            return ERROR;
-        }
-        if (ctx.moduleBindings.has(e.name)) {
-            ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}' — bindings must be defined before use` });
-            return ERROR;
-        }
-        const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
-        ctx.diagnostics.push({ node: e, message: `unknown identifier '${e.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
-        return ERROR;
-    }
-    ctx.diagnostics.push({ node: e, message: 'unexpected expression' });
-    return ERROR;
-}
-
-/** Evaluate a UnaryExpression (a BinaryExpression operand): unary minus or a plain expression. */
-function evalUnary(u: UnaryExpression, ctx: Ctx): Value {
-    const value = evalUnaryInner(u, ctx);
-    ctx.nodeValues?.set(u, value);
+/** Evaluate an already-lowered HIR node. */
+function evalHir(h: Hir, ctx: Ctx): Value {
+    const value = evalHirInner(h, ctx);
+    ctx.nodeValues?.set(h.at, value);
     return value;
 }
 
-function evalUnaryInner(u: UnaryExpression, ctx: Ctx): Value {
-    if (isUnaryMinus(u)) {
-        const v = evalUnary(u.operand, ctx);
-        const node = exprNode(v);
-        if (!node) return ERROR;
-        if (node.type === 'null' || (!isNumeric(node.type) && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: u, message: `unary '-' requires a numeric expression, got ${typeName(node.type)}` });
+function evalHirInner(h: Hir, ctx: Ctx): Value {
+    switch (h.kind) {
+        case 'let': {
+            // `let x = value in body` — a pure lexical binding. Evaluation
+            // extends the environment immutably; the value is not mutable state.
+            let v = evalHir(h.value, ctx);
+            if (isError(v)) return ERROR;
+            // A query-type annotation on a local bare table defines the schema,
+            // exactly like a top-level binding annotation.
+            if (h.type && v.kind === 'query' && !v.query.known
+                && v.query.steps.every(step => step.kind !== 'join')) {
+                const qt = queryTypeOf(h.type);
+                if (qt) {
+                    const schema = schemaFromQueryType(qt, h.at, ctx);
+                    if (schema) {
+                        const alias = v.query.aliases[0] ?? v.query.root.name;
+                        const stamped: Schema = new Map(
+                            [...schema].map(([key, col]) => [key, { ...col, table: alias }]),
+                        );
+                        v = {
+                            kind: 'query',
+                            query: { ...v.query, known: true, root: { ...v.query.root, schema: stamped } },
+                            ast: v.ast,
+                        };
+                    }
+                }
+            }
+            const env = new Map(ctx.env);
+            env.set(h.name, v);
+            return evalHir(h.body, { env, diagnostics: ctx.diagnostics, moduleBindings: ctx.moduleBindings });
+        }
+
+        case 'ascribe': {
+            // Type annotations are erased except for query schemas on plain
+            // tables, where the annotation IS the schema — and `mempty`, where
+            // the annotation picks the monoid instance (type-directed value).
+            const v = evalHir(h.operand, ctx);
+            return stampQueryTypeAnnotation(v, h.type, h.at, ctx);
+        }
+
+        case 'negate': {
+            const v = evalHir(h.operand, ctx);
+            const node = exprNode(v);
+            if (!node) return ERROR;
+            if (node.type === 'null' || (!isNumeric(node.type) && node.type !== 'unknown')) {
+                ctx.diagnostics.push({ node: h.at, message: `unary '-' requires a numeric expression, got ${typeName(node.type)}` });
+                return ERROR;
+            }
+            if (node.kind === 'lit' && typeof node.value === 'number') {
+                return mkExpr({ ...node, value: -node.value, type: node.type }, h.at);
+            }
+            return mkExpr({ kind: 'bin', op: '-', left: lit(0, node.type), right: node, type: node.type }, h.at);
+        }
+
+        case 'binary': {
+            const left = evalHir(h.left, ctx);
+            // `$` keeps implicit-lambda argument behavior (its right operand is
+            // an application argument); all other operators evaluate normally.
+            const right = h.op === '$'
+                ? evalHirArg(h.right, ctx)
+                : evalHir(h.right, ctx);
+            if (!isBinaryOperator(h.op)) {
+                ctx.diagnostics.push({ node: h.at, message: `unknown operator '${h.op}'` });
+                return ERROR;
+            }
+            return applyScopedBinaryOperator(h.op, left, right, h.at, ctx);
+        }
+
+        case 'access': {
+            const recv = evalHir(h.receiver, ctx);
+            if (isError(recv)) return ERROR;
+            return access(recv, h.property, h.at, ctx);
+        }
+
+        case 'apply': {
+            // All builtins are ordinary curried functions — including the
+            // list-argument ones (`concat [a, b]`), which take a single list
+            // argument, and the heterogeneous/optional ones (`substring u.name
+            // 1 nothing`), which curry position by position with `maybe`s.
+            // Overload selection happens inside `applyWith`.
+            let f = evalHir(h.func, ctx);
+            for (const argExpr of h.args) {
+                if (isError(f)) {
+                    evalHirArg(argExpr, ctx); // keep collecting diagnostics
+                    continue;
+                }
+                const arg = evalHirArg(argExpr, ctx);
+                f = applyWith(f, arg, argExpr.at, ctx);
+            }
+            return f;
+        }
+
+        case 'number':
+            return mkExpr({ kind: 'lit', value: h.value, type: numberLiteralType(h.at as unknown as NumberLiteral) }, h.at);
+
+        case 'string':
+            return mkExpr({ kind: 'lit', value: h.value, type: 'string' }, h.at);
+
+        case 'bool':
+            return mkExpr({ kind: 'lit', value: h.value, type: 'bool' }, h.at);
+
+        case 'null':
+            return mkExpr({ kind: 'lit', value: null, type: 'null' }, h.at);
+
+        case 'case':
+            return evalCaseHir(h, ctx);
+
+        case 'list': {
+            const items = h.elements.map(el => evalHir(el, ctx));
+            const bad = items.find(isError);
+            if (bad) return bad;
+            return { kind: 'list', items, ast: h.at };
+        }
+
+        case 'record': {
+            // A record literal is a plain `{ k = v, ... }`. The old
+            // `{ recv | k = v }` update sugar was removed from the grammar —
+            // it was only ever `merge recv { k = v }`, so use `merge`.
+            let fields: { key: string; value: Value }[] = [];
+            const literalKeys = new Set<string>();
+            for (const entry of h.entries) {
+                const key = entry.key;
+                if (literalKeys.has(key)) {
+                    ctx.diagnostics.push({ node: entry.at, message: `duplicate map key '${key}'` });
+                }
+                literalKeys.add(key);
+                let entryValue: Value;
+                if (entry.value) {
+                    entryValue = evalHir(entry.value, ctx);
+                } else {
+                    // Field punning: `{ id }` is `{ id = <lambda param>.id }`.
+                    const paramName = enclosingLambdaParamName(entry.at as unknown as MapEntry);
+                    if (paramName === null) {
+                        ctx.diagnostics.push({ node: entry.at, message: `field pun '${key}' requires an enclosing lambda parameter, e.g. map (u => { ${key} })` });
+                        return ERROR;
+                    }
+                    const rec = ctx.env.get(paramName);
+                    if (!rec || rec.kind !== 'record') {
+                        ctx.diagnostics.push({ node: entry.at, message: `field pun '${key}' expects lambda parameter '${paramName}' to be a record` });
+                        return ERROR;
+                    }
+                    entryValue = readField(key, rec, entry.at, ctx);
+                    if (isError(entryValue)) return ERROR;
+                }
+                fields = [...fields.filter(f => f.key !== key), { key, value: entryValue }];
+            }
+            return recordValue(fields, h.at);
+        }
+
+        case 'lambda': {
+            // Snapshot the current scope: lambdas see only bindings defined so
+            // far. A parameter annotation (`(x: float) => ...`) is recorded as
+            // an SQL type so an overload set can be selected at render time.
+            const declared = sqlTypeOfAnnotation(h.paramTypes[0]);
+            return {
+                kind: 'lambda',
+                params: [...h.params],
+                body: h.body,
+                closure: new Map(ctx.env),
+                ast: h.at,
+                ...(declared ? { paramType: declared } : {}),
+            };
+        }
+
+        case 'section':
+            return operatorSectionValue(h.value, h.at, ctx);
+
+        case 'ref': {
+            const v = ctx.env.get(h.name);
+            if (v) return v;
+            // `this`/`that` sugar for the first two implicit lambda parameters.
+            // Falling through to the generic message here would lose the hint
+            // that tells the user WHY the sugar did not resolve.
+            const dollar = implicitParamName(h.name);
+            if (dollar) {
+                const param = ctx.env.get(dollar);
+                if (param) return param;
+                ctx.diagnostics.push({ node: h.at, message: `unknown lambda parameter '${h.name}' — this/that refer to the implicit parameters of the enclosing lambda, e.g. filter (this.active)` });
+                return ERROR;
+            }
+            if (ctx.moduleBindings.has(h.name)) {
+                ctx.diagnostics.push({ node: h.at, message: `unknown identifier '${h.name}' — bindings must be defined before use` });
+                return ERROR;
+            }
+            // Builtins and hidden operator intrinsics are never worth listing.
+            const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
+            ctx.diagnostics.push({ node: h.at, message: `unknown identifier '${h.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
             return ERROR;
         }
-        if (node.kind === 'lit' && typeof node.value === 'number') {
-            return mkExpr({ ...node, value: -node.value, type: node.type }, u);
-        }
-        return mkExpr({ kind: 'bin', op: '-', left: lit(0, node.type), right: node, type: node.type }, u);
     }
-    return evalExprWith(u, ctx);
 }
+
+
 
 // ---------------------------------------------------------------------------
 // `case { cond => value, ..., _ => value }` — SQL CASE WHEN
@@ -1658,9 +1556,9 @@ function evalUnaryInner(u: UnaryExpression, ctx: Ctx): Value {
  * ELSE value. Values must share a comparable type (a `null` literal absorbs
  * like coalesce). Aggregates/group/order items are rejected, like coalesce.
  */
-function evalCase(e: CaseExpression, ctx: Ctx): Value {
-    if (e.branches.length === 0) {
-        ctx.diagnostics.push({ node: e, message: `case requires at least one branch, e.g. case { u.active => u.name, _ => "inactive" }` });
+function evalCaseHir(h: Extract<Hir, { kind: 'case' }>, ctx: Ctx): Value {
+    if (h.branches.length === 0) {
+        ctx.diagnostics.push({ node: h.at, message: `case requires at least one branch, e.g. case { u.active => u.name, _ => "inactive" }` });
         return ERROR;
     }
     const branches: { cond: SqlNode; value: SqlNode }[] = [];
@@ -1668,60 +1566,60 @@ function evalCase(e: CaseExpression, ctx: Ctx): Value {
     let resultType: SqlType | null = null;
     // Simple case: evaluate the subject ONCE, then compare every branch with
     // the same immutable value.
-    const subjectValue = e.subject ? evalExprWith(e.subject, ctx) : null;
+    const subjectValue = h.subject ? evalHir(h.subject, ctx) : null;
     if (subjectValue !== null && isError(subjectValue)) return ERROR;
 
-    const valueNode = (branch: import('./generated/ast.js').CaseBranch, value: Value): SqlNode | null => {
+    const valueNode = (branchAt: AstNode, value: Value): SqlNode | null => {
         const node = exprNode(value);
         if (!node) {
-            ctx.diagnostics.push({ node: branch, message: `case branch values must be scalar expressions, got ${describe(value)}` });
+            ctx.diagnostics.push({ node: branchAt, message: `case branch values must be scalar expressions, got ${describe(value)}` });
             return null;
         }
-        if (!ctx.allowAggregatesInCase && forbid(node, ['agg', 'group', 'order'], 'case', branch, ctx)) return null;
-        if (ctx.allowAggregatesInCase && forbid(node, ['group', 'order'], 'case', branch, ctx)) return null;
+        if (!ctx.allowAggregatesInCase && forbid(node, ['agg', 'group', 'order'], 'case', branchAt, ctx)) return null;
+        if (ctx.allowAggregatesInCase && forbid(node, ['group', 'order'], 'case', branchAt, ctx)) return null;
         if (node.type !== 'null') {
             if (resultType === null) resultType = node.type as SqlType;
             else if (!comparable(resultType, node.type)) {
-                ctx.diagnostics.push({ node: branch, message: `case requires matching value types, got ${typeName(resultType)} and ${typeName(node.type)}` });
+                ctx.diagnostics.push({ node: branchAt, message: `case requires matching value types, got ${typeName(resultType)} and ${typeName(node.type)}` });
                 return null;
             }
         }
         return node;
     };
 
-    for (let i = 0; i < e.branches.length; i++) {
-        const b = e.branches[i]!;
-        const value = evalExprWith(b.value!, ctx);
+    for (let i = 0; i < h.branches.length; i++) {
+        const b = h.branches[i]!;
+        const value = evalHir(b.value, ctx);
         if (isError(value)) return ERROR;
-        if (b.fallback) {
-            if (i !== e.branches.length - 1) {
-                ctx.diagnostics.push({ node: b, message: `the '_' fallback branch must be last in a case expression` });
+        if (!b.cond) {
+            // No condition = the `_` fallback branch.
+            if (i !== h.branches.length - 1) {
+                ctx.diagnostics.push({ node: b.at, message: `the '_' fallback branch must be last in a case expression` });
                 return ERROR;
             }
-            const v = valueNode(b, value);
+            const v = valueNode(b.at, value);
             if (!v) return ERROR;
             elseValue = v;
             continue;
         }
         let condValue: Value;
         if (subjectValue !== null) {
-            // The searched form with `subject == c1` conditions. Reuse
-            // evalBinary so `== null` becomes IS NULL and type checks match
-            // the operator.
-            const condExpr = evalExprWith(b.cond!, ctx);
+            // The simple form with `subject == c1` conditions. Reuse evalBinary
+            // so `== null` becomes IS NULL and type checks match the operator.
+            const condExpr = evalHir(b.cond, ctx);
             if (isError(condExpr)) return ERROR;
-            condValue = evalBinary('==', subjectValue, condExpr, b.cond ?? e, ctx);
+            condValue = evalBinary('==', subjectValue, condExpr, b.cond.at, ctx);
             if (isError(condValue)) return ERROR;
         } else {
-            condValue = evalExprWith(b.cond!, ctx);
+            condValue = evalHir(b.cond, ctx);
             if (isError(condValue)) return ERROR;
         }
         const cond = exprNode(condValue);
         if (!cond || (cond.type !== 'bool' && cond.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: b.cond, message: `case condition must be a boolean expression, got ${cond ? `type ${typeName(cond.type)}` : describe(condValue)}` });
+            ctx.diagnostics.push({ node: b.cond.at, message: `case condition must be a boolean expression, got ${cond ? `type ${typeName(cond.type)}` : describe(condValue)}` });
             return ERROR;
         }
-        if (forbid(cond, ['agg', 'group', 'order'], 'case', b.cond ?? b, ctx)) return ERROR;
+        if (forbid(cond, ['agg', 'group', 'order'], 'case', b.cond.at, ctx)) return ERROR;
         // Constant-fold a literal condition: the prelude branches on
         // compile-time values (`sql_dialect.name == "mysql"` folds to a
         // literal bool), so pick the branch NOW instead of emitting SQL.
@@ -1731,16 +1629,16 @@ function evalCase(e: CaseExpression, ctx: Ctx): Value {
             }
             continue; // false branch: skip it entirely
         }
-        const v = valueNode(b, value);
+        const v = valueNode(b.at, value);
         if (!v) return ERROR;
         branches.push({ cond, value: v });
     }
 
     if (branches.length === 0 && elseValue !== null) {
-        return mkExpr(elseValue, e);
+        return mkExpr(elseValue, h.at);
     }
     const t: SqlType = resultType ?? 'string'; // all-null branches → string, like coalesce
-    return mkExpr({ kind: 'case', branches, elseValue, type: t }, e);
+    return mkExpr({ kind: 'case', branches, elseValue, type: t }, h.at);
 }
 
 // ---------------------------------------------------------------------------
@@ -4044,11 +3942,6 @@ export interface AnalysisResult {
  * here so the interpreter does not import render (which imports interpreter).
  * The prelude seeds a first-class `sql_dialect` record from this.
  */
-export interface DialectView {
-    name: string;
-    functions: Readonly<Record<string, string>>;
-}
-
 export interface ProjectAnalysisOptions {
     /** Require the last module's last binding to be a query (default true). */
     requireQuery?: boolean;
@@ -4322,126 +4215,6 @@ function stampQueryTypeAnnotation(
     };
 }
 
-/**
- * Collect the module-binding names a binding's value references, ignoring
- * names shadowed by enclosing lambda parameters or `let` binders. This drives
- * the top-down (Haskell-style) binding order: a definition may reference any
- * other binding in the module regardless of position. Type annotations are
- * skipped — type names are not value references.
- */
-const TYPE_NODE_TYPES = new Set([
-    'Type', 'FunType', 'TypeAtom', 'BaseType', 'RecordType', 'QueryType',
-    'RecordField', 'ListType', 'TypeHole', 'TypeVar', 'TypeParen',
-]);
-
-function freeModuleRefs(node: AstNode, moduleNames: ReadonlySet<string>, shadow: Set<string>, out: Set<string>): void {
-    if (TYPE_NODE_TYPES.has(node.$type)) return;
-    if (isIdentifier(node)) {
-        if (!shadow.has(node.name) && moduleNames.has(node.name)) out.add(node.name);
-        return;
-    }
-    if (isLambda(node)) {
-        const param = node.param?.name;
-        if (param) shadow.add(param);
-        if (node.body) freeModuleRefs(node.body as unknown as AstNode, moduleNames, shadow, out);
-        if (param) shadow.delete(param);
-        return;
-    }
-    if (isLetExpression(node)) {
-        if (node.value) freeModuleRefs(node.value as unknown as AstNode, moduleNames, shadow, out);
-        if (node.name) shadow.add(node.name);
-        if (node.body) freeModuleRefs(node.body as unknown as AstNode, moduleNames, shadow, out);
-        if (node.name) shadow.delete(node.name);
-        return;
-    }
-    for (const key of Object.keys(node)) {
-        if (key === '$type' || key === '$container') continue;
-        const v = (node as unknown as Record<string, unknown>)[key];
-        if (Array.isArray(v)) {
-            for (const item of v) {
-                if (item && typeof item === 'object' && '$type' in (item as object)) {
-                    freeModuleRefs(item as AstNode, moduleNames, shadow, out);
-                }
-            }
-        } else if (v && typeof v === 'object' && '$type' in (v as object)) {
-            freeModuleRefs(v as AstNode, moduleNames, shadow, out);
-        }
-    }
-}
-
-/**
- * Order a module's bindings so every binding comes after the bindings its
- * value references (a stable topological sort, source order as tiebreak).
- * Bindings involved in reference cycles (recursion) are returned separately
- * and reported by the caller; a module with duplicate names falls back to
- * source order (duplicates are already errors).
- */
-export function topoOrderBindings(bindings: readonly Binding[]): { order: readonly Binding[]; cycles: readonly Binding[] } {
-    const names = new Set(bindings.map(b => b.name));
-    if (names.size !== bindings.length) {
-        return { order: bindings, cycles: [] }; // duplicates are diagnosed separately
-    }
-    const byName = new Map(bindings.map(b => [b.name, b] as const));
-    const indegree = new Map<string, number>();
-    const dependents = new Map<string, Binding[]>();
-    const refsByBinding = new Map<Binding, Set<string>>();
-    for (const b of bindings) {
-        const refs = new Set<string>();
-        if (b.value) freeModuleRefs(b.value as unknown as AstNode, names, new Set(), refs);
-        refsByBinding.set(b, refs);
-        indegree.set(b.name, 0);
-    }
-    for (const b of bindings) {
-        for (const r of refsByBinding.get(b)!) {
-            if (!byName.has(r)) continue;
-            indegree.set(b.name, indegree.get(b.name)! + 1);
-            const deps = dependents.get(r) ?? [];
-            deps.push(b);
-            dependents.set(r, deps);
-        }
-    }
-    const order: Binding[] = [];
-    const placed = new Set<string>();
-    let progressed = true;
-    while (progressed) {
-        progressed = false;
-        for (const b of bindings) {
-            if (placed.has(b.name) || indegree.get(b.name)! > 0) continue;
-            placed.add(b.name);
-            order.push(b);
-            progressed = true;
-            for (const dep of dependents.get(b.name) ?? []) {
-                indegree.set(dep.name, indegree.get(dep.name)! - 1);
-            }
-        }
-    }
-    // Genuine cycle members: residual nodes that can reach themselves via at
-    // least one dependency edge (nodes that merely DEPEND on a cycle are not
-    // themselves recursive).
-    const residual = bindings.filter(b => !placed.has(b.name));
-    const cycles: Binding[] = [];
-    const cycleNames = new Set<string>();
-    const reaches = (start: string, target: string, seen: Set<string>): boolean => {
-        if (seen.has(start)) return false;
-        seen.add(start);
-        for (const dep of dependents.get(start) ?? []) {
-            if (dep.name === target || reaches(dep.name, target, seen)) return true;
-        }
-        return false;
-    };
-    for (const b of residual) {
-        if (reaches(b.name, b.name, new Set())) {
-            cycles.push(b);
-            cycleNames.add(b.name);
-        }
-    }
-    // Residual nodes that only DEPEND on a cycle (without being recursive)
-    // still evaluate — after the cycle members are pre-bound to ERROR.
-    for (const b of residual) {
-        if (!cycleNames.has(b.name)) order.push(b);
-    }
-    return { order, cycles };
-}
 
 export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBindings: ReadonlySet<string>, seen: ReadonlySet<string>, ctxExtras: Partial<Ctx> = {}): BindingResult {
     const diagnostics: Diagnostic[] = [];
@@ -4514,16 +4287,6 @@ export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBi
     }
     nextEnv.set(binding.name, v);
     return { value: v, env: nextEnv, seen: nextSeen, diagnostics };
-}
-
-/** Diagnostic shared by the typed and runtime passes for an incomplete binding. */
-export function missingBindingExpressionMessage(name: string): string {
-    return `binding '${name}' is missing an expression after '='`;
-}
-
-/** Diagnostic shared by the typed and runtime passes for a recursive top-level binding. */
-export function recursiveBindingMessage(name: string): string {
-    return `binding '${name}' is part of a recursive cycle — recursive top-level bindings are not supported (use \`let\` or the \`recursive\` step for recursion)`;
 }
 
 // re-export for the validator

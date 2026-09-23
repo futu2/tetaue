@@ -187,6 +187,16 @@ export function detectNoPrelude(text: string): boolean {
     return /^\s*#\s*no\s+prelude\b/i.test(firstLine);
 }
 
+/**
+ * Detect a `# strict` directive in the first comment of a file. Strict mode
+ * turns a wildcard projection (`SELECT *` from an un-annotated table) into an
+ * error — see `ProjectModule.strict`.
+ */
+export function detectStrict(text: string): boolean {
+    const firstLine = text.split(/\r?\n/, 2)[0] ?? '';
+    return /^\s*#\s*strict\b/i.test(firstLine);
+}
+
 /** Null out every AST node's `$cstNode` so the parse's CST tree can be GC'd. */
 function dropCst(model: Model): void {
     for (const node of AstUtils.streamAst(model)) {

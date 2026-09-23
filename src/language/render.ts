@@ -4,8 +4,12 @@
  * Dialects are capability-driven (like teta's backend): identifier quoting,
  * boolean literals and function-name mappings are resolved at render time.
  ******************************************************************************/
-import { querySchema, type JoinKind, type Query, type SetOp, type SqlNode } from './interpreter.js';
-import type { BuiltinName } from './builtin.js';
+import { querySchema } from '../core/ir.js';
+import type { JoinKind, Query, SetOp, SqlNode } from '../core/ir.js';
+import {
+    BUILTIN_ALIASES, BUILTIN_SPECS,
+    type BuiltinName, type BuiltinSpec, type LowerCtx, type Lowering,
+} from './builtin.js';
 import { optimizeQuery } from './optimize.js';
 import { checkDialectCapabilities } from './capabilities.js';
 
@@ -259,6 +263,23 @@ function lastProjection(q: Query): Extract<Query['steps'][number], { kind: 'map'
     return null;
 }
 
+/**
+ * The explicit SELECT list for a query whose schema is KNOWN but which has no
+ * `map`/`fold`/join projection step (a schema-annotated `table`/`filter`
+ * pipeline). Column order follows the root schema, and each column carries the
+ * root alias so qualification matches the rest of the query. Returns null when
+ * no known schema is available, so the caller falls back to `SELECT *`.
+ */
+function knownSchemaProjection(q: Query): readonly SqlNode[] | null {
+    if (!q.known || q.root.schema.size === 0) return null;
+    // A derived-table root with no steps is projected by the inner query.
+    if (q.root.from && q.steps.length === 0) return null;
+    const alias = q.aliases[0] ?? q.root.name;
+    return [...q.root.schema].map(([key, col]) => col.expr ?? {
+        kind: 'col' as const, name: key, table: alias, type: col.type,
+    });
+}
+
 // --- expression rendering --------------------------------------------------
 
 // SQL operator precedence (higher binds tighter)
@@ -320,6 +341,7 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
                 ctx.ctes,
                 ctx.parameters,
                 new Set([...ctx.outerAliases, ...ctx.innerAliases]),
+                true,
             );
             return parenIf(`EXISTS (${sub})`, precOf('ATOM'), parentPrec);
         }
@@ -465,11 +487,6 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
 // ---------------------------------------------------------------------------
 
 /** Canonical builtin names that lower to dialect-specific date/time SQL. */
-const DATE_FUNCTIONS = new Set<BuiltinName>([
-    'extract', 'year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second',
-    'date_add', 'date_diff', 'date_trunc',
-    'date_format', 'date_parse', 'to_unixtime', 'from_unixtime',
-]);
 
 const DATE_UNIT_SQL: Record<string, string> = {
     year: 'YEAR', month: 'MONTH', week: 'WEEK', day: 'DAY',
@@ -495,93 +512,54 @@ function unitSeconds(unit: string): number {
  * spec): date/time functions plus the scalar functions whose lowering is not a
  * plain same-name call (sqlite fallbacks, binary forms and casts).
  */
-const SPECIAL_CALLS = new Set<BuiltinName>([
-    // date/time family (see renderDateFunction)
-    'extract', 'year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second',
-    'date_add', 'date_diff', 'date_trunc', 'date_format', 'date_parse',
-    'to_unixtime', 'from_unixtime',
-    // scalar family
-    'concat', 'greatest', 'least', 'substring', 'reverse',
-    'lpad', 'rpad', 'cast',
-    'from_maybe', 'is_true', 'is_false', 'is_unknown',
-]);
+/**
+ * Special SQL lowerings, keyed by name AS IT APPEARS IN THE IR. Derived from
+ * the builtin registry instead of a hand-kept set, so "is this a special
+ * call?" and "how does it lower?" can no longer drift apart.
+ *
+ * Aliases are registered under their OWN spelling: the evaluator resolves
+ * aliases for argument-index purposes but keeps the written name in the call
+ * node (`rpad` stays `rpad`), so an alias of a special builtin must be
+ * reachable by name — and its lowering must read `ctx.name` when the two
+ * differ in meaning (lpad/rpad, greatest/least).
+ */
+const LOWERINGS: ReadonlyMap<string, Lowering> = (() => {
+    const map = new Map<string, Lowering>();
+    // `BUILTIN_SPECS` is `as const` (so `BuiltinName` stays a precise union),
+    // which hides the OPTIONAL `lower` on entries that omit it. Widen to the
+    // declared interface for this read; the declaration is still checked.
+    const specs: readonly BuiltinSpec[] = BUILTIN_SPECS;
+    for (const spec of specs) {
+        if (spec.lower) map.set(spec.name, spec.lower);
+    }
+    for (const [alias, target] of Object.entries(BUILTIN_ALIASES)) {
+        const lower = map.get(target);
+        if (lower) map.set(alias, lower);
+    }
+    return map;
+})();
 
 function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): string | null {
-    if (DATE_FUNCTIONS.has(node.name as BuiltinName)) return renderDateFunction(node, ctx);
-    if (!SPECIAL_CALLS.has(node.name as BuiltinName)) return null;
-    const d = ctx.dialect.name;
-    const x = (i = 0) => renderExpr(node.args[i]!, ctx, precOf('CALL'));
+    const lower = LOWERINGS.get(node.name);
+    if (!lower) return null; // no special form: the default NAME(...) path
 
-    switch (node.name) {
-        case 'concat': {
-            const parts = node.args.map(a => renderExpr(a, ctx));
-            if (d === 'sqlite') {
-                // SQLite has no CONCAT; || propagates NULL, so COALESCE each
-                // argument to the empty string to match CONCAT semantics.
-                return parts.map(p => `COALESCE(${p}, '')`).join(' || ');
-            }
-            return `CONCAT(${parts.join(', ')})`;
-        }
-        case 'greatest': case 'least': {
-            if (d !== 'sqlite') return null; // GREATEST/LEAST via the default path
-            // SQLite has scalar MAX/MIN with GREATEST/LEAST-like NULL semantics.
-            const fn = node.name === 'greatest' ? 'MAX' : 'MIN';
-            return `${fn}(${node.args.map(a => renderExpr(a, ctx)).join(', ')})`;
-        }
-        case 'substring': {
-            // value, start, length?
-            const len = node.args[2] ? x(2) : null;
-            if (d === 'sqlite') return len ? `SUBSTR(${x()}, ${x(1)}, ${len})` : `SUBSTR(${x()}, ${x(1)})`;
-            return len ? `SUBSTRING(${x()}, ${x(1)}, ${len})` : `SUBSTRING(${x()}, ${x(1)})`;
-        }
-        case 'reverse':
-            if (d === 'sqlite') {
-                // A scalar recursive CTE reverses one character per step and
-                // remains correlated with the current row expression.
-                return `(WITH RECURSIVE __tetaue_reverse(i, value) AS (`
-                    + `SELECT LENGTH(${x()}), '' UNION ALL `
-                    + `SELECT i - 1, value || SUBSTR(${x()}, i, 1) `
-                    + `FROM __tetaue_reverse WHERE i > 0`
-                    + `) SELECT value FROM __tetaue_reverse WHERE i = 0)`;
-            }
-            return `REVERSE(${x()})`;
-        case 'lpad': case 'rpad':
-            // SQLite has no LPAD/RPAD.  printf() produces a run of spaces and
-            // replace() turns it into the requested pad string. CASE handles
-            // native LPAD/RPAD behavior when the input is already too long.
-            if (d === 'sqlite') {
-                const value = x();
-                const width = x(1);
-                const pad = node.args[2] ? x(2) : ctx.dialect.stringLiteral(' ');
-                const fill = `REPLACE(PRINTF('%*s', ${width}, ''), ' ', ${pad})`;
-                const missing = `${width} - LENGTH(${value})`;
-                const truncated = `SUBSTR(${value}, 1, ${width})`;
-                return node.name === 'lpad'
-                    ? `CASE WHEN LENGTH(${value}) >= ${width} THEN ${truncated} ELSE SUBSTR(${fill}, 1, ${missing}) || ${value} END`
-                    : `CASE WHEN LENGTH(${value}) >= ${width} THEN ${truncated} ELSE ${value} || SUBSTR(${fill}, 1, ${missing}) END`;
-            }
-            if (node.args.length === 2) {
-                // MySQL/Trino/Hive require the pad string; PostgreSQL defaults
-                // to a space. Make the default explicit for a uniform lowering.
-                return `${node.name.toUpperCase()}(${x()}, ${x(1)}, ' ')`;
-            }
-            return null;
-        case 'from_maybe':
-            return `COALESCE(${x()}, ${x(1)})`;
-        case 'is_true':
-            return `${x()} IS TRUE`;
-        case 'is_false':
-            return `${x()} IS FALSE`;
-        case 'is_unknown':
-            // IS UNKNOWN is not accepted by every supported backend;
-            // for a boolean expression SQL UNKNOWN is exactly NULL.
-            return `${x()} IS NULL`;
-        case 'cast': {
-            const type = node.args[1]?.kind === 'lit' ? sqlTypeName(String(node.args[1]!.value), d) : 'INTEGER';
-            return `CAST(${x()} AS ${type})`;
-        }
-    }
-    return null;
+    const d = ctx.dialect;
+    return lower({
+        name: node.name,
+        dialect: d.name,
+        arity: node.args.length,
+        arg: (k) => renderExpr(node.args[k]!, ctx, precOf('CALL')),
+        stringLiteral: (value) => d.stringLiteral(value),
+        castTypeName: (tetaueType) => sqlTypeName(tetaueType, d.name),
+        literal: (k) => {
+            const a = node.args[k];
+            return a?.kind === 'lit' && typeof a.value === 'string' ? a.value : null;
+        },
+        numberLiteral: (k) => {
+            const a = node.args[k];
+            return a?.kind === 'lit' && typeof a.value === 'number' ? a.value : null;
+        },
+    });
 }
 
 /** tetaue scalar type name → per-dialect SQL cast type. */
@@ -597,236 +575,6 @@ function sqlTypeName(t: string, d: string): string {
         case 'timestamp': return 'TIMESTAMP';
     }
     return t.toUpperCase();
-}
-
-function renderDateFunction(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): string {
-    const d = ctx.dialect.name;
-    const [value, second, third] = node.args;
-    const x = () => renderExpr(value!, ctx, precOf('CALL'));
-    const str = (n?: SqlNode): string | null => (n?.kind === 'lit' && typeof n.value === 'string' ? n.value : null);
-    const num = (n?: SqlNode): number | null => (n?.kind === 'lit' && typeof n.value === 'number' ? n.value : null);
-    const unit = () => str(second) ?? 'day';
-    const arg = () => renderExpr(third!, ctx, precOf('CALL'));
-
-    switch (node.name) {
-        case 'extract':
-            return renderDatePart(d, str(second) ?? 'day', x());
-
-        case 'year': case 'month': case 'day': case 'day_of_week':
-        case 'hour': case 'minute': case 'second':
-            return renderDatePart(d, node.name, x());
-
-        case 'date_add': return renderDateAdd(d, x(), unit(), third!, arg, num);
-        case 'date_diff': return renderDateDiff(d, x(), unit(), arg());
-        case 'date_trunc': return renderDateTrunc(d, x(), unit());
-        case 'date_format': return renderDateFormat(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral);
-        case 'date_parse': return renderDateParse(d, x(), str(second) ?? '%Y-%m-%d', ctx.dialect.stringLiteral);
-        case 'to_unixtime': return renderToUnixtime(d, x());
-        case 'from_unixtime': return renderFromUnixtime(d, x());
-    }
-    return renderFailure(ctx, node, `unknown date function '${node.name}'`);
-}
-
-/** EXTRACT / date-part lowering for the given field over a rendered value. */
-function renderDatePart(d: string, field: string, x: string): string {
-    switch (d) {
-        case 'sqlite': {
-            const fmt: Record<string, string> = { year: '%Y', month: '%m', day: '%d', hour: '%H', minute: '%M', second: '%S', day_of_week: '%w' };
-            return `CAST(STRFTIME('${fmt[field] ?? '%Y'}', ${x}) AS INTEGER)`;
-        }
-        case 'postgresql': {
-            const f: Record<string, string> = { year: 'YEAR', month: 'MONTH', day: 'DAY', hour: 'HOUR', minute: 'MINUTE', second: 'SECOND', day_of_week: 'DOW' };
-            return `EXTRACT(${f[field] ?? field.toUpperCase()} FROM ${x})`;
-        }
-        case 'mysql':
-            if (field === 'day_of_week') return `DAYOFWEEK(${x})`;
-            return `EXTRACT(${DATE_UNIT_SQL[field] ?? field.toUpperCase()} FROM ${x})`;
-        case 'trino': {
-            const f: Record<string, string> = { year: 'YEAR', month: 'MONTH', day: 'DAY', hour: 'HOUR', minute: 'MINUTE', second: 'SECOND', day_of_week: 'DAY_OF_WEEK' };
-            return `EXTRACT(${f[field] ?? field.toUpperCase()} FROM ${x})`;
-        }
-        case 'hive': {
-            if (field === 'day_of_week') return `DAYOFWEEK(${x})`;
-            return `${DATE_UNIT_SQL[field] ?? field.toUpperCase()}(${x})`;
-        }
-        default:
-            return `EXTRACT(${field.toUpperCase()} FROM ${x})`;
-    }
-}
-
-/** `date_add value unit amount` — unit is interpreter-validated. */
-function renderDateAdd(d: string, x: string, unit: string, amount: SqlNode, renderAmount: () => string, num: (n?: SqlNode) => number | null): string {
-    const a = renderAmount();
-    switch (d) {
-        case 'postgresql':
-            return `${x} + (${a}) * INTERVAL '1 ${unit}'`;
-        case 'mysql': {
-            const amt = num(amount);
-            const inner = amt !== null ? `${amt}` : `(${a})`;
-            return `DATE_ADD(${x}, INTERVAL ${inner} ${DATE_UNIT_SQL[unit] ?? unit.toUpperCase()})`;
-        }
-        case 'sqlite': {
-            const amt = num(amount);
-            if (amt !== null) {
-                const mod = unit === 'week' ? `${amt * 7} days` : `${amt} ${unit}s`;
-                return `DATETIME(${x}, '${amt >= 0 ? '+' : ''}${mod}')`;
-            }
-            const modifier = unit === 'week'
-                ? `PRINTF('%+d days', (${a}) * 7)`
-                : `PRINTF('%+d ${unit}s', ${a})`;
-            // The modifier is computed in SQL, so column/parameter amounts
-            // work just like literal amounts on the other backends.
-            return `DATETIME(${x}, ${modifier})`;
-        }
-        case 'trino':
-            return `DATE_ADD('${unit}', ${a}, ${x})`;
-        case 'hive': {
-            const amt = num(amount);
-            const inner = amt !== null ? `'${amt}'` : `(${a})`;
-            return `${x} + INTERVAL ${inner} ${DATE_UNIT_SQL[unit] ?? unit.toUpperCase()}`;
-        }
-        default:
-            return `DATE_ADD('${unit}', ${a}, ${x})`;
-    }
-}
-
-/** `date_diff value unit other` — calendar-ish diff (other - value) in units. */
-function renderDateDiff(d: string, x: string, unit: string, other: string): string {
-    switch (d) {
-        case 'postgresql':
-            if (unit === 'week') return `EXTRACT(DAY FROM (${other} - ${x})) / 7`;
-            return `EXTRACT(${DATE_UNIT_SQL[unit] ?? unit.toUpperCase()} FROM (${other} - ${x}))`;
-        case 'mysql':
-            return `TIMESTAMPDIFF(${DATE_UNIT_SQL[unit] ?? unit.toUpperCase()}, ${x}, ${other})`;
-        case 'sqlite': {
-            // JULIANDAY is SQLite's portable timestamp primitive.  For units
-            // without a calendar-aware builtin, use the corresponding fixed
-            // duration; this is the same elapsed-time interpretation used by
-            // Trino's DATE_DIFF for timestamps.
-            const factor: Record<string, number> = {
-                year: 1 / 365, month: 1 / 30, week: 1 / 7,
-                day: 1, hour: 24, minute: 1440, second: 86400,
-            };
-            const diff = `(JULIANDAY(${other}) - JULIANDAY(${x}))`;
-            const scale = factor[unit] ?? 1;
-            return scale === 1 ? `CAST(${diff} AS INTEGER)` : `CAST(${diff} * ${scale} AS INTEGER)`;
-        }
-        case 'trino':
-            return `DATE_DIFF('${unit}', ${x}, ${other})`;
-        case 'hive':
-            if (unit === 'day') return `DATEDIFF(${other}, ${x})`;
-            // Hive's DATEDIFF is day-granular; convert the timestamp delta to
-            // the requested unit so the same source expression remains valid.
-            return `CAST((UNIX_TIMESTAMP(${other}) - UNIX_TIMESTAMP(${x})) / ${unitSeconds(unit)} AS BIGINT)`;
-        default:
-            return `DATE_DIFF('${unit}', ${x}, ${other})`;
-    }
-}
-
-/** `date_trunc value unit`. */
-function renderDateTrunc(d: string, x: string, unit: string): string {
-    switch (d) {
-        case 'postgresql':
-        case 'trino':
-            return `DATE_TRUNC('${unit}', ${x})`;
-        case 'mysql':
-            switch (unit) {
-                case 'year': return `STR_TO_DATE(DATE_FORMAT(${x}, '%Y-01-01'), '%Y-%m-%d')`;
-                case 'month': return `STR_TO_DATE(DATE_FORMAT(${x}, '%Y-%m-01'), '%Y-%m-%d')`;
-                case 'week': return `DATE_SUB(DATE(${x}), INTERVAL WEEKDAY(${x}) DAY)`;
-                case 'day': return `DATE(${x})`;
-                case 'hour': return `DATE_FORMAT(${x}, '%Y-%m-%d %H:00:00')`;
-                case 'minute': return `DATE_FORMAT(${x}, '%Y-%m-%d %H:%i:00')`;
-                case 'second': return `DATE_FORMAT(${x}, '%Y-%m-%d %H:%i:%s')`;
-                default: return `DATE(${x})`;
-            }
-        case 'sqlite': {
-            if (unit === 'week') {
-                return `DATE(${x}, '-' || ((CAST(STRFTIME('%w', ${x}) AS INTEGER) + 6) % 7) || ' days')`;
-            }
-            const f: Record<string, string> = {
-                year: '%Y-01-01', month: '%Y-%m-01',
-                day: '%Y-%m-%d', hour: '%Y-%m-%d %H:00:00',
-                minute: '%Y-%m-%d %H:%M:00', second: '%Y-%m-%d %H:%M:%S',
-            };
-            return `STRFTIME('${f[unit] ?? f.day}', ${x})`;
-        }
-        case 'hive': {
-            const f: Record<string, string> = {
-                year: 'YYYY', month: 'MM', week: 'WEEK', day: 'DD',
-            };
-            if (f[unit] !== undefined) return `TRUNC(${x}, '${f[unit]}')`;
-            return `FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(${x}) / ${unitSeconds(unit)}) * ${unitSeconds(unit)})`;
-        }
-        default:
-            return `DATE_TRUNC('${unit}', ${x})`;
-    }
-}
-
-/** `date_format value format` — dialect-native format string. */
-function renderDateFormat(d: string, x: string, format: string, quote: (v: string) => string): string {
-    const f = quote(format);
-    switch (d) {
-        case 'postgresql':
-            return `TO_CHAR(${x}, ${f})`;
-        case 'mysql': case 'trino': case 'hive':
-            return `DATE_FORMAT(${x}, ${f})`;
-        case 'sqlite':
-            return `STRFTIME(${f}, ${x})`;
-        default:
-            return `DATE_FORMAT(${x}, ${f})`;
-    }
-}
-
-/** `date_parse value format` — dialect-native format string. */
-function renderDateParse(d: string, x: string, format: string, quote: (v: string) => string): string {
-    const f = quote(format);
-    switch (d) {
-        case 'postgresql':
-            return `TO_TIMESTAMP(${x}, ${f})`;
-        case 'mysql':
-            return `STR_TO_DATE(${x}, ${f})`;
-        case 'sqlite':
-            return `DATETIME(${x})`; // sqlite parses many formats natively; the format is ignored
-        case 'trino':
-            return `DATE_PARSE(${x}, ${f})`;
-        case 'hive':
-            return `FROM_UNIXTIME(UNIX_TIMESTAMP(${x}, ${f}))`;
-        default:
-            return `DATE_PARSE(${x}, ${f})`;
-    }
-}
-
-/** `to_unixtime value` — unix seconds. */
-function renderToUnixtime(d: string, x: string): string {
-    switch (d) {
-        case 'postgresql':
-            return `EXTRACT(EPOCH FROM ${x})`;
-        case 'mysql': case 'hive':
-            return `UNIX_TIMESTAMP(${x})`;
-        case 'sqlite':
-            return `CAST(STRFTIME('%s', ${x}) AS INTEGER)`;
-        case 'trino':
-            return `TO_UNIXTIME(${x})`; // double seconds
-        default:
-            return `TO_UNIXTIME(${x})`;
-    }
-}
-
-/** `from_unixtime value` — unix seconds to a timestamp. */
-function renderFromUnixtime(d: string, x: string): string {
-    switch (d) {
-        case 'postgresql':
-            return `TO_TIMESTAMP(${x})`;
-        case 'mysql': case 'hive':
-            return `FROM_UNIXTIME(${x})`;
-        case 'sqlite':
-            return `DATETIME(${x}, 'unixepoch')`;
-        case 'trino':
-            return `FROM_UNIXTIME(${x})`;
-        default:
-            return `FROM_UNIXTIME(${x})`;
-    }
 }
 
 // --- set-operation rendering ------------------------------------------------
@@ -890,7 +638,7 @@ function renderSetQuery(q: Query, dialect: DialectSpec, format: RenderFormat, di
 
 // --- query rendering -------------------------------------------------------
 
-function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: RenderFormat, diagnostics: RenderDiagnostic[], ctes: CteMap = NO_CTES, parameters: ParameterState = new Map(), outerAliases: ReadonlySet<string> = new Set()): string {
+function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: RenderFormat, diagnostics: RenderDiagnostic[], ctes: CteMap = NO_CTES, parameters: ParameterState = new Map(), outerAliases: ReadonlySet<string> = new Set(), existsSubquery = false): string {
     // A set step is a complete relational operation, not a clause in the
     // surrounding SELECT: render it as operand-wrapped UNION/INTERSECT/EXCEPT.
     if (q.steps.some(s => s.kind === 'set')) return renderSetQuery(q, dialect, format, diagnostics, ctes, parameters, outerAliases);
@@ -931,8 +679,26 @@ function renderQueryWithDiagnostics(q: Query, dialect: DialectSpec, format: Rend
         select = pretty && items.length > 1
             ? renderListClause(head, items, true)
             : `${head} ${items.join(', ')}`;
+    } else if (existsSubquery) {
+        // An EXISTS subquery's select list is irrelevant to SQL semantics, so
+        // emit the conventional constant list instead of enumerating columns.
+        select = 'SELECT 1';
     } else {
-        select = `SELECT${q.distinct ? ' DISTINCT' : ''} *`;
+        // No projection step, but the row shape is still known — a
+        // schema-annotated `table`/`filter` pipeline. Project the declared
+        // columns instead of `*`, so an annotation is a real column contract
+        // rather than a type-level claim only. An un-annotated (dynamic) query
+        // keeps `SELECT *`.
+        const schemaColumns = knownSchemaProjection(q);
+        if (schemaColumns) {
+            const items = schemaColumns.map(col => renderExpr(col, ctx));
+            const head = `SELECT${q.distinct ? ' DISTINCT' : ''}`;
+            select = pretty && items.length > 1
+                ? renderListClause(head, items, true)
+                : `${head} ${items.join(', ')}`;
+        } else {
+            select = `SELECT${q.distinct ? ' DISTINCT' : ''} *`;
+        }
     }
     clauses.push(select);
     // A schema-qualified root name (`public.users`) is aliased to its last

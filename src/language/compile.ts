@@ -15,7 +15,7 @@
  ******************************************************************************/
 import { type AstNode } from 'langium';
 import type { TetaueServices } from './tetaue-module.js';
-import type { Diagnostic } from './interpreter.js';
+import type { Diagnostic } from './binding-analysis.js';
 import { checkProject } from './checker.js';
 import { renderQuery, DIALECTS, isDialect } from './render.js';
 import type { RenderDiagnostic, RenderFormat } from './render.js';
@@ -23,7 +23,8 @@ import { collectModuleTree, moduleOf } from './imports.js';
 import type { ResolvedImportEdge, ResolvedExportEdge } from './imports.js';
 import type { ProjectModule } from './imports.js';
 import { createImportResolver } from './resolve.js';
-import { createModuleLoader, parseModel, detectNoPrelude } from './module-cache.js';
+import { createModuleLoader, parseModel, detectNoPrelude, detectStrict } from './module-cache.js';
+import { checkStrictSchema } from './strict-schema.js';
 import type { Model } from './generated/ast.js';
 import { standardPrelude } from './prelude.js';
 import { stringEscapeWarningsFor } from './strings.js';
@@ -192,11 +193,13 @@ export function compileModuleText(
     // Attach noPrelude meta based on source text
     const readMyFile = (uri: string) => moduleLoader.read(uri);
     if (detectNoPrelude(rootText)) main.noPrelude = true;
+    if (detectStrict(rootText)) main.strict = true;
     // Propagate noPrelude for all collected modules by re-reading their source
     for (const m of modules) {
         if (m.uri) {
             const txt = readMyFile(m.uri) ?? '';
             if (detectNoPrelude(txt)) m.noPrelude = true;
+            if (detectStrict(txt)) m.strict = true;
         }
     }
     const { value, diagnostics: merged } = checkProject(modules, {
@@ -227,6 +230,17 @@ export function compileModuleText(
     }
     if (value.kind !== 'query') {
         return { ok: false, diagnostics: [] };
+    }
+    // Strict-schema mode: every emitted query must name its columns. The check
+    // runs on the SAME IR the renderer consumes, so it can never disagree with
+    // whether `render` would have produced a wildcard projection.
+    if (main.strict) {
+        for (const d of checkStrictSchema(value.query)) {
+            all.push(diagnostic(d, main.uri ?? rootUri));
+        }
+        if (all.some(d => (d.severity ?? 'error') === 'error')) {
+            return { ok: false, diagnostics: all };
+        }
     }
     const spec = DIALECTS[dialect]!;
     const rendered = renderQuery(value.query, spec, format);

@@ -10,7 +10,8 @@
  ******************************************************************************/
 import type { AstNode } from 'langium';
 import type { Export, Import, Model } from './generated/ast.js';
-import { parseStringLiteral, type Diagnostic } from './interpreter.js';
+import { parseStringLiteral } from './strings.js';
+import type { Diagnostic } from './binding-analysis.js';
 import type { ResolvedImport } from './resolve.js';
 
 export interface ProjectModule {
@@ -32,6 +33,13 @@ export interface ProjectModule {
     exports?: readonly ResolvedExportEdge[];
     /** If true, the module opts out of the default prelude injection. */
     noPrelude?: boolean;
+    /**
+     * If true, the module is in STRICT-SCHEMA mode (`# strict` on its first
+     * line): a query whose row shape is not known — a bare `table "t"` with no
+     * schema annotation and no projecting `map`/`fold` step, which would render
+     * `SELECT *` — is an error instead of a silent wildcard projection.
+     */
+    strict?: boolean;
 }
 
 export interface ResolvedImportEdge {

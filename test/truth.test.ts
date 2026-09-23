@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { render, typeErrors } from './helpers.ts';
+import { allErrors, render, typeErrors } from './helpers.ts';
 
 describe('SQL three-valued logic helpers', () => {
     test('is_true/is_false/is_unknown accept bool and nullable bool', () => {
@@ -25,9 +25,17 @@ describe('SQL three-valued logic helpers', () => {
             t: query { id: int } = table "t"
             q = t & filter (u => is_unknown u.id)
         `;
-        // The row-polymorphic lambda is constrained to the internal `truth`
-        // type, then rejected when it is applied to the annotated int row.
-        expect(typeErrors(src).join('\n')).toContain('cannot apply');
+        // `is_unknown` requires a bool / maybe bool argument, so the int column
+        // is rejected where the mistake is: at the predicate itself, naming the
+        // argument's actual type. (This used to surface indirectly as
+        // `cannot apply`, because the argument was constrained to an internal
+        // `truth` marker that leaked `bool?` into the enclosing row type.)
+        //
+        // Asserted through `allErrors` (the merged inference + interpreter path
+        // that `check`/LSP render) rather than `typeErrors`: the interpreter's
+        // evaluation knows the column's concrete type, so the diagnostic is
+        // produced there, and `typeErrors` alone never sees a resolved row field.
+        expect(allErrors(src).join('\n')).toContain('is_unknown expects a boolean or nullable boolean expression, got type int');
     });
 
     test('lowering is portable across the supported SQL dialects', () => {

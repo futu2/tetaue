@@ -26,7 +26,7 @@ adult: { active: bool, age: int | r } -> bool = u => u.active && u.age >= 18
 
 adults = users
     & filter (adult)
-    & map (u => { id = u.id, name = upper u.name, age = u.age, active = u.active })
+    & map (u => { id = u.id, name = toUpper u.name, age = u.age, active = u.active })
     & sort (u => [asc u.name])
     & take 10
 ```
@@ -190,7 +190,7 @@ The VS Code extension is built two ways:
 - The flake pins its own `nixpkgs-unstable` input, so the host NixOS channel
   does not matter.
 
-## Set operations and record update
+## Set operations and record extension
 
 Queries compose with the pure set combinators `union`, `union_all`,
 `intersect`, and `except` exactly like any other pipeline step:
@@ -198,9 +198,17 @@ Queries compose with the pure set combinators `union`, `union_all`,
     active_or_archived = active_users & union_all archived_users
 
 Both operands are complete relational expressions; a later `sort`/`take`
-runs on the combined result. Record update is merge sugar: `{ u | active =
-u.age >= 18 }` is `merge u { active = u.age >= 18 }`, so projections can
-extend a row without repeating every column.
+runs on the combined result.
+
+To extend a row without repeating every column, use `merge` — it is the ONLY
+spelling:
+
+    users & map (u => merge u { active = u.age >= 18 })
+
+The `{ u | active = ... }` update sugar was **removed**: it only ever meant
+`merge u { active = ... }`, so a record literal `{ k = v, ... }` now always
+means exactly a record and nothing else. (A `|` inside a TYPE is unrelated and
+still valid — `{ age: int | r }` is an open row with tail variable `r`.)
 
 ## Modules
 
@@ -222,12 +230,46 @@ is exactly as valid as the reverse order. Recursive top-level bindings
 (`a = b`, `b = a`) are not supported — use `let` for a local recursion or the
 `recursive` query step for SQL recursion.
 
+### A schema annotation is a column contract
+
+The `query { ... }` annotation on a binding is not only a type: when a query's
+row shape is known, the renderer **projects exactly those columns** instead of
+`SELECT *`. An annotation therefore pins the SQL column list, not just the
+static type:
+
+```
+users: query { id: int, name: string, active: bool } = table "users"
+active_users = users & filter (u => u.active)
+# SELECT id, name, active FROM users WHERE active     ← columns named, never `*`
+```
+
+A projection (`map`/`fold`/a join merger) decides the column list the same way.
+`SELECT *` remains only for a **dynamic** table — a bare `table "t"` with no
+annotation and no projecting step, where no row shape is known:
+
+```
+q = table "t"            # SELECT * FROM t
+```
+
+For a module that should never emit a wildcard, put **`# strict` on its first
+line**: any query that would render `SELECT *` becomes a compile error (it is
+checked on the same IR the renderer consumes, so the two can never disagree).
+
+```
+# strict
+users: query { id: int } = table "users"
+main = users & take 2    # ok — columns are named
+
+# strict
+main = table "users"     # ✗ strict schema: … would render SELECT *
+```
+
 ### Core and standard prelude
 
 The language is checked and evaluated by one shared pass (`checkProject`). Its
 TypeScript core is limited to SQL-aware primitives and scalar types, exposed
 as native builtin names (`filter`, `table`, `int`, ...). Reusable functional
-helpers (`id`, `const`, `compose`, `flip`, `pipe`, the derived Maybe
+helpers (`id`, `const`, `flip`, the derived Maybe
 predicates, and the `_op_` bindings) live in
 [`prelude.tetaue`](prelude.tetaue) and are processed by the
 same parser, inference engine, and interpreter as application code; local
@@ -239,7 +281,7 @@ rules.
 
 Per-dialect lowering is also a prelude concern: `checkProject` seeds a
 first-class `sql_dialect` value (name + the canonical→SQL function map), and
-no-variance scalar functions such as `upper`/`lower`/`length`/`trim`/`position`
+no-variance scalar functions such as `toUpper`/`toLower`/`length`/`trim`/`position`
 are ordinary prelude definitions over `sql_func`/`sql_infix` that branch on
 `sql_dialect.name` at analysis time. `toUpper`/`toLower` are provided as
 Haskell-flavored spellings. See
@@ -427,7 +469,7 @@ u & filter ...        # pipeline: apply the step to the query
 - `map` projects one record per row — the `SELECT`. Transforming a single
   column is just a projection that reuses the name:
   ```
-  users & map (u => { id = u.id, name = upper u.name, age = u.age, active = u.active })
+  users & map (u => { id = u.id, name = toUpper u.name, age = u.age, active = u.active })
   ```
 - `merge l r` combines two records — extend a row with computed fields
   (`map (u => u <> { active = u.age >= 18 })`), or layer two projections.
@@ -445,7 +487,7 @@ u & filter ...        # pipeline: apply the step to the query
   users & map (omit ["password_hash"])        # everything except the listed fields
   ```
   A key rule must compute a column NAME from the field name — a compile-time
-  string, so `"user_" <> k` is folded statically while `upper k` is rejected.
+  string, so `"user_" <> k` is folded statically while `toUpper k` is rejected.
   They are ordinary curried functions: bind one first-class
   (`strip = omit ["password_hash"]`) and compose with the rest of the
   pipeline. Renaming requires a known schema (annotate the table); `drop n`
@@ -460,9 +502,11 @@ u & filter ...        # pipeline: apply the step to the query
   `query & step`. Sections are first-class and partially applicable:
   `increment = _+_ 1`. These `_op_` functions are ordinary prelude bindings,
   so a local or imported `_+_` changes infix `+` as well. A named section
-  resolves an exact `_name_` binding first and then an ordinary function, so
-  `_div_ 5 2` calls `div`, and `_combine_ x y` can call a user-defined curried
-  function named `_combine_` or `combine`.
+  resolves **exactly** its own `_name_` binding — there is no fallback to the
+  bare name, and the prelude ships no aliases for its own functions (`div` is
+  `div`; there is no `_div_`). Agda-style word sections are therefore for YOUR
+  functions: bind `_combine_ = x => y => ...` to call it as `_combine_ x y`.
+  The symbol sections above (`_+_`, `_&_`, `_>>>_`, …) stay built in.
 - The closed container classes use their familiar operators. Functor supplies
   `<$` and `<$>`; Applicative supplies `<*>`, `<*`, and `*>`; Alternative
   supplies `<|>`; Monad supplies `>>=` and `>>`. Maybe values and lists support
@@ -480,7 +524,7 @@ column. There is **no implicit `T` -> `(maybe T)` conversion**: `null` has
 type `forall a. (maybe a)`, `is_null`/`is_not_null` test a maybe value,
 and `from_maybe default x` unwraps it (`COALESCE`). `just x` lifts a
 non-null value into maybe, `nothing` is the maybe constant, and
-`fmap f x` lifts a function over a maybe, list, or query (`fmap upper email`,
+`fmap f x` lifts a function over a maybe, list, or query (`fmap toUpper email`,
 `fmap (x => x + 1) [1, 2]`, or `fmap (u => { id = u.id }) users`). The same
 closed operations have named forms: `replaceWith`, `ap`, `applyLeft`,
 `applyRight`, `orElse`, `bind`, and `then`. Their infix forms are normally more
@@ -622,13 +666,13 @@ is_not_in u.id [4, 5]          # NOT IN
 exists (orders & filter ...)   # correlated EXISTS subquery
 scalar (orders & ... & take 1) # scalar subquery, one nullable column
 in_query u.id (orders & map ...) # IN (SELECT ...)
-fmap upper u.email             # lift a function over (maybe T)
+fmap toUpper u.email           # lift a function over (maybe T)
 0 <$ [1, 2]                    # [0, 0]
 (x => x + 1) <$> [1, 2]        # [2, 3]
 [1, 2] <|> [3]                 # Alternative choice / list concatenation
 [1, 2] >>= (x => [x, x + 10])  # Monad bind / list flat-map
 param "user_id"                # SQL bind parameter
-upper u.name  lower u.name     # UPPER / LOWER
+toUpper u.name  toLower u.name # UPPER / LOWER
 length u.name                  # LENGTH
 coalesce u.nickname u.email    # COALESCE
 coalesce [u.nickname, u.email, just "?"]  # variadic list form
@@ -650,6 +694,10 @@ ceil u.balance  floor u.balance  sqrt u.balance  pow u.balance 2  mod u.id 3
 round u.balance 0                     # scale is required (0 = no rounding)
 greatest [u.a, u.b]  least [u.a, u.b]  # any number of arguments, one list
 concat [u.first, u.last]             # sqlite renders || — joins
+# Arity rule: HOMOGENEOUS-variadic functions take ONE list (`concat`, `greatest`,
+# `least`); HETEROGENEOUS ones are curried position by position (`round`, `substring`,
+# `lpad`/`rpad`, `lag`/`lead`). A list cannot type `[string, int, ...]` soundly, so
+# the two shapes never overlap; every one of them is an ordinary curried value.
 merge u { active = true }              # record union — right record wins on overlap
 u <> { active = true }                 # infix form of merge (a monoid: {} is the identity)
 map (rename (k => "user_" <> k))       # rename EVERY field via a key rule (inside map)
@@ -681,7 +729,7 @@ Operator precedence (tightest first, matching the grammar):
 → `== != < <= > >=` → `&&` → `||` → `&`
 (pipeline: `a & f` ⇔ `f a`) → `?` (unwrap-with-default: `u.email ? "n/a"`)
 → `>>=` `>>` (Monad) → `$` (application: `f $ a` ⇔ `f a`, right-assoc).
-Application binds tightest: `upper u.name` is `upper (u.name)`.
+Application binds tightest: `toUpper u.name` is `toUpper (u.name)`.
 
 ### Local bindings
 

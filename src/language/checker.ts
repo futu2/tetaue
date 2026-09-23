@@ -20,13 +20,14 @@
  * validator, hover/completion, and `tetaue types`) all use this pass.
  ******************************************************************************/
 import type { AstNode } from 'langium';
-import {
-    ERROR, createPreludeEnv, describe, parseStringLiteral, recursiveBindingMessage, topoOrderBindings, type Diagnostic, type Value,
-} from './interpreter.js';
+import { ERROR, checkBinding, createPreludeEnv, describe, type Value } from './interpreter.js';
+import { parseStringLiteral } from './strings.js';
+import { recursiveBindingMessage, topoOrderBindings, type Diagnostic } from './binding-analysis.js';
 import { Inferencer, mergeDiagnostics } from './inference.js';
 import type { Scheme, Type } from './types.js';
 import { resolveImportScope } from './project-scope.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
+import type { DialectView } from './binding-analysis.js';
 
 export interface CheckProjectResult {
     /** The root module's final evaluated value; its `query` is the SQL IR. */
@@ -70,7 +71,7 @@ export interface CheckProjectOptions {
      * The dialect the prelude's `sql_dialect` value describes. When omitted,
      * the prelude sees a sqlite-shaped view (matching the CLI default).
      */
-    dialect?: import('./interpreter.js').DialectView;
+    dialect?: DialectView;
 }
 
 /**
@@ -165,9 +166,16 @@ export function checkProject(
             env = new Map(env).set(binding.name, ERROR);
         }
         for (const binding of [...order, ...cycles]) {
-            const result = inferencer.typedBinding(
-                binding, exportedSchemes, scope, env, moduleBindings, seen, nodeValues, cycleNames,
+            // ONE loop, TWO passes: the binding is typed and then evaluated,
+            // so a project is never traversed twice. They are separate calls
+            // (rather than one fused method) so the inferencer never has to
+            // import the evaluator — see stage 3 of the architecture doc.
+            moduleDiagnostics.push(
+                ...inferencer.checkBindingTypes(binding, exportedSchemes, scope, cycleNames),
             );
+            const result = checkBinding(binding, env, moduleBindings, seen, {
+                ...(nodeValues ? { nodeValues } : {}),
+            });
             moduleDiagnostics.push(...result.diagnostics);
             env = result.env;
             seen = result.seen;

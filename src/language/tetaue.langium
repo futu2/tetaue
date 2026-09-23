@@ -213,7 +213,7 @@ Argument infers Expr:
     | {infer BooleanLiteral} value=('true' | 'false')
     | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
-    | {infer MapLiteral} '{' (receiver=Expression '|')? (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
+    | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
     | {infer Lambda} param=LambdaParam '=>' body=Expression
     | {infer CaseExpression} 'case' (subject=Expression)? '{' (branches+=CaseBranch (',' branches+=CaseBranch)* ','?)? '}'
     | '(' Expression ')';
@@ -224,7 +224,7 @@ Atom infers Expr:
     | {infer BooleanLiteral} value=('true' | 'false')
     | {infer NullLiteral} 'null'
     | {infer ListLiteral} '[' (elements+=Expression (',' elements+=Expression)* ','?)? ']'
-    | {infer MapLiteral} '{' (receiver=Expression '|')? (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
+    | {infer MapLiteral} '{' (entries+=MapEntry (',' entries+=MapEntry)* ','?)? '}'
     | {infer Lambda} param=LambdaParam '=>' body=Expression
     | {infer Lambda} '(' param=LambdaParam ')' '=>' body=Expression
     | {infer CaseExpression} 'case' (subject=Expression)? '{' (branches+=CaseBranch (',' branches+=CaseBranch)* ','?)? '}'
@@ -263,9 +263,16 @@ hidden terminal COMMENT: /#[^\r\n]*/;
 
 // Agda-style binary operator names. `_+_`, `_>>>_`, and `_op_` are ordinary
 // lexical bindings and first-class curried functions, so `_+_ 1 2` is exactly
-// `1 + 2`. This must precede ID: named sections such as `_div_` are otherwise
-// valid identifiers.
-terminal OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\?|\+|-|\*|\/|<>|<|>|&|\$|[a-zA-Z][\w_]*)_(?![\w_])/;
+// `1 + 2`. This must precede ID: named word sections such as `_combine_` are
+// otherwise valid identifiers.
+//
+// The WORD form (`_name_`) is guarded like ARG_ID: when it is followed by `:`
+// or `=` (only whitespace between) it is a BINDING NAME, not an argument, so
+// the terminal declines and the name lexes as a plain ID. Without this, a
+// `_name_ = ...` binding after any other binding parses as an argument of the
+// previous expression (`x = 1` then `_combine_ = 2` swallowed `_combine_`).
+// Symbol forms (`_+_`) have no ID spelling, so they stay unguarded.
+terminal OP_SECTION: /_(>>>|<<<|>>=|>>|<\$>|<\$|<\*>|<\*|\*>|<\|>|==|!=|<=|>=|&&|\|\||\?|\+|-|\*|\/|<>|<|>|&|\$)_(?![\w_])|_[a-zA-Z][\w_]*_(?![\w_])(?![ \t\r\n]*[:=])/;
 
 // A bare identifier usable as an application argument: any identifier NOT
 // followed by `=`. The lookahead keeps bindings comma-free — `filter adult`

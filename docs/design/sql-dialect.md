@@ -1,7 +1,7 @@
 # `sql_dialect` — a first-class per-dialect dictionary
 
 Status: **implemented** — the dialect is seeded as a first-class value, the
-prelude branches on it at analysis time, and the scalar family (`upper`/`lower`/
+prelude branches on it at analysis time, and the scalar family (`toUpper`/`toLower`/
 `length`/`trim`/`replace`/`mod`/`like`/`div`/`left_substring`/`right_substring`/
 `abs`/`ceil`/`floor`/`sqrt`/`pow`/`position`) has migrated out of the TS core
 into `prelude.tetaue`.
@@ -35,7 +35,7 @@ not leak" direction), while dialect differences stay a *library* concern.
 
 ## What has migrated
 
-- `upper`, `lower`, `length`, `trim` — no per-dialect variance, plain
+- `toUpper`, `toLower`, `length`, `trim` — no per-dialect variance, plain
   `sql_func "UPPER"/"LOWER"/"LENGTH"/"TRIM"` wrappers with precise
   annotations.
 - `replace`, `mod` — no per-dialect variance; `like` is a binary operator
@@ -98,7 +98,7 @@ sql_dialect = {
   name = "sqlite",
   quoteIdentifier = ...,
   boolLiteral = ...,
-  functions = { upper = "UPPER", ceil = "CEILING", ... },
+  functions = { toUpper = "UPPER", ceil = "CEILING", ... },
   ...
 }
 ```
@@ -242,8 +242,9 @@ The user's direction is "use haskell base lib name rather than sql things,
 sql things should not leak." The migrated scalars now carry Haskell-flavored
 public names:
 
-- `toUpper`/`toLower` are the canonical definitions; `upper`/`lower` remain
-  as compatibility aliases.
+- `toUpper`/`toLower` are the only spellings; the SQL-named `upper`/`lower`
+  aliases were removed (the language has no installed base to keep them for,
+  and a second spelling is the enemy of concision).
 - `length`/`trim` already match base spellings.
 - `position` keeps its SQL name (its argument-reordered lowering has no
   faithful base counterpart — `elemIndex` returns `Maybe Int`, SQL returns

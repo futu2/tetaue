@@ -374,7 +374,7 @@ describe('validation', () => {
 describe('closed fmap instances', () => {
     test('fmap lifts a function over a nullable SQL expression', () => {
         const src = `t: query { email: (maybe string), age: (maybe int) } = table "t"
-q = t & map (u => { e = fmap upper u.email, a = fmap (x => x + 1) u.age })`;
+q = t & map (u => { e = fmap toUpper u.email, a = fmap (x => x + 1) u.age })`;
         expect(typeErrors(src)).toEqual([]);
         const sql = render(src, 'postgresql', 'compact');
         expect(sql).toContain('UPPER(email) AS e');
@@ -383,7 +383,7 @@ q = t & map (u => { e = fmap upper u.email, a = fmap (x => x + 1) u.age })`;
 
     test('fmap type-checks only functions of the wrapped type', () => {
         const bad = `t: query { age: (maybe int) } = table "t"
-q = t & map (u => { a = fmap upper u.age })`;
+q = t & map (u => { a = fmap toUpper u.age })`;
         expect(typeErrors(bad).join('\n')).toContain('cannot apply');
     });
 
@@ -404,7 +404,7 @@ q = fmap (u => { id2 = u.id + 1, label = u.name }) users`;
 
     test('fmap rejects values without a closed Functor instance', () => {
         const bad = `users: query { id: int } = table "users"
-q = fmap upper users`;
+q = fmap toUpper users`;
         expect(typeErrors(bad).join('\n')).toContain('incompatible types');
     });
 });
@@ -474,7 +474,7 @@ orders: query { user_id: int } = table "orders"
 q = users & filter (u => exists (orders & filter (o => o.user_id == u.id)))`;
         expect(typeErrors(src)).toEqual([]);
         const sql = render(src, 'postgresql', 'compact');
-        expect(sql).toContain('WHERE EXISTS (SELECT * FROM orders WHERE user_id = users.id)');
+        expect(sql).toContain('WHERE EXISTS (SELECT 1 FROM orders WHERE user_id = users.id)');
     });
 
     test('EXISTS executes with outer-column correlation', () => {
@@ -524,7 +524,7 @@ orders: query { user_id: int } = table "orders"
 q = users & map (u => { id, last_user = scalar (orders & filter (o => o.user_id == u.id) & take 1) })`;
         expect(typeErrors(src)).toEqual([]);
         const sql = render(src, 'postgresql', 'compact');
-        expect(sql).toContain('(SELECT * FROM orders WHERE user_id = users.id LIMIT 1)');
+        expect(sql).toContain('(SELECT user_id FROM orders WHERE user_id = users.id LIMIT 1)');
     });
 
     test('scalar requires exactly one output column', () => {
@@ -584,7 +584,7 @@ q = orders & fold (o => { paid_total = sum_where (o.status == "paid") o.total, n
         expect(db.query(sql).get()).toEqual({ paid_total: 40, n: 2 });
     });
 
-    test('MySQL/Hive lower FILTER to CASE WHEN', () => {
+    test('MySQL/Hive toLower FILTER to CASE WHEN', () => {
         const src = `t: query { flag: bool, x: int } = table "t"
 q = t & fold (u => { s = sum_where u.flag u.x })`;
         expect(render(src, 'mysql', 'compact')).toContain('SUM(CASE WHEN flag THEN x END)');

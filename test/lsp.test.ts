@@ -8,8 +8,8 @@
  * Requires `bun run build:server` first (the bundle is git-ignored).
  ******************************************************************************/
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { URI } from 'langium';
 
@@ -22,8 +22,28 @@ const NODE = process.env.TETAUE_TEST_NODE ?? (Bun.which('node') ?? process.execP
 const EXAMPLE = resolve(ROOT, 'examples', 'strings.tetaue');
 
 // The server bundle is a git-ignored build artifact: build it on demand so a
-// fresh clone can run `bun test` without manual steps.
-if (!existsSync(SERVER)) {
+// fresh clone can run `bun test` without manual steps. Freshness matters as
+// much as presence — a stale bundle silently tests OLD source, which is how
+// this suite once reported green while two real provider bugs were live.
+// Rebuild whenever any source file is newer than the bundle.
+function serverIsStale(): boolean {
+    if (!existsSync(SERVER)) return true;
+    const built = statSync(SERVER).mtimeMs;
+    const walk = (dir: string): boolean => {
+        for (const entry of readdirSync(dir)) {
+            const full = join(dir, entry);
+            if (statSync(full).isDirectory()) {
+                if (walk(full)) return true;
+            } else if (statSync(full).mtimeMs > built) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return walk(join(ROOT, 'src'));
+}
+
+if (serverIsStale()) {
     execFileSync('bun', ['run', 'build:server'], { cwd: ROOT, stdio: 'inherit' });
 }
 
@@ -332,9 +352,11 @@ describe('tetaue language server (LSP over stdio)', () => {
 
             // Hover over `age` in `u.age` (line 2, char 28 is inside `age`):
             // show the field's type. With polymorphic numeric literals the
-            // comparison against `18` leaves `u.age` a class-constrained
+            // comparison against `18` leaves `u.age` a still-unconstrained
             // variable at the definition site (it pins to `int` where the
-            // binding is applied to `users`).
+            // binding is applied to `users`). Type classes were removed from
+            // the language (see types.ts `constrain`), so no constraint is
+            // rendered — the inferred type is the bare variable.
             const hover = await request(server, 2, 'textDocument/hover', {
                 textDocument: { uri },
                 position: { line: 2, character: 28 },
@@ -342,18 +364,19 @@ describe('tetaue language server (LSP over stdio)', () => {
             const hoverContents = (hover.result as { contents: { value: string } }).contents;
             expect(hover.error).toBeUndefined();
             expect(hoverContents.value).toContain('u.age');
-            expect(hoverContents.value).toContain('Num t, Ord t => t');
+            expect(hoverContents.value).toContain('u.age : t');
 
             // Hover over the `u` lambda parameter (line 2, char 8): the lambda
             // type's input row must be flat — open rows render as one `{ ... }`
             // record with a single `| r` tail, never as nested `| { ... }`.
+            // (No constraint prefix is rendered — type classes were removed.)
             const hoverRow = await request(server, 9, 'textDocument/hover', {
                 textDocument: { uri },
                 position: { line: 2, character: 8 },
             });
             const hoverRowContents = (hoverRow.result as { contents: { value: string } }).contents;
             expect(hoverRow.error).toBeUndefined();
-            expect(hoverRowContents.value).toContain('Num t, Ord t => { active: bool, age: t | r } -> bool');
+            expect(hoverRowContents.value).toContain('{ active: bool, age: t | r } -> bool');
             expect(hoverRowContents.value).not.toContain('| {');
 
             // Hover over the `adult` reference in `filter (adult)` (line 3):

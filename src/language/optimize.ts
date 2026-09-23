@@ -9,7 +9,7 @@
  ******************************************************************************/
 import type {
     Query, QueryStep, RowNode, Schema, SqlColumn, SqlNode,
-} from './interpreter.js';
+} from '../core/ir.js';
 
 interface OptimizeState {
     queries: Map<Query, Query>;

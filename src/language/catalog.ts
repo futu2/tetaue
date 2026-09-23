@@ -12,6 +12,9 @@ export {
     type BuiltinSpec,
     type BuiltinSpecName,
     BUILTIN_ALIASES,
+    BUILTIN_MODES,
     BUILTIN_NAMES,
     BUILTIN_SPECS,
+    builtinModeOf,
+    type SqlMode,
 } from './builtin.js';

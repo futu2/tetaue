@@ -146,12 +146,16 @@ q = a & joinFull b (l => r => l.id == r.id) (l => r => { id = l.id })`;
     });
 });
 
-describe('record update sugar', () => {
-    test('{ row | k = v } is merge row { k = v }', () => {
-        const sql = render(`users: query { id: int, name: string } = table "users"\nq = users & map (u => { u | active = u.id > 0 })`, 'postgresql');
+describe('record extension (merge)', () => {
+    test('merge is the only record-extension spelling', () => {
+        // The `{ row | k = v }` update sugar was REMOVED from the grammar: it
+        // only ever meant `merge row { k = v }`. The explicit form must work,
+        // and the sugar must no longer parse.
+        const sql = render(`users: query { id: int, name: string } = table "users"\nq = users & map (u => merge u { active = u.id > 0 })`, 'postgresql');
         expect(sql).toContain('id > 0 AS active');
         expect(sql).toContain('id');
         expect(sql).toContain('name');
+        expect(() => parseModel('q = { 1 | x = 2 }')).toThrow();
     });
 
     test('select [columns] narrows a projection', () => {
@@ -174,9 +178,13 @@ describe('record update sugar', () => {
         expect(bad.join('\n')).toContain("field pun 'id' requires an enclosing lambda parameter");
     });
 
-    test('record update rejects non-records consistently', () => {
-        const messages = allErrors('q = { 1 | x = 2 }');
-        expect(messages.join('\n')).toContain("record update expects a record before '|'");
+    test('merge rejects a non-record first argument', () => {
+        // The removed update sugar was the only way to write a non-record to
+        // the left of `|`, so the syntax itself is now a parse error; the
+        // underlying merge check still rejects a non-record.
+        expect(() => parseModel('q = { 1 | x = 2 }')).toThrow();
+        expect(allErrors('q = merge 1 { x = 2 }').join('\n'))
+            .toContain('merge expects a record as its first argument');
     });
 });
 

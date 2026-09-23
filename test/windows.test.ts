@@ -133,7 +133,7 @@ describe('window function validation', () => {
 
     test('over rejects non-window-function expressions', () => {
         expect(errors(`${USERS}\nq = users & map (u => { x = over (u.id) {} })`).join('\n')).toContain('over expects a window function');
-        expect(errors(`${USERS}\nq = users & map (u => { x = over (upper u.name) {} })`).join('\n')).toContain('over expects a window function');
+        expect(errors(`${USERS}\nq = users & map (u => { x = over (toUpper u.name) {} })`).join('\n')).toContain('over expects a window function');
     });
 
     test('over spec must be a record with only partition/order', () => {

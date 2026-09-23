@@ -28,19 +28,21 @@ import {
 import type { Type as LangiumType } from './generated/ast.js';
 import {
     TypeUniverse, UnifyError, type Scheme, type Type, type VarKind,
-    builtinOf, fun, isModeOf, listOf, maybeOf, modeOf, modePayload, nullExtendedMaybeOf, nullRowOf, overloadOf, prim, queryOf, rowOf, truthType,
-    type ModeName,
+    builtinOf, fun, listOf, maybeOf, nullExtendedMaybeOf, nullRowOf, overloadOf, prim, queryOf, rowOf,
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
 import { PRELUDE_NAMESPACES } from './prelude-namespaces.js';
 import { moduleOf } from './imports.js';
 import { resolveImportScope } from './project-scope.js';
-import { checkBinding, missingBindingExpressionMessage, parseStringLiteral, recursiveBindingMessage, topoOrderBindings } from './interpreter.js';
-import type { Diagnostic, Value } from './interpreter.js';
+import { parseStringLiteral } from './strings.js';
+import {
+    missingBindingExpressionMessage, recursiveBindingMessage, topoOrderBindings,
+    type Diagnostic, type DialectView,
+} from './binding-analysis.js';
 import { implicitParamName, labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
-import { CAST_TYPES, LIST_ARITY, CORE_TYPE_NAMES, type CoreTypeName } from './builtin.js';
+import { CAST_TYPES, LIST_ARITY, CORE_TYPE_NAMES, builtinModeOf, type CoreTypeName, type SqlMode } from './builtin.js';
 import {
     INTRINSIC_OPERATORS, isBinaryOperator, isIntrinsicOperator, operatorIntrinsicName,
     sectionName, sectionSpelling, type BinaryOperator, type IntrinsicOperator,
@@ -213,6 +215,7 @@ export class Inferencer {
      */
     private deferred: { node: AstNode | undefined; a: Type; b: Type; message: string }[] = [];
 
+
     /**
      * `mempty` uses whose instance is decided by later unification (an
      * ascription, a `<>` operand, a concat/greatest argument, ...). Checked
@@ -309,12 +312,14 @@ export class Inferencer {
 
     /**
      * Build the primitive environment from the builtin catalog plus the hidden
-     * operator intrinsics consumed by `prelude.tetaue`. Aggregates return
-     * `agg t`, `group` returns `group t`, and the list-argument builtins take
-     * one list argument, so plain fold entries and non-order sort lambdas are
-     * STATIC type errors, not runtime checks.
+     * operator intrinsics consumed by `prelude.tetaue`. The SQL mode of an
+     * aggregate / group key / window function is a property of its NAME
+     * (`BUILTIN_MODES`), checked from the entry's syntax at the fold/map/over
+     * call sites, and the list-argument builtins take one list argument, so
+     * plain fold entries and non-order sort lambdas are STATIC type errors,
+     * not runtime checks.
      */
-    prelude(dialect?: import('./interpreter.js').DialectView): void {
+    prelude(dialect?: DialectView): void {
         for (const spec of BUILTIN_SPECS) {
             const scheme = spec.scheme(this.u);
             const tagged = { ...scheme, type: builtinOf(spec.name, scheme.type) };
@@ -828,19 +833,25 @@ export class Inferencer {
      * then evaluate its runtime IR in the same scope step. Inference owns the
      * scheme and exports; the interpreter owns the SQL Value.
      */
-    typedBinding(
+    /**
+     * Type ONE binding and install its scheme in `scope`. Returns only the
+     * TYPE-side result — no `Value` is produced here.
+     *
+     * This is the seam stage 3 of docs/design/architecture.md introduces: the
+     * inferencer no longer calls the evaluator, so `inference.ts` depends on
+     * neither `checkBinding` nor `Value`. The project pass (`checker.ts`)
+     * advances both sides per binding in the same loop, which is what keeps
+     * the single-traversal property without fusing the two passes.
+     */
+    checkBindingTypes(
         b: Binding,
         exported: Map<string, Scheme>,
         scope: Map<string, string>,
-        valueEnv: Map<string, Value>,
-        moduleBindings: ReadonlySet<string>,
-        seen: ReadonlySet<string>,
-        nodeValues?: Map<AstNode, Value>,
         topoCycleNames: ReadonlySet<string> = new Set(),
-    ): { env: Map<string, Value>; seen: Set<string>; value: Value; diagnostics: Diagnostic[] } {
+    ): Diagnostic[] {
         const diagnostics: Diagnostic[] = [];
-        // Mirrors `inferBinding`: a repeated local name is an overload, while a
-        // name already claimed by an import is still a conflict.
+        // A repeated local name is an overload; a name already claimed by an
+        // import is still a conflict.
         const claimedBy = scope.get(b.name);
         if (claimedBy !== undefined && claimedBy !== `local binding '${b.name}'`) {
             diagnostics.push({
@@ -849,28 +860,22 @@ export class Inferencer {
             });
         }
 
-        // Recursive cycles are diagnosed once per cycle member here; the
-        // interpreter reports the same message (exact-deduped on merge).
-        // Duplicate names are handled by `seen` inside checkBinding, so this
-        // runs only for the recursion case (topoOrderBindings keeps cycles
-        // out of the main order).
+        // Recursive cycles are diagnosed once per cycle member; the evaluator
+        // reports the same wording (deduped on merge). Duplicate names are
+        // handled by the evaluator's `seen`, so this covers the recursion case
+        // only (topoOrderBindings keeps cycles out of the main order).
         if (topoCycleNames.has(b.name)) {
             diagnostics.push({ node: b, message: recursiveBindingMessage(b.name) });
         }
 
-        // Type first against the ORIGINAL imported scope; the runtime
-        // diagnostic above is authoritative, so inference only installs the
-        // binding scheme and resolves namespace shadowing.
+        // Type against the ORIGINAL imported scope; the runtime diagnostic
+        // above is authoritative, so this only installs the binding scheme and
+        // records the local name for shadowing/overload purposes.
         const inferenceStart = this.diagnostics.length;
         this.inferBinding(b, exported, scope, false);
         diagnostics.push(...this.takeDiagnosticsFrom(inferenceStart));
         scope.set(b.name, `local binding '${b.name}'`);
-
-        const result = checkBinding(b, valueEnv, moduleBindings, seen, {
-            ...(nodeValues ? { nodeValues } : {}),
-        });
-        diagnostics.push(...result.diagnostics);
-        return { env: result.env, seen: result.seen, value: result.value, diagnostics };
+        return diagnostics;
     }
 
     // -----------------------------------------------------------------------
@@ -984,17 +989,10 @@ export class Inferencer {
                     fields.push([labelName(entry.key), t]);
                 }
             }
-            const updated = rowOf(fields);
-            if (!e.receiver) return updated;
-            // `{ receiver | k = v }` is record-update sugar for
-            // `merge receiver { k = v }`.
-            const base = this.inferExpr(e.receiver, env);
-            const r = this.u.peel(base);
-            if (r.kind !== 'row' && r.kind !== 'var') {
-                this.diag(e.receiver, `record update expects a record before '|', got type ${this.u.pretty(base)}`);
-                return updated;
-            }
-            return this.inferMerge(base, updated, e);
+            // The `{ recv | k = v }` update sugar was removed from the
+            // grammar (it was `merge recv { k = v }`); a record literal is
+            // just its fields now.
+            return rowOf(fields);
         }
         if (isLambda(e)) return this.inferLambda(e, env);
         if (isOperatorSection(e)) return this.inferOperatorSection(e, env);
@@ -1329,7 +1327,14 @@ export class Inferencer {
      * LEFT-JOIN side and render `b.id + 1` (NULL arithmetic). Explicitly
      * guard so nullable columns must be unwrapped (from_maybe / coalesce).
      */
-    private rejectModeOperand(node: AstNode, op: string, lt: Type, rt: Type): boolean {
+    private rejectModeOperand(
+        node: AstNode,
+        op: string,
+        lt: Type,
+        rt: Type,
+        leftNode?: AstNode,
+        rightNode?: AstNode,
+    ): boolean {
         const kind = (t: Type): string => this.u.peel(t).kind;
         const ka = kind(lt);
         const kb = kind(rt);
@@ -1337,9 +1342,12 @@ export class Inferencer {
             this.diag(node, `'${op}' requires non-null numeric operands — use from_maybe or coalesce to unwrap, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
             return true;
         }
-        // Pipeline modes are not plain scalars and must not be
-        // silently absorbed by a numeric literal variable (`row_number + 1`).
-        if (modePayload(this.u.peel(lt)) !== null || modePayload(this.u.peel(rt)) !== null) {
+        // Pipeline modes are not plain scalars and must not be silently
+        // absorbed by a numeric literal variable (`row_number + 1`). The mode
+        // belongs to the operand's SYNTAX (its head builtin), not its type, so
+        // it is read from the operand expressions.
+        const modeOperand = (n: AstNode | undefined): boolean => this.entryModeOf(n) !== null;
+        if (modeOperand(leftNode) || modeOperand(rightNode)) {
             this.diag(node, `'${op}' requires numeric operands, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
             return true;
         }
@@ -1358,8 +1366,9 @@ export class Inferencer {
             // Aggregates/window values cannot be compared as plain scalars; a
             // polymorphic literal would otherwise absorb the mode (`row_number
             // == 1`, `sum t == 1`). Nullable `maybe` is handled below (== null).
-            const cmpMode = (t: Type): boolean => modePayload(this.u.peel(t)) !== null;
-            if (cmpMode(lt) || cmpMode(rt)) {
+            // The mode comes from the operand's syntax, like the arithmetic
+            // guard above.
+            if (this.entryModeOf(leftNode) !== null || this.entryModeOf(rightNode) !== null) {
                 this.diag(node, `cannot compare an aggregate or window value with ${this.u.pretty(lt)} and ${this.u.pretty(rt)} — project it through fold/over first`);
                 return prim('bool');
             }
@@ -1450,7 +1459,7 @@ export class Inferencer {
         // Haskell-base numerics: + - * require the same numeric type; / is
         // fractional division and requires float; use div/mod for integrals.
         if (op === '/') {
-            if (this.rejectModeOperand(node, op, lt, rt)) return this.u.fresh();
+            if (this.rejectModeOperand(node, op, lt, rt, leftNode, rightNode)) return this.u.fresh();
             try {
                 this.u.unify(lt, prim('float'));
                 this.u.unify(rt, prim('float'));
@@ -1465,7 +1474,7 @@ export class Inferencer {
             return prim('float');
         }
         // + - *: operands must share one numeric type.
-        if (this.rejectModeOperand(node, op, lt, rt)) return this.u.fresh();
+        if (this.rejectModeOperand(node, op, lt, rt, leftNode, rightNode)) return this.u.fresh();
         try {
             return this.u.unify(lt, rt);
         } catch (err) {
@@ -1516,13 +1525,11 @@ export class Inferencer {
 
         const op = sectionName(e.value);
         if (!isBinaryOperator(op)) {
-            const scheme = env.get(op);
-            if (scheme) return this.u.instantiate(scheme);
-            this.diag(e, `unknown operator section '${e.value}' — '${op}' is not defined`);
+            this.diag(e, `unknown operator section '${e.value}' — '${e.value}' is not defined`);
             return this.u.fresh();
         }
         if (isIntrinsicOperator(op)) return this.fallbackOperatorType(op);
-        this.diag(e, `unknown operator section '${e.value}' — '${op}' is not defined`);
+        this.diag(e, `unknown operator section '${e.value}' — '${e.value}' is not defined`);
         return this.u.fresh();
     }
 
@@ -1783,7 +1790,14 @@ export class Inferencer {
                     throw err;
                 }
             }
-            if (funcName && !failed) this.postCheckArg(funcName, i, argExpr, argType, e);
+            // Run the special checks even when this application failed to
+            // unify: an ARITY error IS an application failure (the extra
+            // argument has nothing to apply to), so gating these on `!failed`
+            // would replace the precise "takes exactly N arguments" message
+            // with a generic `cannot apply a function of type ...`. A failed
+            // step leaves earlier types intact, so the checks still see what
+            // they need.
+            if (funcName) this.postCheckArg(funcName, i, argExpr, argType, e);
             f = result;
         }
         if (funcName === 'is_in' || funcName === 'is_not_in') {
@@ -2133,8 +2147,11 @@ export class Inferencer {
         if (e.arguments.length === 0) return this.inferExpr(e.func, env);
         const firstExpr = e.arguments[0]!;
         const first = this.inferArg(firstExpr, env);
-        const raw = this.u.peel(first);
-        if (!isModeOf(raw, 'agg', 'window')) {
+        // Only an aggregate or a window function can be wrapped by `over`; the
+        // mode is read from the wrapped expression's syntax. Its TYPE is
+        // already the value type (no mode wrapper), so it is returned as-is.
+        const mode = this.entryModeOf(this.unwrapApplicationExpr(firstExpr));
+        if (mode !== 'agg' && mode !== 'window') {
             this.argError('over', 0, firstExpr, first, undefined, undefined);
             return this.u.fresh();
         }
@@ -2143,7 +2160,7 @@ export class Inferencer {
         for (let i = 1; i < e.arguments.length; i++) {
             this.inferArg(e.arguments[i]!, env);
         }
-        return raw.of;
+        return first;
     }
 
     /** `cast x "int"` — the result type is the target. */
@@ -2305,13 +2322,40 @@ export class Inferencer {
     private inferTruthPredicate(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, name: string): Type {
         const arg = e.arguments[0]!;
         const argType = this.inferArg(arg, env);
-        try {
-            this.u.unify(argType, truthType());
-        } catch (err) {
-            if (!(err instanceof UnifyError)) throw err;
+        // A SQL predicate is a non-null bool or a nullable bool. This is a
+        // direct acceptance test on the argument rather than a marker type to
+        // unify against.
+        //
+        // A still-open variable must be BOUND, not merely accepted: when the
+        // argument's type is not yet known (the row-polymorphic lambda in
+        // `filter (u => is_unknown u.id)`, or `f = is_true` before its argument
+        // settles) the old marker propagated `bool?` into the enclosing
+        // expression, and that propagation is what later produced the error at
+        // the application site. Binding reproduces it: the variable resolves to
+        // `bool?`, so a row field annotated `int` no longer matches.
+        const r = this.u.peel(argType);
+        // An unresolved argument (`filter (u => is_unknown u.id)` sees `u.id` as
+        // a row-field variable) is left alone: the column is deliberately kept
+        // at its declared type. The old `truth` marker unified itself INTO that
+        // variable, which is what leaked `bool?` into the enclosing row and
+        // made a plain `bool` column stop matching. The interpreter checks the
+        // concrete type at evaluation (see `truthPredicateBuiltin`), so the
+        // static pass does not need to pre-commit.
+        if (r.kind !== 'var' && !this.isTruthAccepting(r)) {
             this.diag(e, `${name} expects a boolean or nullable boolean expression, got type ${this.u.pretty(argType)}`);
         }
         return prim('bool');
+    }
+
+    /** Whether a resolved type is a SQL predicate: `bool` or `maybe bool`. */
+    private isTruthAccepting(t: Type): boolean {
+        const r = this.u.peel(t);
+        if (r.kind === 'prim') return r.name === 'bool';
+        if (r.kind === 'maybe') {
+            const inner = this.u.peel(r.of);
+            return inner.kind === 'var' || (inner.kind === 'prim' && inner.name === 'bool');
+        }
+        return false;
     }
 
     /** `in_query x q` / `not_in_query x q` — IN (SELECT ...). */
@@ -2436,11 +2480,12 @@ export class Inferencer {
 
     /**
      * `fold (o => { k = group o.k, s = sum o.v })` — the DSL's grouping and
-     * aggregate-mode check. The lambda's result must be a record whose fields
-     * are ALL in aggregate or group mode (`agg t` / `group t`); a plain column
-     * or computed expression is a static type error. A projection made only
-     * of group fields is therefore a valid grouping operation. The result row
-     * strips the modes, so downstream steps see plain columns
+     * aggregate-mode check. Every entry of the lambda's result record must be
+     * an aggregate or a group key — determined by the entry's head builtin, not
+     * by a tag in its type; a plain column or computed expression is a static
+     * type error. A projection made only of group fields is therefore a valid
+     * grouping operation. The field types are the plain value types, so
+     * downstream steps see plain columns
      * (`query { user_id: int, total: float }`), matching the interpreter's
      * derived-table semantics.
      */
@@ -2468,10 +2513,12 @@ export class Inferencer {
         }
         const res = this.u.resolveRow(ret);
         const entryNodes = this.entryNodesOf(argExpr);
+        // Modes are recovered from each entry's SYNTAX (its head builtin), not
+        // from the field type: the two are decoupled so `Type` needs no
+        // `agg`/`group`/`window` variant. See `entryModeOf`.
         const groupSigs = new Set<string>();
-        for (const [key, ft] of res.fields) {
-            const raw = this.u.peel(ft);
-            if (!isModeOf(raw, 'group')) continue;
+        for (const [key] of res.fields) {
+            if (this.entryModeOf(entryNodes?.get(key)) !== 'group') continue;
             const groupArg = this.groupArgumentOf(entryNodes?.get(key));
             const sig = this.accessSignature(groupArg);
             if (sig) groupSigs.add(sig);
@@ -2479,8 +2526,7 @@ export class Inferencer {
         const out: [string, Type][] = [];
         let modes = 0;
         for (const [key, ft] of res.fields) {
-            const raw = this.u.peel(ft);
-            const mode: ModeName | null = isModeOf(raw, 'agg', 'group', 'window') ? raw.kind : null;
+            const mode: SqlMode | null = this.entryModeOf(entryNodes?.get(key));
             if (mode === 'agg') {
                 const entry = entryNodes?.get(key);
                 const caseNode = this.unwrapApplicationExpr(entry);
@@ -2492,10 +2538,15 @@ export class Inferencer {
                     }
                 }
                 modes++;
-                out.push([key, modePayload(raw) ?? ft]);
+                out.push([key, ft]);
             } else if (mode === 'group') {
                 modes++;
-                out.push([key, modePayload(raw) ?? ft]);
+                out.push([key, ft]);
+            } else if (mode === 'window') {
+                // A window function used directly (not wrapped in `over`) is
+                // rejected by `inferMap`/the interpreter; here it simply does
+                // not count as an aggregate for fold legality.
+                out.push([key, ft]);
             } else {
                 this.diag(entryNodes?.get(key) ?? argExpr, `fold entry '${key}' must be wrapped in an aggregate (count, sum, ...) or group`);
                 out.push([key, ft]);
@@ -2570,11 +2621,12 @@ export class Inferencer {
         const entryNodes = this.entryNodesOf(argExpr);
         const out: [string, Type][] = [];
         for (const [key, ft] of res.fields) {
-            const raw = this.u.peel(ft);
-            const mode: ModeName | null = isModeOf(raw, 'agg', 'group', 'window') ? raw.kind : null;
+            const mode: SqlMode | null = this.entryModeOf(entryNodes?.get(key));
             if (mode === 'group') {
                 this.diag(entryNodes?.get(key) ?? argExpr, `projection entry '${key}' cannot contain group`);
-            } else if (raw.kind === 'order') {
+            } else if (this.producesOrderItems(entryNodes?.get(key) as unknown as Expr | null)) {
+                // `asc`/`desc` are transparent in the type system, so this is
+                // judged from the entry's syntax rather than its type.
                 this.diag(entryNodes?.get(key) ?? argExpr, `projection entry '${key}' cannot contain order items (asc/desc)`);
             } else if (mode === 'window') {
                 const entry = entryNodes?.get(key);
@@ -2582,10 +2634,10 @@ export class Inferencer {
                 // Anchor on the enclosing pipeline so this diagnostic and the
                 // interpreter's validateWindowUses message dedupe exactly.
                 this.diag(this.pipelineAnchorOf(e), `${fnName} must be wrapped in over (...) — e.g. over (${fnName}) { partition = [u.dept], order = [desc u.salary] }`);
-                out.push([key, modePayload(raw) ?? ft]);
+                out.push([key, ft]);
                 continue;
             }
-            out.push([key, mode === 'agg' ? (modePayload(raw) ?? ft) : ft]);
+            out.push([key, ft]);
         }
         return fun(queryOf(r.from), queryOf(rowOf(out, res.tail)));
     }
@@ -2653,6 +2705,51 @@ export class Inferencer {
         while (body && isApplication(body) && body.arguments.length === 0) body = body.func;
         if (!body || !isMapLiteral(body)) return null;
         return new Map(body.entries.filter(en => en.value !== undefined).map(en => [labelName(en.key), en.value as AstNode]));
+    }
+
+    /**
+     * The SQL mode of a projection entry, recovered from its SYNTAX.
+     *
+     * An entry is an aggregate / group key / window function because of the
+     * builtin it applies — `count u.id`, `group u.id`, `row_number` — so the
+     * mode is a lookup on the head name (following aliases, so `lead` matches
+     * its `lag` target), not a tag carried in the entry's field type. A
+     * non-builtin expression (a literal, a plain column, an arithmetic
+     * combination) has no mode.
+     */
+    private entryModeOf(node: AstNode | undefined): SqlMode | null {
+        let e = node as Expr | undefined;
+        // `row_number` (a nullary builtin) is a bare Identifier wrapped in a
+        // zero-argument Application; `sum u.x` is an Application with a func.
+        // Unwrap the wrappers and read the head identifier either way.
+        while (e && isApplication(e) && e.arguments.length === 0) e = e.func as Expr;
+        if (!e) return null;
+        // `case { cond => sum x, _ => sum y }` is an aggregate entry: the mode
+        // sits on the branch values, not on the `case` itself.
+        if (isCaseExpression(e)) {
+            const branchModes = e.branches
+                .map(b => this.entryModeOf(b.value as unknown as AstNode))
+                .filter((m): m is SqlMode => m !== null);
+            return branchModes[0] ?? null;
+        }
+        return this.modeOfHeadExpr(e);
+    }
+
+    /**
+     * The mode carried by an expression's head position. An aggregate reaches
+     * the head through several shapes: `sum u.x` (an Application), `sum`
+     * (a bare nullary builtin), and `sum $ 1.0 + r.total` (a BinaryExpression
+     * whose LEFT is the builtin, since `$` is an operator). The operator
+     * spine is walked so the builtin is found wherever it sits.
+     */
+    private modeOfHeadExpr(e: Expr): SqlMode | null {
+        let head: Expr = e;
+        while (isApplication(head) && head.arguments.length === 0) head = head.func as Expr;
+        if (isApplication(head)) return this.modeOfHeadExpr(head.func as Expr);
+        // `sum $ x` / `sum + x`: the operator wraps the builtin on the left.
+        if (isBinaryExpression(head)) return this.modeOfHeadExpr(head.left as unknown as Expr);
+        if (!isIdentifier(head)) return null;
+        return builtinModeOf(head.name);
     }
 
     /**
@@ -3069,6 +3166,16 @@ export class Inferencer {
 
     /** Post-unification checks the scheme types don't capture (numeric, date, order, literals). */
     private postCheckArg(name: string, index: number, argExpr: Expr, argType: Type, node: AstNode): void {
+        // A fixed-arity CURRIED builtin: `lag` is `t -> int -> maybe t -> t`, so
+        // reaching a fourth argument IS the arity violation. It has to be caught
+        // here, not by the extra application: when the value type is still an
+        // open row-field variable (`lag u.salary 1 (just 0.0) 9`) the surplus
+        // argument unifies with that variable and would otherwise be absorbed
+        // silently. `argError` sees this only for a concrete value type.
+        if ((name === 'lag' || name === 'lead') && index >= 3) {
+            this.diag(node, `${name} takes exactly three arguments, e.g. ${name} u.salary 1 nothing`);
+            return;
+        }
         const r = this.u.peel(argType);
         // A bare numeric literal is still an unresolved variable (there are
         // no type classes left to pin it), but it is definitively not a date —
@@ -3125,34 +3232,68 @@ export class Inferencer {
         }
         if (name === 'sort' && index === 0) {
             const rt = this.u.peel(argType);
-            if (rt.kind === 'fun') {
-                const ret = this.u.peel(rt.to);
-                // A concrete return must already BE an order item or a list of
-                // them; an unconstrained variable is skolemized so it cannot
-                // silently bind to `order`/`[order]` — `sort (u => u.name)`
-                // must fail here, not at runtime.
-                const isOrder = ret.kind === 'order'
-                    || (ret.kind === 'list' && this.u.peel(ret.of).kind === 'order');
-                if (!isOrder && ret.kind !== 'var') {
-                    this.diag(node, `sort expects order items like asc u.name or a list of them, got an expression of type ${this.u.pretty(ret)}`);
-                } else if (ret.kind === 'var') {
-                    const sk = this.u.skolemize(ret);
-                    try {
-                        try {
-                            this.u.unify(ret, { kind: 'order' });
-                        } catch {
-                            try {
-                                this.u.unify(ret, listOf({ kind: 'order' }));
-                            } catch {
-                                this.diag(node, `sort expects order items like asc u.name or a list of them, got an expression of type ${this.u.pretty(ret)}`);
-                            }
-                        }
-                    } finally {
-                        sk.restore();
-                    }
-                }
+            if (rt.kind !== 'fun') return;
+            const ret = this.u.peel(rt.to);
+            // An ORDER BY item is `asc e` / `desc e`, or a list of them. This is
+            // a property of the EXPRESSION, not of its type: `asc u.name` and
+            // `u.name` have the same underlying value type, so the check reads
+            // the syntax (the lambda body / the argument itself) rather than a
+            // tag carried in `Type`. Inference has already typed the argument,
+            // so a still-unconstrained variable here means the shape was never
+            // reached — leave that to the runtime, which reports it precisely.
+            // The check reads the SYNTAX: an ORDER BY item is `asc e` /
+            // `desc e`, or a list of them. `asc u.name` and `u.name` share an
+            // underlying value type, so this cannot be decided from `Type`.
+            //
+            // A still-unconstrained return type (`u => u.name` leaves the
+            // column's type open at the definition site) must NOT be waved
+            // through: the shape is what makes the expression an order item, so
+            // a non-order shape is an error whatever the type turns out to be.
+            const body = this.sortBodyExpr(argExpr);
+            if (!this.producesOrderItems(body)) {
+                this.diag(node, `sort expects order items like asc u.name or a list of them, got an expression of type ${this.u.pretty(ret)}`);
             }
         }
+    }
+
+    /**
+     * The expression `sort` actually evaluates: the lambda's body when the
+     * argument is a lambda, else the argument itself (a bare `sort f` passes
+     * a bound function value, whose body is not visible here).
+     */
+    private sortBodyExpr(argExpr: Expr): Expr | null {
+        let e: AstNode | undefined = argExpr;
+        while (e && isApplication(e) && e.arguments.length === 0) e = e.func;
+        if (e && isLambda(e)) return e.body as unknown as Expr;
+        return e ? (e as unknown as Expr) : null;
+    }
+
+    /**
+     * Whether an expression yields ORDER BY items: `asc e`, `desc e`, a list of
+     * them, or a reference to a prelude/bound function that produces them
+     * (`sort by_age`). A bare column is NOT an order item — that is the error
+     * this predicate exists to catch.
+     */
+    private producesOrderItems(e: Expr | null): boolean {
+        if (!e) return false;
+        let cur = e;
+        while (isApplication(cur) && cur.arguments.length === 0) cur = cur.func as Expr;
+        if (isListLiteral(cur)) return cur.elements.some(el => this.producesOrderItems(el as unknown as Expr));
+        if (isApplication(cur)) {
+            // `asc u.name` is `Application(Identifier('asc'), [u.name])` — an
+            // application WITH arguments, so peel back to the head identifier
+            // directly rather than via `directBuiltinName` (which stops at the
+            // first non-zero-arity application).
+            let head: AstNode = cur.func;
+            while (isApplication(head) && head.arguments.length === 0) head = head.func;
+            if (isIdentifier(head) && (head.name === 'asc' || head.name === 'desc')
+                && this.isPreludeBuiltin(head.name, this.env)) {
+                return true;
+            }
+        }
+        // A bound step (`by_age = sort (u => [asc u.age])`) is typed elsewhere;
+        // only literal asc/desc in view can be judged here.
+        return false;
     }
 
     /** is_in's second argument must be a list of the first argument's type. */

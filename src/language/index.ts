@@ -6,10 +6,11 @@ export type { TetaueServices, TetaueSharedServices } from './tetaue-module.js';
 export {
     analyze, analyzeProject, evalExpr, apply, querySchema, describe, typeName, parseStringLiteral,
 } from './interpreter.js';
+export type { AnalysisResult, ProjectAnalysisOptions, Ctx, Diagnostic, Value, EvalResult } from './interpreter.js';
+// The SQL IR now lives in core/ir.ts; re-exported here for API stability.
 export type {
-    AnalysisResult, ProjectAnalysisOptions, Ctx, Diagnostic, Value, EvalResult, Schema, SqlColumn, SqlNode, RowNode,
-    Query, QueryStep, JoinKind, SetOp, SqlType, TypeOrNull,
-} from './interpreter.js';
+    Schema, SqlColumn, SqlNode, SqlNodeBase, RowNode, Query, QueryStep, JoinKind, SetOp, SqlType, TypeOrNull,
+} from '../core/ir.js';
 export { collectModuleTree, moduleOf } from './imports.js';
 export type { ProjectModule, ModuleTree, ModuleTreeOptions, ResolvedImportEdge, ResolvedExportEdge } from './imports.js';
 export { createImportResolver, resolveImport } from './resolve.js';

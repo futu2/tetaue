@@ -93,10 +93,10 @@ describe('semantic errors', () => {
     });
 
     test('string functions require strings', () => {
-        // `upper` is a prelude definition (`string -> string`), so passing a
+        // `toUpper` is a prelude definition (`string -> string`), so passing a
         // non-string is a static type error (caught by inference) rather than
         // a runtime check.
-        expect(allErrors(`${USERS}\nq = users & map (u => { x = upper u.age })`).join('\n')).toContain('cannot apply');
+        expect(allErrors(`${USERS}\nq = users & map (u => { x = toUpper u.age })`).join('\n')).toContain('cannot apply');
     });
 
     test('sum requires numeric', () => {
@@ -155,7 +155,7 @@ describe('semantic errors', () => {
         `);
         expect(sql).toContain([
             'WITH paid AS (',
-            "    SELECT * FROM orders WHERE status = 'paid'",
+            "    SELECT user_id, status FROM orders WHERE status = 'paid'",
             ')',
         ].join('\n'));
         expect(sql).toContain([

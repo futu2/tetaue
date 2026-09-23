@@ -75,7 +75,7 @@ describe('rename', () => {
     });
 
     test('rejects a non-literal key rule', () => {
-        expect(errors(`${USERS}\nq = users & map (rename (k => upper k))`).join('\n'))
+        expect(errors(`${USERS}\nq = users & map (rename (k => toUpper k))`).join('\n'))
             .toContain('rename key rule must compute a column name');
     });
 
@@ -144,7 +144,7 @@ describe('omit', () => {
     });
 
     test('stays open downstream — the remaining fields compose', () => {
-        const sql = render(`${USERS}\nq = users & map (omit ["password_hash"]) & map (u => { u | ok = true })`);
+        const sql = render(`${USERS}\nq = users & map (omit ["password_hash"]) & map (u => merge u { ok = true })`);
         expect(sql).toContain('1 AS ok');
         expect(sql).not.toContain('password_hash');
     });

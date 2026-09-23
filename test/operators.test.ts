@@ -95,7 +95,7 @@ q = table "t"`;
 
     test('_>>>_ composes functions exactly like >>>', () => {
         const source = `${NUMBERS}
-            project = _>>>_ (r => { a = r.a, b = r.b }) (r => { r | total = r.a + r.b })
+            project = _>>>_ (r => { a = r.a, b = r.b }) (r => merge r { total = r.a + r.b })
             q = numbers & map project`;
         expect(typeErrors(source)).toEqual([]);
         expect(render(source, 'postgresql', 'compact')).toContain('a + b AS total');
@@ -104,21 +104,39 @@ q = table "t"`;
     test('_&_ and _$_ preserve pipeline and application argument order', () => {
         const viaPipeline = render(`${NUMBERS}\nq = _&_ numbers (take 2)`, 'postgresql', 'compact');
         const viaApply = render(`${NUMBERS}\nq = _$_ (take 2) numbers`, 'postgresql', 'compact');
-        expect(viaPipeline).toBe('SELECT * FROM numbers LIMIT 2');
+        expect(viaPipeline).toBe('SELECT a, b FROM numbers LIMIT 2');
         expect(viaApply).toBe(viaPipeline);
     });
 
-    test('named sections resolve ordinary curried functions from scope', () => {
+    test('a named section requires its own `_name_` binding', () => {
+        // `_combine_` resolves the exact `_combine_` binding; there is no
+        // fallback to the bare `combine`, so the section needs its own name.
+        // (The builtin `div` has no `_div_` alias for the same reason — the
+        // prelude ships no word sections for its own functions.)
         const source = `${NUMBERS}
-            combine = x => y => x + y
+            _combine_ = x => y => x + y
             q = numbers & map (r => {
-                quotient = _div_ r.a r.b,
+                quotient = div r.a r.b,
                 combined = _combine_ r.a r.b,
             })`;
         expect(typeErrors(source)).toEqual([]);
         const sql = render(source, 'postgresql', 'compact');
         expect(sql).toContain('a / b AS quotient');
         expect(sql).toContain('a + b AS combined');
+    });
+
+    test('a bare function name is NOT reachable through a `_name_` section', () => {
+        const source = `${NUMBERS}
+            combine = x => y => x + y
+            q = numbers & map (r => { combined = _combine_ r.a r.b })`;
+        expect(typeErrors(source).join('\n')).toContain("unknown operator section '_combine_'");
+    });
+
+    test('builtin functions have no prelude section aliases', () => {
+        // `div` is an ordinary function; there is no `_div_` word section. Use
+        // `div r.a r.b` directly (or `_+_`-style symbols, which stay built in).
+        expect(allErrors(`${NUMBERS}\nq = numbers & map (r => { bad = _div_ r.a r.b })`).join('\n'))
+            .toContain("unknown operator section '_div_'");
     });
 
     test('operator sections retain the infix type checks', () => {

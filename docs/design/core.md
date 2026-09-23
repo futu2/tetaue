@@ -8,7 +8,8 @@ Tetaue has two layers:
    scalar types are reserved under an `@` name (`@filter`, `@int`, ...).
 2. The standard prelude is ordinary tetaue code in [`prelude.tetaue`](../../prelude.tetaue).
    It defines the public `_op_` bindings plus reusable functions such as
-   `id`, `compose`, `is_nothing`, and `is_just`.
+   `id`, `flip`, `is_nothing`, and `is_just` (the point-free composition
+   operators `<<<`/`>>>` replace the removed `compose`/`pipe` helpers).
 
 The prelude is not a second implementation of the language. The checker parses
 it, runs the same interpreter and Hindley-Milner inferencer used for user code,

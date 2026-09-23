@@ -9,8 +9,12 @@ const USERS = `users: query {
 } = table "users"`;
 
 describe('query roots', () => {
-    test('bare table renders SELECT *', () => {
-        expect(render(`${USERS}`)).toBe('SELECT *\nFROM users');
+    test('a schema-annotated table projects its declared columns', () => {
+        expect(render(`${USERS}`)).toBe('SELECT\n    id,\n    name,\n    age,\n    active\nFROM users');
+    });
+
+    test('a dynamic (un-annotated) table renders SELECT *', () => {
+        expect(render('q = table "users"')).toBe('SELECT *\nFROM users');
     });
 });
 
@@ -112,19 +116,19 @@ describe('nulls', () => {
 });
 
 describe('string functions', () => {
-    test('upper/lower/length/coalesce', () => {
+    test('toUpper/toLower/length/coalesce', () => {
         const sql = render(`
             ${USERS}
             q = users
                 & map (u => {
-                    upper = upper u.name,
-                    lower = lower u.name,
+                    uname = toUpper u.name,
+                    lname = toLower u.name,
                     len = length u.name,
                     name_or_unknown = coalesce u.name "unknown",
                 })
         `);
-        expect(sql).toContain('UPPER(name) AS upper');
-        expect(sql).toContain('LOWER(name) AS lower');
+        expect(sql).toContain('UPPER(name) AS uname');
+        expect(sql).toContain('LOWER(name) AS lname');
         expect(sql).toContain('LENGTH(name) AS len');
         expect(sql).toContain(`COALESCE(name, 'unknown') AS name_or_unknown`);
     });
@@ -151,7 +155,7 @@ describe('is_in', () => {
 describe('distinct', () => {
     test('SELECT DISTINCT', () => {
         const sql = render(`${USERS}\nq = users & distinct`);
-        expect(sql).toContain('SELECT DISTINCT *');
+        expect(sql).toContain('SELECT DISTINCT\n    id,\n    name,\n    age,\n    active');
     });
 });
 
@@ -274,7 +278,7 @@ describe('joins', () => {
         expect(sql).not.toContain('FROM detail\n    WHERE buy_order = 1'); // the raw-table bug
         expect(sql).toContain('WITH detail AS (');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY tx.cust_id ORDER BY tx.tx_dt ASC) AS buy_order');
-        expect(sql).toContain('first_buy AS (\n    SELECT * FROM detail AS first_buy WHERE buy_order = 1');
+        expect(sql).toContain('first_buy AS (\n    SELECT customer_number, buy_order FROM detail AS first_buy WHERE buy_order = 1');
         expect(sql).toContain('LEFT JOIN first_buy\n    ON detail.customer_number = first_buy.customer_number');
         expect(sql).toContain('WHERE detail.buy_order = 1');
     });
@@ -314,7 +318,7 @@ describe('CTE rendering by default', () => {
             & joinLeft first_buy (l => r => l.customer_number == r.customer_number) (l => r => merge l r)
         `);
         expect(sql).toContain('WITH detail AS (');
-        expect(sql).toContain('first_buy AS (\n    SELECT * FROM detail AS first_buy WHERE buy_order = 1');
+        expect(sql).toContain('first_buy AS (\n    SELECT customer_number, buy_order FROM detail AS first_buy WHERE buy_order = 1');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY tx.cust_id ORDER BY tx.tx_dt ASC) AS buy_order');
         expect(sql).toContain('FROM detail\nLEFT JOIN first_buy\n    ON detail.customer_number = first_buy.customer_number');
         expect(sql).toContain('WHERE detail.buy_order = 1');
@@ -331,7 +335,7 @@ describe('CTE rendering by default', () => {
         expect((sql.match(/WITH detail AS/g) ?? []).length).toBe(1);
         // one definition plus one reference inside each of the two first_buy CTEs
         expect(sql.match(/FROM detail\b/g)?.length).toBe(3);
-        expect(sql).toContain('first_buy_1 AS (\n    SELECT * FROM detail AS first_buy_1 WHERE buy_order = 1');
+        expect(sql).toContain('first_buy_1 AS (\n    SELECT customer_number, buy_order FROM detail AS first_buy_1 WHERE buy_order = 1');
         expect(sql).toContain('LEFT JOIN first_buy_1\n    ON first_buy.customer_number = first_buy_1.customer_number');
     });
 
@@ -369,7 +373,7 @@ describe('CTE rendering by default', () => {
         // reuse that name or `WITH t AS (SELECT * FROM t ...)` would recurse
         // into the CTE itself (SQLite: "circular reference").
         const sql = render(`t: query { a: int } = table "t"\nq = t & take 2 & fold (u => { total = sum u.a })`);
-        expect(sql).toContain('WITH t_1 AS (\n    SELECT * FROM t LIMIT 2');
+        expect(sql).toContain('WITH t_1 AS (\n    SELECT a FROM t LIMIT 2');
         expect(sql).toContain('FROM t_1 AS t');
     });
 });
@@ -497,7 +501,7 @@ describe('dialects', () => {
     test('compact format is a single line', () => {
         const sql = render(`${USERS}\nq = users & take 1`, 'sqlite', 'compact');
         expect(sql).not.toContain('\n');
-        expect(sql).toBe('SELECT * FROM users LIMIT 1');
+        expect(sql).toBe('SELECT id, name, age, active FROM users LIMIT 1');
     });
 });
 
@@ -613,8 +617,8 @@ describe('function composition and aliases', () => {
         const sql = render(`
             ${USERS}
             q = users & map (u => {
-                a = (upper <<< lower) u.name,
-                b = (upper >>> lower) u.name,
+                a = (toUpper <<< toLower) u.name,
+                b = (toUpper >>> toLower) u.name,
             })
         `);
         expect(sql).toContain('UPPER(LOWER(name)) AS a');
@@ -676,7 +680,7 @@ describe('composable joins (review change)', () => {
             orders: query { user_id: int } = table "orders"
             q = users & joinInner (orders & distinct) (u => o => u.id == o.user_id) (u => o => { uid = u.id })
         `);
-        expect(sql).toContain('WITH orders_1 AS (\n    SELECT DISTINCT * FROM orders');
+        expect(sql).toContain('WITH orders_1 AS (\n    SELECT DISTINCT user_id FROM orders');
         expect(sql).toContain('INNER JOIN orders_1 AS orders\n    ON users.id = orders.user_id');
     });
 
@@ -883,7 +887,7 @@ describe('implicit lambda parameters (this/that)', () => {
             s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
             main = s03_corp_chrem_tx_dtl & filter (u => exists (filter (cast this.pt_dt "date" <= u.pt_dt) s03_corp_chrem_tx_dtl))
         `);
-        expect(sql).toContain('EXISTS (SELECT * FROM s03_corp_chrem_tx_dtl WHERE CAST(pt_dt AS DATE) <= pt_dt)');
+        expect(sql).toContain('EXISTS (SELECT 1 FROM s03_corp_chrem_tx_dtl WHERE CAST(pt_dt AS DATE) <= pt_dt)');
         expect(sql).not.toContain('unknown lambda parameter');
     });
 
@@ -923,7 +927,7 @@ describe('implicit lambda parameters (this/that)', () => {
             ${USERS}
             q = users
                 & filter (u => u.active)
-                & map ({ id = this.id, name = upper this.name })
+                & map ({ id = this.id, name = toUpper this.name })
         `);
         expect(sql).toContain('WHERE active');
         expect(sql).toContain([
@@ -959,19 +963,19 @@ describe('review fixes: pure-local bindings, step composition, SQL escaping', ()
             adult = u => u.active
             q = users & (filter (adult) >>> take 10)
         `);
-        expect(sql).toBe('SELECT *\nFROM users\nWHERE active\nLIMIT 10');
+        expect(sql).toBe('SELECT\n    id,\n    name,\n    age,\n    active\nFROM users\nWHERE active\nLIMIT 10');
     });
 
     test('identifiers with embedded quotes are escaped per dialect', () => {
         const src = 'q: query { id: int } = table "a\\\"b"';
-        expect(render(src, 'sqlite')).toBe('SELECT *\nFROM "a""b"');
-        expect(render(src, 'postgresql')).toBe('SELECT *\nFROM "a""b"');
+        expect(render(src, 'sqlite')).toBe('SELECT id\nFROM "a""b"');
+        expect(render(src, 'postgresql')).toBe('SELECT id\nFROM "a""b"');
     });
 
     test('backtick identifiers are escaped for mysql/hive', () => {
         const src = 'q: query { id: int } = table "a`b"';
-        expect(render(src, 'mysql')).toBe('SELECT *\nFROM `a``b`');
-        expect(render(src, 'hive')).toBe('SELECT *\nFROM `a``b`');
+        expect(render(src, 'mysql')).toBe('SELECT id\nFROM `a``b`');
+        expect(render(src, 'hive')).toBe('SELECT id\nFROM `a``b`');
     });
 
     test('date_format strings are quoted as SQL string literals', () => {
@@ -1025,10 +1029,10 @@ describe('lambda bodies are full operator chains', () => {
     });
 
     test('$ inside a lambda body stays part of the body', () => {
-        // `$` is right-associative application: `upper $ u.name` ≡ `upper (u.name)`.
+        // `$` is right-associative application: `toUpper $ u.name` ≡ `toUpper (u.name)`.
         const sql = render(`
             ${USERS}
-            q = users & map (u => { n = upper $ u.name })
+            q = users & map (u => { n = toUpper $ u.name })
         `);
         expect(sql).toContain('UPPER(name)');
     });

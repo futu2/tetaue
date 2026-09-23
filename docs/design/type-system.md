@@ -94,7 +94,7 @@ tail       ::= lowercase-row-variable | '?hole_name'
   into one numeric variable and then requiring `(maybe int) ~ int` violates
   Maybe strictness. The explicit "unwrap first" diagnostics fire where
   nullability is already known (outer-join mergers, ascriptions).
-- Scalar SQL functions (`upper`, `length`, `trim`, date functions, ...) take
+- Scalar SQL functions (`toUpper`, `length`, `trim`, date functions, ...) take
   and return non-maybe values; SQL NULL propagation is achieved explicitly
   with `from_maybe`/`coalesce`, not by implicit lifting.
 - **Outer joins** expose the null-extended input as a FIELD-WISE null-extended

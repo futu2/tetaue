@@ -9,7 +9,7 @@
 #                   named `omit` here because `drop n` is the OFFSET step)
 #
 # A key rule must compute a column NAME from the field name — a compile-time
-# string, so `"user_" <> k` is folded statically while `upper k` is rejected.
+# string, so `"user_" <> k` is folded statically while `toUpper k` is rejected.
 
 users: query {
     id: int,
