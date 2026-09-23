@@ -22,7 +22,7 @@
 import type { AstNode } from 'langium';
 import { ERROR, checkBinding, createPreludeEnv, describe, namespaceEnv, type Value } from './interpreter.js';
 import { parseStringLiteral } from './strings.js';
-import { baseClosureFor } from './prelude.js';
+import { baseClosureFor, baseModuleFor, baseModulesByPath } from './prelude.js';
 import { recursiveBindingMessage, topoOrderBindings, type Diagnostic } from './binding-analysis.js';
 import { Inferencer, mergeDiagnostics } from './inference.js';
 import type { Scheme, Type } from './types.js';
@@ -128,20 +128,25 @@ export function checkProject(
     // still gets the whole library.
     const baseModules = options.baseModules ?? (prelude ? baseClosureFor(prelude) : []);
     const baseSet: ReadonlySet<ProjectModule> = new Set(baseModules);
+    // Identity is not enough on its own: a base file opened as a document
+    // arrives as a `file:///…/base/sql.tetaue` module that no library walk
+    // produced. `baseModuleFor` matches those by library path and maps them
+    // onto the canonical module, so the file is not analyzed twice.
+    const baseByPath = baseModulesByPath(baseModules);
     // A caller may pass the library AND a user tree that reached a base
     // module through an explicit `import "base/..."`. Those modules are
     // already in `baseModules` (with the primitive environment), so drop the
     // duplicates: checking one twice would both lose its primitives and
     // report every diagnostic twice.
-    const userModules = modules.filter(m => !baseSet.has(m));
+    const userModules = modules.filter(m => baseModuleFor(m, baseSet, baseByPath) === undefined);
     const allModules = [...baseModules, ...userModules];
     const root = userModules[userModules.length - 1];
-    inferencer.isBaseModule = module => baseSet.has(module);
+    inferencer.isBaseModule = module => baseModuleFor(module, baseSet, baseByPath) !== undefined;
     let rootEnv: Map<string, Value> | undefined;
     let value: Value = ERROR;
 
     for (const module of allModules) {
-        const isBase = baseSet.has(module);
+        const isBase = baseModuleFor(module, baseSet, baseByPath) !== undefined;
         const moduleImports: readonly ResolvedImportEdge[] = isBase
             ? baseImportsByModule.get(module) ?? module.imports ?? []
             : importsByModule.get(module) ?? module.imports ?? [];

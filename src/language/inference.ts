@@ -33,7 +33,7 @@ import {
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
 import { CORE_NAMESPACE, PRELUDE_NAMESPACES } from './prelude-namespaces.js';
-import { baseClosureFor } from './prelude.js';
+import { baseClosureFor, baseModuleFor, baseModulesByPath } from './prelude.js';
 import { moduleOf } from './imports.js';
 import { resolveImportScope } from './project-scope.js';
 import { parseStringLiteral } from './strings.js';
@@ -459,11 +459,17 @@ export class Inferencer {
         // user module starts from the Prelude's exports instead.
         const baseModules = prelude ? baseClosureFor(prelude) : [];
         const baseSet: ReadonlySet<ProjectModule> = new Set(baseModules);
-        this.isBaseModule = module => baseSet.has(module);
+        // Match by library path as well as identity: a base file opened as a
+        // document is a different object than the one the library walk
+        // produced (see `baseModuleFor`).
+        const baseByPath = baseModulesByPath(baseModules);
+        const isBase = (module: ProjectModule): boolean =>
+            baseModuleFor(module, baseSet, baseByPath) !== undefined;
+        this.isBaseModule = isBase;
         // Drop base modules a caller also passed in `modules` (an explicit
         // `import "base/..."` reaches them): they are already covered by
         // `baseModules`, with the primitive environment.
-        const allModules = [...baseModules, ...modules.filter(m => !baseSet.has(m))];
+        const allModules = [...baseModules, ...modules.filter(m => !isBase(m))];
         for (const module of allModules) {
             const exported = this.inferModule(
                 module,
@@ -472,7 +478,7 @@ export class Inferencer {
                 reexportsByModule.get(module) ?? module.exports ?? [],
             );
             exportsByModule.set(module, exported);
-            if (module === prelude || baseSet.has(module)) {
+            if (isBase(module)) {
                 this.preludeNames = new Set([...this.preludeNames, ...exported.keys()]);
                 this.preludeEnv = new Map([...this.preludeEnv, ...exported]);
             }

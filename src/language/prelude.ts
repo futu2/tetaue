@@ -40,6 +40,32 @@ export function isBaseUri(uri: string | undefined): boolean {
     return uri.startsWith(BASE_PREFIX) || uri.startsWith(`tetaue:${BASE_PREFIX}`);
 }
 
+/**
+ * A base module's library path (`sql.tetaue`) from any spelling of its URI.
+ * Module identity inside the library is the PATH, not the URI: the embedded
+ * library keys its modules by synthetic URIs (`base/sql.tetaue`), while the
+ * LSP sees the same files as open documents with real `file://` URIs
+ * (`file:///…/base/sql.tetaue`). Both must name the SAME module, or a
+ * `base/*.tetaue` file opened in the editor is analyzed twice — once as a
+ * base module (with the primitive core) and once as a user module (without
+ * it), which reports every `core`/`sql_func`/`sql_dialect` reference as an
+ * unknown identifier.
+ *
+ * Returns undefined for a URI that does not name a library module.
+ */
+export function basePathOf(uri: string | undefined): string | undefined {
+    if (!uri) return undefined;
+    if (uri.startsWith(`tetaue:${BASE_PREFIX}`)) return uri.slice(`tetaue:${BASE_PREFIX}`.length);
+    if (uri.startsWith(BASE_PREFIX)) return uri.slice(BASE_PREFIX.length);
+    // A real path to a file inside the project's `base/` directory. Both the
+    // `file:` URI and a plain filesystem path are accepted, `\` and `/`
+    // alike, so the check does not depend on how the caller spelled it. The
+    // captured group is the path RELATIVE to `base/` (`sql/time.tetaue`),
+    // which is exactly the key the library indexes its modules by.
+    const match = /(?:^|[/\\])base[/\\](.+)\.tetaue$/.exec(uri);
+    return match !== null ? `${match[1]}.tetaue` : undefined;
+}
+
 /** The Prelude's canonical URI; the module every other module auto-imports. */
 export const PRELUDE_URI = `${BASE_PREFIX}prelude.tetaue`;
 
@@ -206,6 +232,46 @@ export function baseClosureFor(prelude: ProjectModule): readonly ProjectModule[]
     // The prelude must come last: it re-exports the modules walked above.
     const rest = order.filter(m => m !== prelude);
     return [...rest, prelude];
+}
+
+/**
+ * The base-library MODULE a project module denotes, matched by identity first
+ * and by base path second.
+ *
+ * Identity (`baseSet.has(module)`) is the fast path: the embedded library and
+ * every caller that threads its modules through agree on the same objects.
+ * It is not sufficient on its own, because the SAME base file reaches the
+ * analyzer through a second object when it is opened as a document: the LSP
+ * root module for `base/sql.tetaue` is a `file:///…/base/sql.tetaue` module
+ * that no library walk ever produced. Matching `basePathOf` (`sql.tetaue`)
+ * then makes the two spellings the same module, so the file is analyzed once,
+ * with the primitive core, instead of once as base (with it) and once as a
+ * user module (without it).
+ *
+ * Returning the canonical module — not just a boolean — lets a caller rebind
+ * a duplicate to the library object, which is what keeps the export maps,
+ * the diagnostic anchors, and the prelude identity aligned.
+ */
+export function baseModuleFor(
+    module: ProjectModule,
+    baseSet: ReadonlySet<ProjectModule>,
+    byPath: ReadonlyMap<string, ProjectModule>,
+): ProjectModule | undefined {
+    if (baseSet.has(module)) return module;
+    const path = basePathOf(module.uri);
+    return path !== undefined ? byPath.get(path) : undefined;
+}
+
+/** Index a base-module set by library path (`sql.tetaue`), for `baseModuleFor`. */
+export function baseModulesByPath(
+    baseModules: readonly ProjectModule[],
+): ReadonlyMap<string, ProjectModule> {
+    const byPath = new Map<string, ProjectModule>();
+    for (const module of baseModules) {
+        const path = basePathOf(module.uri);
+        if (path !== undefined) byPath.set(path, module);
+    }
+    return byPath;
 }
 
 /**

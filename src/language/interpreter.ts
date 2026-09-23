@@ -32,7 +32,7 @@ export { missingBindingExpressionMessage, recursiveBindingMessage, topoOrderBind
 export type { Diagnostic, DialectView };
 import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
 import { CORE_NAMESPACE, PRELUDE_NAMESPACES } from './prelude-namespaces.js';
-import { baseClosureFor } from './prelude.js';
+import { baseClosureFor, baseModuleFor, baseModulesByPath } from './prelude.js';
 import { TypeUniverse } from './types.js';
 import type { Type } from './types.js';
 import {
@@ -4026,6 +4026,10 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
     // every other module starts from the Prelude's exports instead.
     const baseModules = prelude ? baseClosureFor(prelude) : [];
     const baseSet: ReadonlySet<ProjectModule> = new Set(baseModules);
+    // Identity plus library path: a base file opened as a document is a
+    // different object than the one the library walk produced (see
+    // `baseModuleFor`).
+    const baseByPath = baseModulesByPath(baseModules);
     const allModules = [...baseModules, ...modules];
     const root = modules[modules.length - 1];
     let standardValues = new Map<string, Value>();
@@ -4041,7 +4045,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         // reserved `core` namespace). A user module starts from what it
         // imports instead; `# no prelude` suppresses the automatic injection
         // of the Prelude's exports (and nothing else).
-        const isBase = baseSet.has(module);
+        const isBase = baseModuleFor(module, baseSet, baseByPath) !== undefined;
         const isNoPrelude = module.noPrelude === true;
         // A base module starts from the whole primitive core. A user module
         // starts from the built-in NAMESPACES (`list.*`, `Maybe.*`) — they are
