@@ -20,8 +20,9 @@
  * validator, hover/completion, and `tetaue types`) all use this pass.
  ******************************************************************************/
 import type { AstNode } from 'langium';
-import { ERROR, checkBinding, createPreludeEnv, describe, type Value } from './interpreter.js';
+import { ERROR, checkBinding, createPreludeEnv, describe, namespaceEnv, type Value } from './interpreter.js';
 import { parseStringLiteral } from './strings.js';
+import { baseClosureFor } from './prelude.js';
 import { recursiveBindingMessage, topoOrderBindings, type Diagnostic } from './binding-analysis.js';
 import { Inferencer, mergeDiagnostics } from './inference.js';
 import type { Scheme, Type } from './types.js';
@@ -68,6 +69,21 @@ export interface CheckProjectOptions {
      */
     prelude?: ProjectModule;
     /**
+     * The whole base library, in dependency order, including `prelude`. Base
+     * modules are evaluated with the primitive core seeded and are the ONLY
+     * modules that see it; every other module starts from the Prelude's
+     * exports. Defaults to `[prelude]` so a caller that only cares about the
+     * auto-imported surface keeps working.
+     */
+    baseModules?: readonly ProjectModule[];
+    /**
+     * The base library's OWN import/re-export edges (`base/prelude.tetaue`
+     * imports `./sql.tetaue`). The user's `importsByModule` never contains
+     * them, so the library's internal wiring is passed separately.
+     */
+    baseImportsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    baseExportsByModule?: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]>;
+    /**
      * The dialect the prelude's `sql_dialect` value describes. When omitted,
      * the prelude sees a sqlite-shaped view (matching the CLI default).
      */
@@ -84,6 +100,8 @@ export function checkProject(
 ): CheckProjectResult {
     const { requireQuery = true, requireMain = false, importsByModule = new Map(), entryBinding, prelude, dialect } = options;
     const reexportsByModule = options.reexportsByModule ?? new Map<ProjectModule, readonly ResolvedExportEdge[]>();
+    const baseImportsByModule = options.baseImportsByModule ?? new Map<ProjectModule, readonly ResolvedImportEdge[]>();
+    const baseExportsByModule = options.baseExportsByModule ?? new Map<ProjectModule, readonly ResolvedExportEdge[]>();
 
     const inferencer = new Inferencer();
     inferencer.prelude(dialect);
@@ -95,21 +113,38 @@ export function checkProject(
     const schemeExportsByModule = new Map<ProjectModule, Map<string, Scheme>>();
 
     const interpreterDiagnostics: Diagnostic[] = [];
-    const root = modules[modules.length - 1];
-    // The prelude is a real module, but it is not part of the user's import
-    // graph. Process it first and inject only its exports into user scopes.
-    // `allModules` (prelude included) is also the diagnostic-anchor universe:
-    // an error inside a prelude lambda (e.g. `_&_ = x => f => f x`) must carry
-    // the PRELUDE's uri, not the importing file's.
-    const allModules = prelude ? [prelude, ...modules] : [...modules];
-    let standardValues = new Map<string, Value>();
-    let standardSchemes = new Map<string, Scheme>();
+    // The base library is a set of REAL modules that form their own module
+    // tree: the Prelude re-exports `./data/function`, `./Sql`, ... so the
+    // standard surface is built exactly the way a user's index module is.
+    // They are processed first, in dependency order, and recorded in the
+    // export maps like any other module — which is what lets the Prelude's
+    // re-exports resolve.
+    //
+    // `baseModules` is also the diagnostic-anchor universe: an error inside a
+    // library lambda (`_&_ = x => f => f x`) must carry the BASE module's uri,
+    // not the importing file's. With no explicit wiring, the tree is expanded
+    // from the Prelude itself, because every base module carries its own edges
+    // (see prelude.ts) — so a caller holding only `standardPrelude(services)`
+    // still gets the whole library.
+    const baseModules = options.baseModules ?? (prelude ? baseClosureFor(prelude) : []);
+    const baseSet: ReadonlySet<ProjectModule> = new Set(baseModules);
+    // A caller may pass the library AND a user tree that reached a base
+    // module through an explicit `import "base/..."`. Those modules are
+    // already in `baseModules` (with the primitive environment), so drop the
+    // duplicates: checking one twice would both lose its primitives and
+    // report every diagnostic twice.
+    const userModules = modules.filter(m => !baseSet.has(m));
+    const allModules = [...baseModules, ...userModules];
+    const root = userModules[userModules.length - 1];
+    inferencer.isBaseModule = module => baseSet.has(module);
     let rootEnv: Map<string, Value> | undefined;
     let value: Value = ERROR;
 
     for (const module of allModules) {
-        const moduleImports: readonly ResolvedImportEdge[] =
-            importsByModule.get(module) ?? module.imports ?? [];
+        const isBase = baseSet.has(module);
+        const moduleImports: readonly ResolvedImportEdge[] = isBase
+            ? baseImportsByModule.get(module) ?? module.imports ?? []
+            : importsByModule.get(module) ?? module.imports ?? [];
 
         // Prepare BOTH sides once for this module. The type inferencer owns
         // the shared lexical scope; the value evaluator owns the runtime
@@ -121,7 +156,16 @@ export function checkProject(
         ).scope;
         const scope = new Map(typedScope);
 
-        let env = createPreludeEnv(dialect);
+        // A BASE module is the only kind that starts from the primitive core
+        // (BUILTINS + the operator intrinsics + `sql_dialect`); a user module
+        // starts from the auto-imported Prelude instead. That single rule is
+        // what makes `table`/`filter` ambient for users while `sql_func` and
+        // `op_add` stay library-internal.
+        // A base module starts from the whole primitive core; a user module
+        // starts from the built-in namespaces (`list.*`, `Maybe.*`) and then
+        // receives the Prelude's exports below. The namespaces are core
+        // vocabulary rather than Prelude exports, so they are always in scope.
+        let env = isBase ? createPreludeEnv(dialect) : namespaceEnv();
         const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
         const moduleDiagnostics: Diagnostic[] = [
             ...inferencer.takeDiagnostics(),
@@ -139,14 +183,20 @@ export function checkProject(
             });
         }
 
-        // Standard-library names have lower precedence than imports and local
-        // bindings, matching ordinary lexical shadowing.
-        const isNoPrelude = module.noPrelude === true;
-        if (!isNoPrelude && module !== prelude) {
-            for (const [name, scheme] of standardSchemes) {
+        // The Prelude is auto-imported into every non-base module that does
+        // not opt out with `# no prelude`. Its names have LOWER precedence
+        // than explicit imports and local bindings, matching ordinary lexical
+        // shadowing (and Haskell, where a local definition wins over the
+        // Prelude's).
+        //
+        // `noPrelude` is set by `compile.ts` from the first-line pragma:
+        // comments are hidden terminals, so the flag — not the model — is
+        // where the directive lives for a caller-built `ProjectModule`.
+        if (!isBase && module.noPrelude !== true && prelude) {
+            for (const [name, scheme] of schemeExportsByModule.get(prelude) ?? []) {
                 if (!inferencer.env.has(name)) inferencer.env.set(name, scheme);
             }
-            for (const [name, v] of standardValues) {
+            for (const [name, v] of valueExportsByModule.get(prelude) ?? []) {
                 if (!env.has(name)) env.set(name, v);
             }
         }
@@ -189,7 +239,10 @@ export function checkProject(
         // Re-exports add names to THIS module's public surface without binding
         // them locally, mirroring the interpreter's merge exactly (same
         // wording, so the merged diagnostics dedupe).
-        for (const { target, exportNode } of reexportsByModule.get(module) ?? []) {
+        const moduleReexports = isBase
+            ? baseExportsByModule.get(module) ?? module.exports ?? []
+            : reexportsByModule.get(module) ?? module.exports ?? [];
+        for (const { target, exportNode } of moduleReexports) {
             const targetValues = valueExportsByModule.get(target);
             const targetSchemes = schemeExportsByModule.get(target);
             if (!targetValues || !targetSchemes) continue; // cyclic/missing target — already diagnosed
@@ -219,18 +272,17 @@ export function checkProject(
         schemeExportsByModule.set(module, exportedSchemes);
 
         if (module === root) rootEnv = env;
-        if (module === prelude) {
-            standardValues = exports;
-            standardSchemes = exportedSchemes;
-            // Public aliases are the prelude for every following module. Keep
-            // their scheme identity so builtin-specific inference checks still
-            // recognize `filter`, `fold`, etc. while allowing local shadowing.
-            // `preludeNames` records the same set by NAME, so a rule may also
-            // apply to a prelude-defined wrapper (`abs`, `ceil`, `pow`) that
-            // has no core builtin behind it — while a user's own `abs` is
-            // still exempt, because its scheme identity differs.
-            inferencer.preludeNames = new Set([...inferencer.preludeNames, ...standardSchemes.keys()]);
-            inferencer.preludeEnv = new Map([...inferencer.preludeEnv, ...standardSchemes]);
+        if (module === prelude || isBase) {
+            // The base library's exported names are the Prelude for every
+            // following module. Keep their scheme identity so builtin-specific
+            // inference checks still recognize `filter`, `fold`, etc. while
+            // allowing local shadowing. `preludeNames` records the same set by
+            // NAME, so a rule may also apply to a library-defined wrapper
+            // (`abs`, `ceil`, `pow`) that has no core builtin behind it —
+            // while a user's own `abs` is still exempt, because its scheme
+            // identity differs.
+            inferencer.preludeNames = new Set([...inferencer.preludeNames, ...exportedSchemes.keys()]);
+            inferencer.preludeEnv = new Map([...inferencer.preludeEnv, ...exportedSchemes]);
         }
         interpreterDiagnostics.push(...moduleDiagnostics);
     }

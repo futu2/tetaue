@@ -22,8 +22,8 @@ the reflection that shaped the implementation — lives in
    metavariable. A bare `table "users"` gets a fresh row hole
    (`query ?table`) instead of `forall r. query r`.
 4. **SQL NULL is explicit.** `null : forall a. (maybe a)`, `just : a -> (maybe a)`,
-   `nothing : forall a. (maybe a)`, `from_maybe : a -> (maybe a) -> a`,
-   `is_null` / `is_not_null : (maybe a) -> bool`. `coalesce` remains as the
+   `nothing : forall a. (maybe a)`, `fromMaybe : a -> (maybe a) -> a`,
+   `isNull` / `isNotNull : (maybe a) -> bool`. `coalesce` remains as the
    SQL-native choice between two maybe values.
 5. **Numeric polymorphism is constrained.** `Num t` is retained on inferred
    variables through generalization and instantiation. Its closed instances
@@ -80,12 +80,12 @@ tail       ::= lowercase-row-variable | '?hole_name'
 - `maybeOf(T)` never flattens and never unifies with `T`.
 - `null` (also `nothing`) has type `forall a. (maybe a)`.
 - `just x : (maybe T)` when `x : T`.
-- `from_maybe default x : T` requires `default : T` and `x : (maybe T)`.
-- `is_null x` / `is_not_null x` require `x : (maybe T)` and return `bool`.
+- `fromMaybe default x : T` requires `default : T` and `x : (maybe T)`.
+- `isNull x` / `isNotNull x` require `x : (maybe T)` and return `bool`.
 - Comparison `==`/`!=` with `null` is only well-typed when the other operand
   is already maybe; it lowers to `IS [NOT] NULL`.
 - Ordinary comparison and arithmetic require non-maybe operands. Use
-  `from_maybe` (or `coalesce`) to unwrap first. Two consequences of the
+  `fromMaybe` (or `coalesce`) to unwrap first. Two consequences of the
   implementation mechanism: a nullable column meeting a *polymorphic
   literal* (`v.s + 1`, `v.s > 1` on `v.s : (maybe int)`) is accepted and
   stays maybe — inside an open lambda nullability flows in at row
@@ -96,7 +96,7 @@ tail       ::= lowercase-row-variable | '?hole_name'
   nullability is already known (outer-join mergers, ascriptions).
 - Scalar SQL functions (`toUpper`, `length`, `trim`, date functions, ...) take
   and return non-maybe values; SQL NULL propagation is achieved explicitly
-  with `from_maybe`/`coalesce`, not by implicit lifting.
+  with `fromMaybe`/`coalesce`, not by implicit lifting.
 - **Outer joins** expose the null-extended input as a FIELD-WISE null-extended
   row to the merger: `joinLeft` null-extends the right row, `joinRight` the
   left, and `joinFull` both. The extension is written `nullRow r` and means
@@ -162,9 +162,9 @@ The current runtime uses a deliberately closed instance table:
 - `Eq`: `int`, `float`, `decimal`, `string`, `bool`, `date`, `timestamp`.
 - `Ord`: the same scalar set as `Eq`.
 - `DateTime`: `date`, `timestamp` — the calendar-valued class of the date
-  family (`year`…`second`, `extract`, `date_add`, `date_diff`, `date_trunc`,
-  `date_format`, `to_unixtime`). Their schemes state the constraint — e.g.
-  `year : DateTime t => t -> int` and `date_trunc : DateTime t => t -> string
+  family (`year`…`second`, `extract`, `dateAdd`, `dateDiff`, `dateTrunc`,
+  `dateFormat`, `toUnixtime`). Their schemes state the constraint — e.g.
+  `year : DateTime t => t -> int` and `dateTrunc : DateTime t => t -> string
   -> t` — so hovers show the real shape, and concrete non-date arguments are
   rejected by the ordinary constraint machinery (`year o.note` in a lambda,
   a bound `f = year` applied to a string). Numeric literals still need the
@@ -220,14 +220,14 @@ bind        : closed `>>=` dispatch over maybe and list
 then        : closed `>>` dispatch over maybe and list
 just        : forall a. a -> (maybe a)
 nothing     : forall a. (maybe a)
-from_maybe  : forall a. a -> (maybe a) -> a
+fromMaybe  : forall a. a -> (maybe a) -> a
 coalesce    : forall a. (maybe a) -> (maybe a) -> (maybe a)
              | forall a. [(maybe a)] -> (maybe a)   -- list form: coalesce [x, y, z]
-is_null     : forall a. (maybe a) -> bool
-is_not_null : forall a. (maybe a) -> bool
+isNull     : forall a. (maybe a) -> bool
+isNotNull : forall a. (maybe a) -> bool
 
 count       : forall a. a -> agg int
-count_distinct : forall a. a -> agg int
+countDistinct : forall a. a -> agg int
 sum         : forall a. a -> agg (maybe a)       -- numeric a
 avg         : forall a. a -> agg (maybe float)   -- numeric a
 min, max    : forall a. a -> agg (maybe a)       -- comparable a

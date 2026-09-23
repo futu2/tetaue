@@ -2,14 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import { allErrors, render, typeErrors } from './helpers.ts';
 
 describe('SQL three-valued logic helpers', () => {
-    test('is_true/is_false/is_unknown accept bool and nullable bool', () => {
+    test('isTrue/isFalse/isUnknown accept bool and nullable bool', () => {
         const src = `
             t: query { flag: (maybe bool), active: bool } = table "t"
             q = t & map (u => {
-                yes = is_true u.flag,
-                no = is_false u.flag,
-                unknown = is_unknown u.flag,
-                active = is_true u.active,
+                yes = isTrue u.flag,
+                no = isFalse u.flag,
+                unknown = isUnknown u.flag,
+                active = isTrue u.active,
             })
         `;
         expect(typeErrors(src)).toEqual([]);
@@ -23,9 +23,9 @@ describe('SQL three-valued logic helpers', () => {
     test('truth helpers reject non-boolean values', () => {
         const src = `
             t: query { id: int } = table "t"
-            q = t & filter (u => is_unknown u.id)
+            q = t & filter (u => isUnknown u.id)
         `;
-        // `is_unknown` requires a bool / maybe bool argument, so the int column
+        // `isUnknown` requires a bool / maybe bool argument, so the int column
         // is rejected where the mistake is: at the predicate itself, naming the
         // argument's actual type. (This used to surface indirectly as
         // `cannot apply`, because the argument was constrained to an internal
@@ -35,13 +35,13 @@ describe('SQL three-valued logic helpers', () => {
         // that `check`/LSP render) rather than `typeErrors`: the interpreter's
         // evaluation knows the column's concrete type, so the diagnostic is
         // produced there, and `typeErrors` alone never sees a resolved row field.
-        expect(allErrors(src).join('\n')).toContain('is_unknown expects a boolean or nullable boolean expression, got type int');
+        expect(allErrors(src).join('\n')).toContain('isUnknown expects a boolean or nullable boolean expression, got type int');
     });
 
     test('lowering is portable across the supported SQL dialects', () => {
         const src = `
             t: query { flag: (maybe bool) } = table "t"
-            q = t & filter (u => is_false u.flag || is_unknown u.flag)
+            q = t & filter (u => isFalse u.flag || isUnknown u.flag)
         `;
         for (const dialect of ['sqlite', 'postgresql', 'mysql', 'trino', 'hive']) {
             const sql = render(src, dialect, 'compact');

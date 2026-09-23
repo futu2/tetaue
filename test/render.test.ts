@@ -139,13 +139,13 @@ describe('string functions', () => {
     });
 });
 
-describe('is_in', () => {
+describe('isIn', () => {
     test('IN and NOT IN', () => {
         const sql = render(`
             ${USERS}
             q = users
-                & filter (u => is_in u.age [18, 21, 25])
-                & filter (u => is_not_in u.name ["a", "b"])
+                & filter (u => isIn u.age [18, 21, 25])
+                & filter (u => isNotIn u.name ["a", "b"])
         `);
         expect(sql).toContain('age IN (18, 21, 25)');
         expect(sql).toContain(`name NOT IN ('a', 'b')`);
@@ -269,7 +269,7 @@ describe('joins', () => {
             first_buy = detail
                 & map (d => {
                     customer_number = d.cust_id,
-                    buy_order = over row_number { partition = [d.cust_id], order = [asc d.tx_dt] },
+                    buy_order = over rowNumber { partition = [d.cust_id], order = [asc d.tx_dt] },
                 })
                 & filter (d => d.buy_order == 1)
             q = first_buy
@@ -308,7 +308,7 @@ describe('CTE rendering by default', () => {
         first_buy = detail
             & map (d => {
                 customer_number = d.cust_id,
-                buy_order = over row_number { partition = [d.cust_id], order = [asc d.tx_dt] },
+                buy_order = over rowNumber { partition = [d.cust_id], order = [asc d.tx_dt] },
             })
             & filter (d => d.buy_order == 1)
     `;
@@ -360,8 +360,8 @@ describe('CTE rendering by default', () => {
                 & fold (o => { user_id = group o.user_id, total = sum o.total })
                 & map (r => { id = r.user_id, total = r.total })
             q = users
-                & join_lateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, t1 = r.total })
-                & join_lateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, t2 = r.total })
+                & joinLateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, t1 = r.total })
+                & joinLateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, t2 = r.total })
         `, 'postgresql');
         expect(sql).not.toMatch(/\bWITH\b/);
         expect(sql.match(/INNER JOIN LATERAL \(/g)?.length).toBe(2);
@@ -443,10 +443,10 @@ describe('schema-qualified table names', () => {
         // `alias.column` — `ecs.table.column` is invalid in most engines.
         const sql = render(`
             cust = table "ecs.cust_f"
-                & filter (this.pt_dt == current_date)
+                & filter (this.pt_dt == currentDate)
                 & map { p_cino = this.roleplayer, cp = this.par_to_par_rel_rol }
             bday = table "ecs.bday_f"
-                & filter (this.pt_dt == current_date)
+                & filter (this.pt_dt == currentDate)
                 & map { customer_number = this.individualid, birthday = this.birthdate }
             q = cust
                 & joinLeft bday (u => v => u.p_cino == v.customer_number) (this <> that)
@@ -813,7 +813,7 @@ describe('implicit lambda parameters (this/that)', () => {
         const sql = render(`
             users: query { id: int } = table "users"
             orders: query { user_id: int, status: string } = table "orders"
-            q = users & joinInner orders (this.id == that.user_id && is_in that.status ["paid", "sent"]) { uid = this.id, oid = that.user_id }
+            q = users & joinInner orders (this.id == that.user_id && isIn that.status ["paid", "sent"]) { uid = this.id, oid = that.user_id }
         `);
         expect(sql).toContain('INNER JOIN orders ON users.id = orders.user_id AND orders.status IN (\'paid\', \'sent\')');
     });
@@ -854,7 +854,7 @@ describe('implicit lambda parameters (this/that)', () => {
     test('this/that work through the $ application operator', () => {
         const sql = render(`
             s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
-            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03_corp_chrem_tx_dtl
+            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= currentDate) s03_corp_chrem_tx_dtl
         `);
         expect(sql).toContain([
             'WHERE',
@@ -870,7 +870,7 @@ describe('implicit lambda parameters (this/that)', () => {
         // type error).
         const sql = render(`
             s03_corp_chrem_tx_dtl: query { pt_dt: date } = table "s03_corp_chrem_tx_dtl"
-            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03_corp_chrem_tx_dtl
+            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= currentDate) s03_corp_chrem_tx_dtl
         `);
         expect(sql).toContain([
             'WHERE',
@@ -892,12 +892,12 @@ describe('implicit lambda parameters (this/that)', () => {
     });
 
     test('this/that in a VALUE-position argument bubbles up to the enclosing lambda', () => {
-        // `is_in`'s first argument is a value expression, not a function
+        // `isIn`'s first argument is a value expression, not a function
         // position — `this` inside its nested call is the `filter` row, so
         // the predicate is abstracted as one lambda (the lpbirthday pattern).
         const sql = render(`
             users: query { id: int, active: bool } = table "users"
-            q = users & filter (is_in (from_maybe 0 this.id) [1, 2, 3])
+            q = users & filter (isIn (fromMaybe 0 this.id) [1, 2, 3])
         `);
         expect(sql).toContain('WHERE COALESCE(id, 0) IN (1, 2, 3)');
     });
@@ -978,8 +978,8 @@ describe('review fixes: pure-local bindings, step composition, SQL escaping', ()
         expect(render(src, 'hive')).toBe('SELECT id\nFROM `a``b`');
     });
 
-    test('date_format strings are quoted as SQL string literals', () => {
-        const src = 'users: query { created_at: date } = table "users"\nq = users & map (u => { d = date_format u.created_at "it\'s" })';
+    test('dateFormat strings are quoted as SQL string literals', () => {
+        const src = 'users: query { created_at: date } = table "users"\nq = users & map (u => { d = dateFormat u.created_at "it\'s" })';
         expect(render(src, 'sqlite')).toContain(`STRFTIME('it''s', created_at)`);
     });
 

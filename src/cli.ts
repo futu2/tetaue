@@ -34,7 +34,7 @@ import type { ProjectModule } from './language/imports.js';
 import { resolveImport } from './language/resolve.js';
 import { formatTetaue } from './language/lsp/formatter.js';
 import type { Model } from './language/generated/ast.js';
-import { standardPrelude } from './language/prelude.js';
+import { baseLibraryOptions } from './language/prelude.js';
 
 const HELP = `tetaue — a pure functional SQL query language
 
@@ -243,7 +243,7 @@ async function cmdTypes(args: string[]): Promise<number> {
         requireQuery: false,
         importsByModule: project.importsByModule,
         reexportsByModule: project.exportsByModule,
-        prelude: standardPrelude(services),
+        ...baseLibraryOptions(services),
     });
     for (const d of result.diagnostics) {
         const m = moduleOf(d.node, project.modules) ?? project.main;

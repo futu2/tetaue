@@ -1,0 +1,10 @@
+# Data.Maybe — helpers over SQL NULL.
+#
+# `(maybe T)` is the language's Maybe: a value that may be SQL NULL. These
+# are the derived predicates and eliminators the Prelude exposes unqualified
+# (`isNothing`, `isJust`, `fromMaybe`); the constructors and the
+# `Maybe.*` namespace spellings come from the core.
+
+export isNothing = isNull
+export isJust = x => not (isNull x)
+export isNotNull = isJust

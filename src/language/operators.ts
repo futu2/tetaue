@@ -11,7 +11,7 @@ export type BinaryOperator = (typeof BINARY_OPERATORS)[number];
 /**
  * SQL-aware primitive behind each public prelude operator binding. These names
  * are deliberately distinct from the public ones, so a module can shadow `+`
- * without touching the intrinsic: the checked `prelude.tetaue` module binds
+ * without touching the intrinsic: the checked `base/sql.tetaue` module binds
  * `_+_` and friends to them. They are spelled WITHOUT a `@` prefix so they
  * lex as ordinary identifiers (an `@` would be a lexer error), and the
  * public `_*_` section name never collides with them.

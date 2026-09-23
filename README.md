@@ -50,10 +50,14 @@ LIMIT 10
 
 ```sh
 bun install
-bun run langium:generate   # regenerate the Langium parser from the grammar
+bun run build              # langium:generate + base:generate
 bun test                   # run the test suite
 bun run src/cli.ts render examples/report.tetaue --dialect sqlite
 ```
+
+`bun run langium:generate` regenerates the parser from the grammar and
+`bun run base:generate` re-embeds the `base/` library; `bun run build` runs
+both. Edit anything under `base/` and re-run `base:generate`.
 
 ## CLI
 
@@ -192,13 +196,21 @@ The VS Code extension is built two ways:
 
 ## Set operations and record extension
 
-Queries compose with the pure set combinators `union`, `union_all`,
+Queries compose with the pure set combinators `union`, `unionAll`,
 `intersect`, and `except` exactly like any other pipeline step:
 
-    active_or_archived = active_users & union_all archived_users
+    active_or_archived = active_users & unionAll archived_users
 
 Both operands are complete relational expressions; a later `sort`/`take`
-runs on the combined result.
+runs on the combined result. `union` drops duplicate rows while `unionAll`
+keeps them, and a `distinct` step after either deduplicates the whole
+combined result:
+
+    active_or_archived = active_users & unionAll archived_users & distinct
+
+SQL set operands are matched positionally, so both sides need a known,
+matching schema — a bare `table "x"` must be annotated or narrowed with `map`
+first. `examples/set-operations.tetaue` works through all four combinators.
 
 To extend a row without repeating every column, use `merge` — it is the ONLY
 spelling:
@@ -264,27 +276,49 @@ main = users & take 2    # ok — columns are named
 main = table "users"     # ✗ strict schema: … would render SELECT *
 ```
 
-### Core and standard prelude
+### The `base` library and the Prelude
 
-The language is checked and evaluated by one shared pass (`checkProject`). Its
-TypeScript core is limited to SQL-aware primitives and scalar types, exposed
-as native builtin names (`filter`, `table`, `int`, ...). Reusable functional
-helpers (`id`, `const`, `flip`, the derived Maybe
-predicates, and the `_op_` bindings) live in
-[`prelude.tetaue`](prelude.tetaue) and are processed by the
-same parser, inference engine, and interpreter as application code; local
-bindings and imports may shadow them normally. Infix parsing
-and precedence stay in the grammar, while an expression such as `1 + 2`
-resolves the scoped `_+_` function defined by the prelude. See
-[`docs/design/core.md`](docs/design/core.md) for the boundary and extension
-rules.
+The standard library is organised the way Haskell's `base` is: a directory of
+ordinary tetaue modules, with a `Prelude` that every module gets
+automatically.
 
-Per-dialect lowering is also a prelude concern: `checkProject` seeds a
-first-class `sql_dialect` value (name + the canonical→SQL function map), and
-no-variance scalar functions such as `toUpper`/`toLower`/`length`/`trim`/`position`
-are ordinary prelude definitions over `sql_func`/`sql_infix` that branch on
-`sql_dialect.name` at analysis time. `toUpper`/`toLower` are provided as
-Haskell-flavored spellings. See
+```
+base/
+  prelude.tetaue        the auto-imported surface — a thin aggregator
+  sql.tetaue            the SQL surface + the scalar layer
+  sql/time.tetaue       the date/time layer: date parts, dateAdd, dateDiff,
+                        dateTrunc, dateFormat/dateParse, toUnixtime/fromUnixtime
+  data/function.tetaue  id, const, flip, compose, composeBack, apply
+  data/maybe.tetaue     isNothing, isJust, isNotNull
+```
+
+These are parsed, inferred, and evaluated by the same pipeline as application
+code, and local bindings or imports shadow them normally. `table "users"`,
+`filter (u => ...)`, `toUpper u.name`, and the `_+_` operator bindings are all
+**exported bindings of the library** rather than names an ambient environment
+supplies — which is what lets you import them by hand
+(`import "base/sql.tetaue" (length)`) and read their definitions. See
+[`docs/design/core.md`](docs/design/core.md) for the boundary rules.
+
+The TypeScript core keeps only what the library is *written in*: the primitive
+lowering vocabulary (`sql_func`, `sql_infix`, `sql_cast`, `sql_bare`,
+`sql_fragment`, `sql_literal`, `sql_literal_amount`, `sql_error`,
+`sql_dialect`, the `op_*` operator intrinsics) and the query-shape machinery
+(joins, sets, windows, recursive CTEs). Those names reach **base modules
+only**; a user module cannot reference `sql_func` at all, and completion never
+suggests it.
+
+Editing anything under `base/` requires `bun run base:generate`, which
+rewrites the embedded copy (`src/language/base-sources.ts`) that the
+CLI, the language server, and the standalone executables carry.
+
+Per-dialect lowering is a library concern: `checkProject` seeds a first-class
+`sql_dialect` value (name + the canonical→SQL function map), and
+`toUpper`/`toLower`/`length`/`trim`/`position`/`div`/`abs`/`ceil`/... are
+ordinary `base/sql.tetaue` definitions over `sql_func`/`sql_infix` that branch
+on `sql_dialect.name` at analysis time. The whole date/time family lives the
+same way in `base/sql/time.tetaue` — including which part/unit NAMES are valid,
+which the library rejects itself through `sql_error`. See
 [`docs/design/sql-dialect.md`](docs/design/sql-dialect.md).
 
 Numeric literals are polymorphic, Haskell-`fromIntegral`-style: `1 : Num t => t`
@@ -295,7 +329,7 @@ to a concrete type (`x = 1 : int`, `x = 1.5 : float`). Nullable and
 aggregate/window values must still be unwrapped before arithmetic.
 
 The `?` operator is relude-style unwrap-with-default: `u.email ? "n/a"` is
-`from_maybe "n/a" u.email` and lowers to `COALESCE(email, 'n/a')`.
+`fromMaybe "n/a" u.email` and lowers to `COALESCE(email, 'n/a')`.
 
 ```
 users: query { id: int, name: string, active: bool } = table "users"
@@ -521,8 +555,8 @@ u & filter ...        # pipeline: apply the step to the query
 and checked statically against every operation. `(maybe T)` is Haskell-style
 Maybe ("a `T` or SQL NULL") — write `email: (maybe string)` for a nullable
 column. There is **no implicit `T` -> `(maybe T)` conversion**: `null` has
-type `forall a. (maybe a)`, `is_null`/`is_not_null` test a maybe value,
-and `from_maybe default x` unwraps it (`COALESCE`). `just x` lifts a
+type `forall a. (maybe a)`, `isNull`/`isNotNull` test a maybe value,
+and `fromMaybe default x` unwraps it (`COALESCE`). `just x` lifts a
 non-null value into maybe, `nothing` is the maybe constant, and
 `fmap f x` lifts a function over a maybe, list, or query (`fmap toUpper email`,
 `fmap (x => x + 1) [1, 2]`, or `fmap (u => { id = u.id }) users`). The same
@@ -541,8 +575,8 @@ structural record merge. Consequently
 `add = x => y => x + y` stays numeric when generalized and cannot later be
 applied to strings.
 
-SQL three-valued predicates are explicit: `is_true x` and `is_false x` test
-the TRUE/FALSE branches, while `is_unknown x` tests SQL `NULL`. They accept
+SQL three-valued predicates are explicit: `isTrue x` and `isFalse x` test
+the TRUE/FALSE branches, while `isUnknown x` tests SQL `NULL`. They accept
 both `bool` and `(maybe bool)` and always return a non-null `bool`.
 
 Types are **builtin-only**: the scalar primitives (`int`, `float`, `decimal`,
@@ -590,7 +624,7 @@ type errors, so they never disagree.
 The type system encodes the SQL phases a query step lives in, so mode mistakes
 are static errors, not runtime surprises:
 
-- **Aggregates** (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `array`) have aggregate
+- **Aggregates** (`count`, `countDistinct`, `sum`, `avg`, `min`, `max`, `array`) have aggregate
   mode (`sum o.total : agg float`) and `group` has group mode
   (`group o.user_id : group int`). Every `fold` entry must use one of those
   modes, and the projection may contain groups, aggregates, or both. A plain
@@ -621,7 +655,7 @@ are static errors, not runtime surprises:
 | `distinct` | dedupe rows | `SELECT DISTINCT ...` |
 | `fold (o => { k = group o.k, s = sum o.v })` | grouping and/or aggregation | `SELECT ... GROUP BY ...` |
 | `joinInner table (this.id == that.user_id) { uid = this.id }` | inner join; `joinLeft`, `joinRight`, and `joinFull` select the outer variants | `... JOIN ... ON ...` |
-| `join_lateral (l => right) (l => r => on) (l => r => row)` | lateral join | `INNER JOIN LATERAL (...) ON ...` (PG/MySQL) |
+| `joinLateral (l => right) (l => r => on) (l => r => row)` | lateral join | `INNER JOIN LATERAL (...) ON ...` (PG/MySQL) |
 | `recursive (self => termQuery)` | fixed point | `WITH RECURSIVE ... UNION ALL ...` |
 
 Everything is curried: `filter (u => ...)` is a *step* value; applying it to a query
@@ -661,11 +695,11 @@ u.age >= 18 && u.active       # comparisons, && (AND), || (OR)
 u.name == null                 # → "name" IS NULL
 u.name != null                 # → "name" IS NOT NULL
 not u.active                   # NOT
-is_in u.id [1, 2, 3]           # IN
-is_not_in u.id [4, 5]          # NOT IN
+isIn u.id [1, 2, 3]           # IN
+isNotIn u.id [4, 5]          # NOT IN
 exists (orders & filter ...)   # correlated EXISTS subquery
 scalar (orders & ... & take 1) # scalar subquery, one nullable column
-in_query u.id (orders & map ...) # IN (SELECT ...)
+inQuery u.id (orders & map ...) # IN (SELECT ...)
 fmap toUpper u.email           # lift a function over (maybe T)
 0 <$ [1, 2]                    # [0, 0]
 (x => x + 1) <$> [1, 2]        # [2, 3]
@@ -678,18 +712,18 @@ coalesce u.nickname u.email    # COALESCE
 coalesce [u.nickname, u.email, just "?"]  # variadic list form
 abs u.balance                  # ABS
 count o.id  sum o.total  avg o.total  min o.x  max o.x   # aggregates (in fold)
-sum_where cond o.total  count_where cond o.id              # filtered aggregates
+sumWhere cond o.total  countWhere cond o.id              # filtered aggregates
 array o.tag                      # collect values into a list: ARRAY_AGG (trino/pg), COLLECT_LIST (hive), JSON_ARRAYAGG (mysql), JSON_GROUP_ARRAY (sqlite)
-current_date  current_timestamp   # CURRENT_DATE / CURRENT_TIMESTAMP (bare keywords)
-year u.created_at  month u.created_at  day u.created_at  day_of_week u.created_at
+currentDate  currentTimestamp   # CURRENT_DATE / CURRENT_TIMESTAMP (bare keywords)
+year u.created_at  month u.created_at  day u.created_at  dayOfWeek u.created_at
 hour u.created_at  minute u.created_at  second u.created_at
 extract u.created_at "month"   # generic date part (string literal)
-date_add u.created_at "day" (-7)         # DATE_ADD / INTERVAL, per dialect
-date_diff u.created_at "day" current_date
-date_trunc u.created_at "month"
-date_format u.created_at "%Y-%m-%d"      # dialect-native format string
-date_parse u.note "%Y-%m-%d"             # dialect-native format string
-to_unixtime u.created_at  from_unixtime u.id
+dateAdd u.created_at "day" (-7)         # DATE_ADD / INTERVAL, per dialect
+dateDiff u.created_at "day" currentDate
+dateTrunc u.created_at "month"
+dateFormat u.created_at "%Y-%m-%d"      # dialect-native format string
+dateParse u.note "%Y-%m-%d"             # dialect-native format string
+toUnixtime u.created_at  fromUnixtime u.id
 ceil u.balance  floor u.balance  sqrt u.balance  pow u.balance 2  mod u.id 3
 round u.balance 0                     # scale is required (0 = no rounding)
 greatest [u.a, u.b]  least [u.a, u.b]  # any number of arguments, one list
@@ -706,17 +740,20 @@ map (omit ["password_hash"])           # remove the listed fields (inside map); 
 trim u.name  reverse u.name  replace u.name "x" "y"
 substring u.name 1 (just 3)          # optional length (nothing omits); sqlite renders SUBSTR
 position u.name "a"                    # POSITION / LOCATE / INSTR, per dialect
-left_substring u.name 3  right_substring u.name 2
+leftSubstring u.name 3  rightSubstring u.name 2
 lpad u.code 8 "0"  rpad u.code 8 " "  # pad is required (SQL defaults to a space)
 like u.name "a%"                       # x LIKE pattern
-null_if u.name ""  is_null u.name  is_not_null u.name
-is_true u.flag  is_false u.flag  is_unknown u.flag
+nullIf u.name ""  isNull u.name  isNotNull u.name
+isTrue u.flag  isFalse u.flag  isUnknown u.flag
 case { u.active => u.name, _ => "inactive" }    # CASE WHEN active THEN name ELSE 'inactive' END
 case { u.age < 18 => "minor", u.age >= 65 => "senior", _ => "adult" }   # multi-branch; `_` is the fallback
 case u.code { "101" => "one", "102" => "two", _ => u.code }   # simple case: branches compare with the subject
-cast u.id "string"
-over row_number { partition = [u.dept], order = [desc u.salary] }   # window functions — parens optional for zero-arg fns
-over rank { partition = [u.dept] }          # rank / dense_rank / percent_rank
+cast u.id "string"                    # target named as a string literal (the primitive)
+asString u.id                        # the same cast as a unary helper — asInt / asFloat /
+                                      #   asDecimal / asString / asBool / asDate / asTimestamp
+asIntOrNull u.code                 # tryCast: NULL instead of an error when the cast fails
+over rowNumber { partition = [u.dept], order = [desc u.salary] }   # window functions — parens optional for zero-arg fns
+over rank { partition = [u.dept] }          # rank / denseRank / percentRank
 over (ntile 4) { partition = [u.dept] }     # multi-arg fns keep parens
 over (lag u.salary 1 nothing) { order = [asc u.joined] }   # lag / lead — offset required; default optional (nothing omits)
 over (sum u.salary) { partition = [u.dept] }        # windowed aggregates
@@ -815,7 +852,11 @@ any dialect. Functions use native names where available and compositional
 fallbacks elsewhere (for example SQLite `greatest`/`least` use `MAX`/`MIN`,
 `lpad`/`rpad` use `printf`/`substr`, and `reverse` uses a scalar recursive CTE).
 Backend-specific functions without a semantics-preserving lowering, including
-regular-expression helpers and `try_cast`, are not part of the common prelude.
+regular-expression helpers, are not part of the common prelude.
+`tryCast` IS in the common prelude: dialects with a native `TRY_CAST`
+(postgresql, mysql, trino, hive) render it directly, and SQLite — which has
+none — emulates the NULL-on-failure result by round-tripping the converted
+value back to TEXT and keeping it only when the conversion survives.
 Capability diagnostics are reserved for query-shape features that a backend
 cannot express natively, such as Hive recursive CTEs or a dialect's missing
 lateral join form; they are reported before SQL text is emitted.
@@ -910,16 +951,18 @@ spawns the server, wires Render-on-Save and the render command.
 src/language/
   tetaue.langium        # grammar
   generated/            # generated by `bun run langium:generate` (langium-cli)
-  builtin.ts            # single source of truth: builtin names, schemes, aliases
+  base-sources.ts       # generated by `bun run base:generate` — the embedded base library
+  builtin.ts            # single source of truth: primitive names, schemes, aliases
   catalog.ts            # compatibility re-export of builtin.ts
+  prelude.ts            # loads the base library (base/*.tetaue) and exposes it
   checker.ts            # single typed-IR/checker pass (IR construction + type inference)
   interpreter.ts        # symbolic evaluator: curried builtins, query steps, diagnostics
   optimize.ts           # pure, dialect-independent query normalization/rewrites
   capabilities.ts       # pure dialect capability preflight for normalized queries
   types.ts              # type engine: HM unification, rows, `(maybe T)`, `?hole`s
-  inference.ts          # type inference engine: prelude schemes, annotations, diagnostics
+  inference.ts          # type inference engine: primitive schemes, annotations, diagnostics
   imports.ts            # multi-file module resolution (cycles, missing files)
-  resolve.ts            # relative-path import resolution (no package layer)
+  resolve.ts            # relative-path + `base/...` import resolution (no package layer)
   module-cache.ts       # memoized, budgeted loader for imported modules (size limits, CST dropping)
   render.ts             # SQL renderer + dialect specs
   compile.ts            # shared compile pipeline (CLI + language server)
@@ -931,7 +974,8 @@ src/cli.ts              # render / check / types / parse / format / build / watc
 bin/tetaue.ts           # `tetaue` executable (bun shebang)
 extension/              # VS Code extension (client, manifest, grammar, packaging)
 test/                   # bun test suite (incl. an end-to-end LSP test)
-examples/               # runnable example modules (incl. multi-file report.tetaue, joins.tetaue, case.tetaue)
+examples/               # runnable example modules (incl. multi-file report.tetaue, joins.tetaue, case.tetaue, set-operations.tetaue)
+base/                   # the standard library: Prelude, Sql, Sql/time, data/function, data/maybe
 ```
 
 The interpreter builds the symbolic query IR, the pure optimizer normalizes it,
@@ -944,9 +988,11 @@ builds the typed SQL IR and returns exact-deduped diagnostics — so `check` and
 ## Roadmap
 
 - external schema/catalog declarations and a strict-schema project mode
-- user-declared type classes and instances (the compiler currently owns closed
-  `Num`, `Eq`, `Ord`, `Semigroup`, `Monoid`, `Functor`, `Applicative`,
-  `Alternative`, and `Monad` instances)
+- user-declared type classes and instances (container operations are currently
+  closed over maybe values, lists, and queries; numeric operations are
+  per-type overloading, not a `Num` class)
+- richer `base/`: more of the scalar surface moved out of the
+  TypeScript core, and further `Data.*` modules
 - query cardinality types for scalar and singleton subqueries
 - more pure optimizer rewrites: projection pruning and safe predicate
   pushdown (named intermediates already render as `WITH` CTEs, so subqueries

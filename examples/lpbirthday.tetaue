@@ -1,4 +1,4 @@
-yesterday = date_add current_date "day" (-1)
+yesterday = dateAdd currentDate "day" (-1)
 
 # Simple case: `case subject { value => result, ..., _ => fallback }` is sugar
 # for `case { subject == value => result, ... }` (SQL's CASE subject WHEN ...).
@@ -56,7 +56,7 @@ table "ecs.dcm_ecs_p_ecis_m_tb1010_sf_f"
 
 corpBirthday = custRelation
   & joinLeft customerBirthday (u => v => u.p_cino == v.customer_number) merge # (this <> that)
-  & filter (is_in (from_maybe "" this.c_cino) ["11114343"])
+  & filter (isIn (fromMaybe "" this.c_cino) ["11114343"])
 
 # corpBirthday is this module's query.
 main = corpBirthday

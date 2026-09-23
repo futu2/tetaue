@@ -373,6 +373,33 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
             // An unquoted SQL word (EXTRACT(YEAR FROM x) needs YEAR, not
             // 'YEAR') emitted by the sql_bare lowering primitive.
             return parenIf(node.name, precOf('ATOM'), parentPrec);
+        case 'fragment': {
+            // An uninterpreted SQL fragment from `sql_fragment`: the template's
+            // literal text with each `{}` replaced by its rendered argument.
+            // `{{` / `}}` are escaped literal braces. A `{:}` hole renders its
+            // argument BARE — the SQL text of a string without quoting — which
+            // is how a computed SQL KEYWORD reaches the output (`INTERVAL 7
+            // {}` needs `DAY`, not `'DAY'`). The result is opaque SQL, so it
+            // renders at ATOM precedence — a caller that needs parentheses
+            // writes them in the template (`"({})"`).
+            let index = 0;
+            const text = node.template.replace(/\{\{|\}\}|\{:\}|\{\}/g, match => {
+                if (match === '{{') return '{';
+                if (match === '}}') return '}';
+                const arg = node.args[index++]!;
+                if (match === '{:}') {
+                    // A bare word: the literal's own text, unquoted. A
+                    // non-literal argument is a programming error in the
+                    // library, not in a user module, so it renders as SQL text
+                    // rather than being silently dropped.
+                    return arg.kind === 'lit' && typeof arg.value === 'string'
+                        ? arg.value
+                        : renderExpr(arg, ctx, precOf('CALL'));
+                }
+                return renderExpr(arg, ctx, precOf('CALL'));
+            });
+            return parenIf(text, precOf('ATOM'), parentPrec);
+        }
         case 'bin': {
             const prec = precOf(node.op) || 3;
             // Comparisons are non-associative in SQL: parenthesize nested comparisons.
@@ -397,7 +424,7 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
             if (special !== null) {
                 return parenIf(special, precOf('CALL'), parentPrec);
             }
-            const name = ctx.dialect.functions[node.name as BuiltinName] ?? node.name.toUpperCase();
+            const name = defaultSqlName(node.name, ctx.dialect);
             const text = `${name}(${node.args.map(a => renderExpr(a, ctx)).join(', ')})`;
             return parenIf(text, precOf('CALL'), parentPrec);
         }
@@ -428,14 +455,16 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
         }
         case 'agg': {
             const arg = renderExpr(node.arg, ctx);
-            if (node.name === 'count_distinct') {
+            if (node.name === 'countDistinct') {
                 const text = node.filter
                     ? `COUNT(DISTINCT CASE WHEN ${renderExpr(node.filter, ctx)} THEN ${arg} END)`
                     : `COUNT(DISTINCT ${arg})`;
                 return parenIf(text, precOf('CALL'), parentPrec);
             }
-            const baseName = node.name.endsWith('_where') ? node.name.slice(0, -6) : node.name;
-            const name = ctx.dialect.functions[baseName as BuiltinName] ?? baseName.toUpperCase();
+            // `countWhere`/`sumWhere`/... are the filtered forms of the plain
+            // aggregate: strip the `Where` suffix so one lookup serves both.
+            const baseName = node.name.endsWith('Where') ? node.name.slice(0, -'Where'.length) : node.name;
+            const name = defaultSqlName(baseName, ctx.dialect);
             if (!node.filter) {
                 const text = `${name}(${arg})`;
                 return parenIf(text, precOf('CALL'), parentPrec);
@@ -481,7 +510,7 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
 // --- date & time lowering --------------------------------------------------
 // The general SQL date/time function set (teta's spec §4): every function has
 // one tetaue name and a per-dialect lowering — direct, mapped, or fallback.
-// Formats (`date_format`/`date_parse`) are dialect-native: pass the format
+// Formats (`dateFormat`/`dateParse`) are dialect-native: pass the format
 // string the target database expects (e.g. Trino/MySQL `%Y-%m-%d`,
 // PostgreSQL `YYYY-MM-DD`, Hive `yyyy-MM-dd`).
 // ---------------------------------------------------------------------------
@@ -539,6 +568,42 @@ const LOWERINGS: ReadonlyMap<string, Lowering> = (() => {
     return map;
 })();
 
+/**
+ * The SQL word for a builtin whose tetaue name is not the SQL name in upper
+ * case (`rowNumber` -> `ROW_NUMBER`, `currentDate` -> `CURRENT_DATE`,
+ * `isNull` -> `IS NULL`), derived from the specs' `sqlName`.
+ *
+ * Names absent from the map fall back to `name.toUpperCase()`, which is
+ * correct for the SQL-identical builtins (`sum`, `count`, `rank`) — and for
+ * any name that is not a builtin at all (the `sql_func "UPPER" [...]` escape
+ * hatch, whose written name IS the SQL word).
+ *
+ * Aliases are registered under their own spelling for the same reason as
+ * `LOWERINGS`: the evaluator keeps the WRITTEN name in the call node.
+ */
+const SQL_NAMES: ReadonlyMap<string, string> = (() => {
+    const map = new Map<string, string>();
+    const specs: readonly BuiltinSpec[] = BUILTIN_SPECS;
+    for (const spec of specs) {
+        if (spec.sqlName) map.set(spec.name, spec.sqlName);
+    }
+    for (const [alias, target] of Object.entries(BUILTIN_ALIASES)) {
+        const sqlName = map.get(target);
+        if (sqlName) map.set(alias, sqlName);
+    }
+    return map;
+})();
+
+/** The SQL word for a call/flip `name`, or null when the upper-cased name is it. */
+function sqlNameOf(name: string): string | null {
+    return SQL_NAMES.get(name) ?? null;
+}
+
+/** The default `NAME(args)` function word for a tetaue builtin name. */
+function defaultSqlName(name: string, dialect: DialectSpec): string {
+    return dialect.functions[name as BuiltinName] ?? sqlNameOf(name) ?? name.toUpperCase();
+}
+
 function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): string | null {
     const lower = LOWERINGS.get(node.name);
     if (!lower) return null; // no special form: the default NAME(...) path
@@ -595,7 +660,14 @@ function renderSetQuery(q: Query, dialect: DialectSpec, format: RenderFormat, di
         });
         return 'SELECT NULL';
     }
-    const left: Query = { ...q, steps: q.steps.slice(0, index) };
+    // `distinct` is a property of the COMBINED result, not of the left
+    // operand: `a & unionAll b & distinct` means "deduplicate the union".
+    // Leaving it on `left` would render `SELECT DISTINCT ... FROM a UNION ALL
+    // ... FROM b`, where DISTINCT applies to the left operand alone and the
+    // right operand's duplicates survive. Peel it off here and re-apply it to
+    // the whole set expression below.
+    const distinct = q.distinct;
+    const left: Query = { ...q, distinct: false, steps: q.steps.slice(0, index) };
     const right = step.right;
 
     // SQL set operations match columns POSITIONALLY, while tetaue rows are
@@ -633,7 +705,14 @@ function renderSetQuery(q: Query, dialect: DialectSpec, format: RenderFormat, di
     };
     const leftOp = wrap(leftSql, '_tetaue_left');
     const rightOp = wrap(rightSql, '_tetaue_right');
-    return format === 'pretty' ? `${leftOp}\n${step.op}\n${rightOp}` : `${leftOp} ${step.op} ${rightOp}`;
+    const setSql = format === 'pretty' ? `${leftOp}\n${step.op}\n${rightOp}` : `${leftOp} ${step.op} ${rightOp}`;
+    if (!distinct) return setSql;
+    // A `distinct` over the set operation deduplicates the combined rows, so
+    // it must wrap the whole UNION/INTERSECT/EXCEPT rather than either operand.
+    const aliasSql = dialect.quoteIdentifier('_tetaue_distinct');
+    return format === 'pretty'
+        ? `SELECT DISTINCT ${columns}\nFROM (\n${indentLines(setSql, INDENT)}\n) AS ${aliasSql}`
+        : `SELECT DISTINCT ${columns} FROM (${setSql}) AS ${aliasSql}`;
 }
 
 // --- query rendering -------------------------------------------------------

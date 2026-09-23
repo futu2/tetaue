@@ -1,0 +1,107 @@
+# Set operations — union, unionAll, intersect, except.
+#
+# A set combinator is a curried function (`query -> query -> query`) used as a
+# pipeline step, so the left operand is whatever the pipeline has built so far
+# and the right operand is passed as its argument:
+#
+#     left & unionAll right      -- left UNION ALL right
+#
+# `union` and `unionAll` differ ONLY in deduplication, exactly as in SQL:
+#
+#   union       UNION      — removes duplicate rows (a set union)
+#   unionAll   UNION ALL  — keeps every row, duplicates included (a bag union)
+#
+# Because `unionAll` keeps duplicates, it is the cheaper operation: no sort or
+# hash is needed to deduplicate, so prefer it whenever the duplicates are
+# expected or already excluded (e.g. two date ranges of the same table).
+#
+# IMPORTANT — SQL matches set-operand columns POSITIONALLY, while tetaue rows
+# are unordered records. The renderer therefore projects an explicit, shared
+# column order on BOTH operands, which requires each operand to have a KNOWN
+# schema. A bare `table "x"` with no annotation has an unknown schema and is
+# rejected as a set operand — annotate it, or project it with `map` first.
+
+# Two slices of the same shape: live users and archived users. They overlap
+# on purpose (both hold Ada and Bo), so the difference between `union` and
+# `unionAll` is visible on real rows. The annotations give both operands the
+# same schema, in the same order.
+live: query {
+    id: int,
+    name: string,
+    active: bool,
+} = table "users"
+
+legacy: query {
+    id: int,
+    name: string,
+    active: bool,
+} = table "archived"
+
+# --- unionAll: keep everything ------------------------------------------
+# Rows from both sides together, duplicates preserved. `sort`/`take` after the
+# set run on the COMBINED result, not on one operand — a set operation is a
+# complete relational expression, so the pipeline continues from its output.
+everyone = live
+    & unionAll legacy
+    & sort (u => [asc u.id, asc u.name])
+    & take 25
+
+# --- union: deduplicate ---------------------------------------------------
+# Same operands, but the duplicate rows are collapsed. `users` and `archived`
+# share Ada (id 1) and Bo (id 3) with the same name/active, so `unionAll`
+# returns each of those twice while `union` returns them once.
+distinct_everyone = live
+    & union legacy
+    & sort (u => [asc u.id, asc u.name])
+
+# --- distinct after a set -------------------------------------------------
+# `distinct` is a separate step that deduplicates the COMBINED result, so it
+# agrees with `union` on the same operands:
+#
+#     live & union   legacy              -- 4 rows (Ada and Bo once each)
+#     live & unionAll legacy            -- 6 rows (Ada and Bo twice)
+#     live & unionAll legacy & distinct -- 4 rows, the same as `union`
+#
+# The point is worth stating explicitly because the naive lowering
+# (`SELECT DISTINCT ... FROM live UNION ALL ...`) would apply DISTINCT to
+# the LEFT OPERAND ONLY and silently keep the right operand's duplicates.
+# tetaue wraps the whole set expression instead, so the deduplication covers
+# every combined row.
+bagdedup = live
+    & unionAll legacy
+    & distinct
+    & sort (u => [asc u.id, asc u.name])
+
+# --- intersect and except -------------------------------------------------
+# The other two set operations are spelled the same way and require the same
+# conditions (known, matching schemas). Hive supports UNION and UNION ALL but
+# NOT INTERSECT or EXCEPT — those are rejected with a dialect diagnostic at
+# render time for the `hive` dialect.
+both = live & intersect legacy
+only_live = live & except legacy
+
+# --- operands are arbitrary relational expressions ------------------------
+# Either side may be a full pipeline. Here both are filtered and projected to
+# the same shape, so the set operation combines their results. A named
+# intermediate used as an operand renders as a `WITH` CTE and is reused rather
+# than duplicated.
+active_users_step = live
+    & filter (u => u.active)
+    & map (u => { id = u.id, name = u.name })
+
+active_archived_step = legacy
+    & filter (u => u.active)
+    & map (u => { id = u.id, name = u.name })
+
+active_everyone = active_users_step
+    & unionAll active_archived_step
+    & sort (u => [asc u.id, asc u.name])
+
+# --- one module runs ONE query --------------------------------------------
+# The bindings above are library-style (exported or not, they are all reachable
+# by name). Only `main` is the module's query, so the others are rendered by
+# asking for them explicitly:
+#
+#   tetaue render examples/set-operations.tetaue --binding distinct_everyone
+#   tetaue render examples/set-operations.tetaue --binding only_live --dialect postgresql
+main = everyone

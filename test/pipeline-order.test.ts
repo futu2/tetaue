@@ -77,7 +77,7 @@ describe('window projections create a derived-table boundary', () => {
         db.run("INSERT INTO t VALUES ('a', 10), ('a', 20), ('b', 5)");
         const sql = render(`
             t: query { dept: string, salary: int } = table "t"
-            q = t & map (u => { rn = over row_number { partition = [u.dept], order = [desc u.salary] } })
+            q = t & map (u => { rn = over rowNumber { partition = [u.dept], order = [desc u.salary] } })
                   & filter (u => u.rn == 1)
         `);
         expect(sql).toContain('FROM t_1 AS t\nWHERE rn = 1');
@@ -131,15 +131,15 @@ describe('dialect capability fixes execute on SQLite', () => {
     });
 });
 
-describe('count_distinct aggregate', () => {
+describe('countDistinct aggregate', () => {
     test('renders COUNT(DISTINCT ...) and type-checks as an aggregate', () => {
         const db = new Database(':memory:');
         db.run('CREATE TABLE t (g int, v text)');
         db.run("INSERT INTO t VALUES (1, 'a'), (1, 'a'), (1, 'b')");
-        const sql = render(`t: query { g: int, v: string } = table "t"\nq = t & fold (u => { g = group u.g, n = count_distinct u.v })`);
+        const sql = render(`t: query { g: int, v: string } = table "t"\nq = t & fold (u => { g = group u.g, n = countDistinct u.v })`);
         expect(sql).toContain('COUNT(DISTINCT v) AS n');
         expect(db.query(sql).get()).toEqual({ g: 1, n: 2 });
-        expect(typeErrors(`t: query { g: int, v: string } = table "t"\nq = t & fold (u => { g = group u.g, n = count_distinct u.v })`)).toEqual([]);
+        expect(typeErrors(`t: query { g: int, v: string } = table "t"\nq = t & fold (u => { g = group u.g, n = countDistinct u.v })`)).toEqual([]);
     });
 });
 

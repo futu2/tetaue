@@ -72,7 +72,7 @@ describe('CTE rendering', () => {
         // reference site must re-apply its own alias (`FROM detail AS
         // first_buy`) or ON/WHERE qualifiers point at a missing table.
         const src = `tx: query { cust_id: int, tx_dt: date } = table "tx"
-detail = tx & map (d => { customer_number = d.cust_id, buy_order = over row_number { partition = [d.cust_id], order = [asc d.tx_dt] } })
+detail = tx & map (d => { customer_number = d.cust_id, buy_order = over rowNumber { partition = [d.cust_id], order = [asc d.tx_dt] } })
 first_buy = detail & filter (d => d.buy_order == 1)
 q = first_buy & joinLeft first_buy (l => r => l.customer_number == r.customer_number) (l => r => merge l r)`;
         const model = parseModel(src);
@@ -94,7 +94,7 @@ q = first_buy & joinLeft first_buy (l => r => l.customer_number == r.customer_nu
         const src = `users: query { id: int } = table "users"
 orders: query { user_id: int, total: float } = table "orders"
 ranked = orders & fold (o => { user_id = group o.user_id, total = sum o.total })
-q = users & join_lateral (l => (ranked & filter (r => r.user_id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })`;
+q = users & joinLateral (l => (ranked & filter (r => r.user_id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })`;
         const model = parseModel(src);
         const { value } = analyze(model, standardPrelude(services));
         expect(value.kind).toBe('query');
@@ -111,7 +111,7 @@ q = users & join_lateral (l => (ranked & filter (r => r.user_id == l.id))) (l =>
 describe('pure set combinators', () => {
     test('union/intersect/except render SQL set operations', () => {
         expect(render(`${USERS_A}\n${USERS_B}\nq = a & union b`, 'postgresql')).toContain('UNION');
-        expect(render(`${USERS_A}\n${USERS_B}\nq = a & union_all b`, 'postgresql')).toContain('UNION ALL');
+        expect(render(`${USERS_A}\n${USERS_B}\nq = a & unionAll b`, 'postgresql')).toContain('UNION ALL');
         expect(render(`${USERS_A}\n${USERS_B}\nq = a & intersect b`, 'postgresql')).toContain('INTERSECT');
         expect(render(`${USERS_A}\n${USERS_B}\nq = a & except b`, 'postgresql')).toContain('EXCEPT');
     });
@@ -120,7 +120,7 @@ describe('pure set combinators', () => {
         const sql = render(
             `a: query { id: int, name: string } = table "a"
              b: query { name: string, id: int } = table "b"
-             q = a & union_all b`,
+             q = a & unionAll b`,
             'postgresql',
         );
         expect(sql).toContain('SELECT id, name');
@@ -140,9 +140,40 @@ q = a & joinFull b (l => r => l.id == r.id) (l => r => { id = l.id })`;
     });
 
     test('steps after a set run on the combined result', () => {
-        const sql = render(`${USERS_A}\n${USERS_B}\nq = a & union_all b & sort (r => [asc r.id])`, 'postgresql');
+        const sql = render(`${USERS_A}\n${USERS_B}\nq = a & unionAll b & sort (r => [asc r.id])`, 'postgresql');
         expect(sql).toContain('UNION ALL');
         expect(sql).toContain('ORDER BY id ASC');
+    });
+
+    test('distinct after a set deduplicates the COMBINED result', () => {
+        // `distinct` belongs to the set's output, not to the left operand: a
+        // lowering that spread it onto `left` emitted
+        // `SELECT DISTINCT ... FROM a UNION ALL ...` and kept the right
+        // operand's duplicates. The DISTINCT must wrap the whole set instead.
+        const sql = render(`${USERS_A}\n${USERS_B}\nq = a & unionAll b & distinct`, 'postgresql', 'compact');
+        expect(sql).toContain('UNION ALL');
+        expect(sql.startsWith('SELECT DISTINCT')).toBe(true);
+        // The left operand itself must NOT be deduplicated on its own.
+        expect(sql).not.toContain('(SELECT DISTINCT id, name FROM a)');
+    });
+
+    test('distinct composes with every set operator', () => {
+        for (const op of ['union', 'unionAll', 'intersect', 'except']) {
+            const sql = render(`${USERS_A}\n${USERS_B}\nq = a & ${op} b & distinct`, 'postgresql', 'compact');
+            expect(sql.startsWith('SELECT DISTINCT'), `${op}: ${sql}`).toBe(true);
+        }
+    });
+
+    test('a distinct on the left operand alone still deduplicates only it', () => {
+        // `(a & distinct) & unionAll b` must keep b's duplicates: the
+        // DISTINCT applies to `a` before the union, not to the result. The
+        // deduplicated left operand is hoisted into a CTE and the set itself
+        // stays a plain UNION ALL.
+        const sql = render(`${USERS_A}\n${USERS_B}\nq = (a & distinct) & unionAll b`, 'postgresql', 'compact');
+        expect(sql).toContain('SELECT DISTINCT id, name FROM a');
+        expect(sql).toContain('UNION ALL');
+        expect(sql.trimEnd().endsWith('UNION ALL SELECT id, name FROM (SELECT id, name FROM b) AS _tetaue_right')).toBe(true);
+        expect(sql).not.toContain('_tetaue_distinct');
     });
 });
 
@@ -203,6 +234,6 @@ describe('set-operation capabilities', () => {
 
     test('hive still supports UNION and UNION ALL', () => {
         expect(render(`${USERS_A}\n${USERS_B}\nq = a & union b`, 'hive')).toContain('UNION');
-        expect(render(`${USERS_A}\n${USERS_B}\nq = a & union_all b`, 'hive')).toContain('UNION ALL');
+        expect(render(`${USERS_A}\n${USERS_B}\nq = a & unionAll b`, 'hive')).toContain('UNION ALL');
     });
 });

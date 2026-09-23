@@ -76,6 +76,10 @@ function optimizeExpr(node: SqlNode, state: OptimizeState): SqlNode {
             const args = node.args.map(arg => optimizeExpr(arg, state));
             return args.every((arg, i) => arg === node.args[i]) ? node : { ...node, args };
         }
+        case 'fragment': {
+            const args = node.args.map(arg => optimizeExpr(arg, state));
+            return args.every((arg, i) => arg === node.args[i]) ? node : { ...node, args };
+        }
         case 'in': {
             const expr = optimizeExpr(node.expr, state);
             const list = node.list.map(item => optimizeExpr(item, state));

@@ -22,6 +22,7 @@ const EXAMPLES = [
     'examples/orders.tetaue',
     'examples/report.tetaue',
     'examples/selective.tetaue',
+    'examples/set-operations.tetaue',
     'examples/strings.tetaue',
     'examples/lib-project/main.tetaue',
 ];

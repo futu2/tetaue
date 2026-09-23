@@ -31,7 +31,8 @@ import {
 export { missingBindingExpressionMessage, recursiveBindingMessage, topoOrderBindings };
 export type { Diagnostic, DialectView };
 import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
-import { PRELUDE_NAMESPACES } from './prelude-namespaces.js';
+import { CORE_NAMESPACE, PRELUDE_NAMESPACES } from './prelude-namespaces.js';
+import { baseClosureFor } from './prelude.js';
 import { TypeUniverse } from './types.js';
 import type { Type } from './types.js';
 import {
@@ -209,6 +210,24 @@ function stringValue(v: Value): string | null {
 }
 
 /**
+ * The number of holes in a `sql_fragment` template. A hole is `{}` (rendered
+ * argument) or `{:}` (the same, but bare — the SQL word of a string without
+ * quoting). `{{`/`}}` are escaped literal braces and do not open a hole,
+ * matching the format-string escape used elsewhere in the language, so
+ * `"a {{}} b {}"` has exactly one hole.
+ */
+function fragmentHoles(template: string): number {
+    let holes = 0;
+    for (let i = 0; i < template.length; i++) {
+        if (template[i] !== '{') continue;
+        if (template[i + 1] === '{') { i++; continue; }  // `{{` — a literal brace
+        if (template[i + 1] === '}') { holes++; i++; continue; }
+        if (template[i + 1] === ':' && template[i + 2] === '}') { holes++; i += 2; }
+    }
+    return holes;
+}
+
+/**
  * The string a rename key-rule result denotes, constant-folding literal
  * `concat` chains (`"user_" <> k` with k a string literal folds to
  * "user_id"). A column NAME is a compile-time string — a rule that still
@@ -286,7 +305,7 @@ function listNumericFold(op: '+' | '*', start: number, type: SqlType, xs: { kind
 }
 
 /** SQL three-valued logic predicates; all return a non-null boolean. */
-function truthPredicateBuiltin(name: 'is_true' | 'is_false' | 'is_unknown'): () => Value {
+function truthPredicateBuiltin(name: 'isTrue' | 'isFalse' | 'isUnknown'): () => Value {
     return () => fn(name, (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node || (node.type !== 'bool' && node.type !== 'null' && node.type !== 'unknown')) {
@@ -331,6 +350,7 @@ function forEachNode(node: SqlNode, visit: (n: SqlNode) => void): void {
             if (node.filter) forEachNode(node.filter, visit);
             break;
         case 'call': node.args.forEach(a => forEachNode(a, visit)); break;
+        case 'fragment': node.args.forEach(a => forEachNode(a, visit)); break;
         case 'window':
             forEachNode(node.fn, visit);
             node.partition.forEach(p => forEachNode(p, visit));
@@ -1031,7 +1051,7 @@ function mapStepFromTransformer(q: Query, f: Value, at: AstNode | undefined, ctx
         ctx.diagnostics.push({ node: at ?? f.ast, message: `map projection must contain at least one field` });
         return null;
     }
-    // Window-only functions (row_number, rank, lag, ...) are invalid outside
+    // Window-only functions (rowNumber, rank, lag, ...) are invalid outside
     // `over (...)` — catch them here so they never render broken SQL.
     if (validateWindowUses(proj.fields, at ?? f.ast, ctx)) return null;
     return addStep(q, { kind: 'map', proj }, at);
@@ -1179,7 +1199,7 @@ function access(recv: Value, prop: string, at: AstNode, ctx: Ctx): Value {
  * `that` outward: `filter (P1) $ filter (P2) s03` keeps the `this` inside
  * the inner `filter`'s predicate instead of abstracting the whole `$`-right
  * operand into a lambda. VALUE-position `this`/`that` arguments (like
- * `cast this.pt_dt` or `is_in (from_maybe "" this.x) [...]`) bubble up to
+ * `cast this.pt_dt` or `isIn (fromMaybe "" this.x) [...]`) bubble up to
  * the enclosing expression's implicit lambda.
  */
 function dollarArity(node: AstNode, env: ReadonlyMap<string, Value>): number {
@@ -1522,9 +1542,19 @@ function evalHirInner(h: Hir, ctx: Ctx): Value {
                 ctx.diagnostics.push({ node: h.at, message: `unknown identifier '${h.name}' — bindings must be defined before use` });
                 return ERROR;
             }
-            // Builtins and hidden operator intrinsics are never worth listing.
-            const known = [...ctx.env.keys()].filter(k => !Object.hasOwn(BUILTINS, k) && !isOperatorIntrinsicName(k));
-            ctx.diagnostics.push({ node: h.at, message: `unknown identifier '${h.name}'${known.length ? ` — defined: ${known.join(', ')}` : ''}` });
+            // Suggest corrections from the SMALL, relevant part of the scope:
+            // the module's own bindings and its imports. Builtins, hidden
+            // operator intrinsics, and the base library's surface are never
+            // worth listing — the Prelude alone is dozens of names, and a
+            // "defined: ..." list that long hides the one name the user meant.
+            const excluded = new Set<string>(Object.keys(BUILTINS));
+            const suggestions = [...ctx.env.keys()]
+                .filter(k => !excluded.has(k) && !isOperatorIntrinsicName(k))
+                .slice(0, 8);
+            const suffix = suggestions.length > 0
+                ? ` — did you mean one of: ${suggestions.join(', ')}?`
+                : '';
+            ctx.diagnostics.push({ node: h.at, message: `unknown identifier '${h.name}'${suffix}` });
             return ERROR;
         }
     }
@@ -1675,6 +1705,7 @@ function sqlNodeReferences(node: SqlNode, target: SqlNode): boolean {
             return sqlNodeReferences(node.fn, target)
                 || node.partition.some(part => sqlNodeReferences(part, target))
                 || node.order.some(item => sqlNodeReferences(item.node, target));
+        case 'fragment': return node.args.some(a => sqlNodeReferences(a, target));
         case 'case':
             return node.branches.some(branch => sqlNodeReferences(branch.cond, target) || sqlNodeReferences(branch.value, target))
                 || (node.elseValue ? sqlNodeReferences(node.elseValue, target) : false);
@@ -1750,7 +1781,7 @@ function step(name: string, impl: (q: Query, at: AstNode | undefined, ctx: Ctx) 
     } };
 }
 
-/** A set operation: `left & union right`, `intersect`, `except`, `union_all`. */
+/** A set operation: `left & union right`, `intersect`, `except`, `unionAll`. */
 function setOpBuiltin(name: string, op: SetOp): () => Value {
     return () => fn(name, (right, at, ctx) => {
         if (right.kind !== 'query') {
@@ -2035,12 +2066,12 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     }),
 
     // --- set operations (pure query -> query combinators) -------------
-    // left & union right, left & union_all right, left & intersect right,
+    // left & union right, left & unionAll right, left & intersect right,
     // and left & except right render as SQL set operations. Both operands
     // are complete relational expressions; later steps wrap the combined
     // result as a derived table.
     union: setOpBuiltin('union', 'UNION'),
-    union_all: setOpBuiltin('union_all', 'UNION ALL'),
+    unionAll: setOpBuiltin('unionAll', 'UNION ALL'),
     intersect: setOpBuiltin('intersect', 'INTERSECT'),
     except: setOpBuiltin('except', 'EXCEPT'),
 
@@ -2238,26 +2269,26 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         });
     }),
 
-    join_lateral: () => fn('join_lateral', (rightFn, at, ctx) => {
+    joinLateral: () => fn('joinLateral', (rightFn, at, ctx) => {
         if (!isApplicable(rightFn)) {
-            ctx.diagnostics.push({ node: at ?? rightFn.ast, message: `join_lateral expects a function l => query as its first argument` });
+            ctx.diagnostics.push({ node: at ?? rightFn.ast, message: `joinLateral expects a function l => query as its first argument` });
             return ERROR;
         }
-        return fn('join_lateral', (on, at2, ctx2) => {
+        return fn('joinLateral', (on, at2, ctx2) => {
             if (!isApplicable(on)) {
-                ctx2.diagnostics.push({ node: at2 ?? on.ast, message: `join_lateral 'on' must be a two-argument function (curried)` });
+                ctx2.diagnostics.push({ node: at2 ?? on.ast, message: `joinLateral 'on' must be a two-argument function (curried)` });
                 return ERROR;
             }
-            return fn('join_lateral', (merger, at3, ctx3) => {
+            return fn('joinLateral', (merger, at3, ctx3) => {
                 if (!isApplicable(merger)) {
-                    ctx3.diagnostics.push({ node: at3 ?? merger.ast, message: `join_lateral 'merger' must be a two-argument function (curried)` });
+                    ctx3.diagnostics.push({ node: at3 ?? merger.ast, message: `joinLateral 'merger' must be a two-argument function (curried)` });
                     return ERROR;
                 }
-                return step('join_lateral', (q, at4, ctx4) => {
+                return step('joinLateral', (q, at4, ctx4) => {
                     const leftRow = rowRecord(q, at4);
                     const right = applyWith(rightFn, leftRow, at4, ctx4);
                     if (isError(right) || right.kind !== 'query') {
-                        if (!isError(right)) ctx4.diagnostics.push({ node: at4 ?? rightFn.ast, message: `join_lateral right side must evaluate to a query, got ${describe(right)}` });
+                        if (!isError(right)) ctx4.diagnostics.push({ node: at4 ?? rightFn.ast, message: `joinLateral right side must evaluate to a query, got ${describe(right)}` });
                         return null;
                     }
                     const baseAlias = right.query.name ?? (right.query.root.name.split('.').at(-1) ?? right.query.root.name);
@@ -2272,28 +2303,28 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
 
                     const on1 = applyWith(on, leftRow, at4, ctx4);
                     if (isError(on1) || !isApplicable(on1)) {
-                        ctx4.diagnostics.push({ node: at4 ?? on.ast, message: `join_lateral 'on' must be a two-argument function (curried)` });
+                        ctx4.diagnostics.push({ node: at4 ?? on.ast, message: `joinLateral 'on' must be a two-argument function (curried)` });
                         return null;
                     }
                     const onVal = applyWith(on1, rightRow, at4, ctx4);
                     const onNode = exprNode(onVal);
                     if (!onNode || (onNode.type !== 'bool' && onNode.type !== 'unknown')) {
-                        ctx4.diagnostics.push({ node: at4 ?? on.ast, message: `join_lateral 'on' condition must be a boolean expression, got ${onNode ? `type ${typeName(onNode.type)}` : describe(onVal)}` });
+                        ctx4.diagnostics.push({ node: at4 ?? on.ast, message: `joinLateral 'on' condition must be a boolean expression, got ${onNode ? `type ${typeName(onNode.type)}` : describe(onVal)}` });
                         return null;
                     }
-                    if (forbid(onNode, ['agg', 'group', 'order', 'window'], 'the join_lateral condition', at4 ?? on.ast, ctx4)) return null;
+                    if (forbid(onNode, ['agg', 'group', 'order', 'window'], 'the joinLateral condition', at4 ?? on.ast, ctx4)) return null;
 
                     const m1 = applyWith(merger, leftRow, at4, ctx4);
                     if (isError(m1) || !isApplicable(m1)) {
-                        ctx4.diagnostics.push({ node: at4 ?? merger.ast, message: `join_lateral 'merger' must be a two-argument function (curried)` });
+                        ctx4.diagnostics.push({ node: at4 ?? merger.ast, message: `joinLateral 'merger' must be a two-argument function (curried)` });
                         return null;
                     }
                     const mv = applyWith(m1, rightRow, at4, ctx4);
                     if (isError(mv)) return null;
-                    const proj = rowFromRecord(mv, at4, ctx4, 'join_lateral merger');
+                    const proj = rowFromRecord(mv, at4, ctx4, 'joinLateral merger');
                     if (!proj) return null;
                     if (proj.fields.length === 0) {
-                        ctx4.diagnostics.push({ node: at4 ?? merger.ast, message: `join_lateral merger must produce a record with at least one field` });
+                        ctx4.diagnostics.push({ node: at4 ?? merger.ast, message: `joinLateral merger must produce a record with at least one field` });
                         return null;
                     }
                     const next: Query = { ...q, aliases: [...q.aliases, alias] };
@@ -2335,22 +2366,22 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     }),
 
     // --- aggregates & grouping ------------------------------------------
-    count_where: aggWhereBuiltin('count_where', 'any'),
-    sum_where: aggWhereBuiltin('sum_where', 'numeric'),
-    avg_where: aggWhereBuiltin('avg_where', 'numeric'),
-    min_where: aggWhereBuiltin('min_where', 'any'),
-    max_where: aggWhereBuiltin('max_where', 'any'),
-    count_distinct: () => fn('count_distinct', (arg, at, ctx) => {
+    countWhere: aggWhereBuiltin('countWhere', 'any'),
+    sumWhere: aggWhereBuiltin('sumWhere', 'numeric'),
+    avgWhere: aggWhereBuiltin('avgWhere', 'numeric'),
+    minWhere: aggWhereBuiltin('minWhere', 'any'),
+    maxWhere: aggWhereBuiltin('maxWhere', 'any'),
+    countDistinct: () => fn('countDistinct', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `count_distinct expects an expression, e.g. count_distinct o.status` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `countDistinct expects an expression, e.g. countDistinct o.status` });
             return ERROR;
         }
         if (node.kind === 'agg' || node.kind === 'group' || node.kind === 'order' || node.kind === 'window') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `count_distinct cannot wrap ${kindLabel(node.kind)}` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `countDistinct cannot wrap ${kindLabel(node.kind)}` });
             return ERROR;
         }
-        return mkExpr({ kind: 'agg', name: 'count_distinct', arg: node, type: 'int' }, at);
+        return mkExpr({ kind: 'agg', name: 'countDistinct', arg: node, type: 'int' }, at);
     }),
     count: aggBuiltin('count', 'any'),
     sum: aggBuiltin('sum', 'numeric'),
@@ -2402,13 +2433,13 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     }),
 
     // --- set membership --------------------------------------------------
-    is_in: inBuiltin(false),
-    is_not_in: inBuiltin(true),
-    in_query: inQueryBuiltin(false),
-    not_in_query: inQueryBuiltin(true),
+    isIn: inBuiltin(false),
+    isNotIn: inBuiltin(true),
+    inQuery: inQueryBuiltin(false),
+    notInQuery: inQueryBuiltin(true),
 
     // --- string & scalar functions --------------------------------------
-    // `abs`/`ceil`/`floor`/`sqrt` live in prelude.tetaue (Num-constrained
+    // `abs`/`ceil`/`floor`/`sqrt` live in base/sql.tetaue (Num-constrained
     // sql_func definitions).
     coalesce: () => fn('coalesce', (arg1, at1, ctx) => {
         // Variadic list form: coalesce [a, b, c].
@@ -2485,33 +2516,12 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         return mkExpr({ kind: 'timestamp-literal', value, type: 'timestamp' }, at);
     }),
     // Zero-argument constants (SQL keywords, rendered bare — no parens).
-    current_date: () => mkExpr({ kind: 'current-date', type: 'date' }),
-    current_timestamp: () => mkExpr({ kind: 'current-timestamp', type: 'timestamp' }),
+    currentDate: () => mkExpr({ kind: 'current-date', type: 'date' }),
+    currentTimestamp: () => mkExpr({ kind: 'current-timestamp', type: 'timestamp' }),
 
     // The monoid identity is type-directed: `<>` resolves it against the other
     // operand; an ascription resolves it through the schema/stamp decoders.
     mempty: () => ({ kind: 'mempty' }),
-
-    // Date-part helpers (teta's convenience helpers over extract):
-    //   year u.created_at, month u.created_at, day u.created_at, ...
-    extract: extractBuiltin(),
-    year: datePartBuiltin('year'),
-    month: datePartBuiltin('month'),
-    day: datePartBuiltin('day'),
-    day_of_week: datePartBuiltin('day_of_week'),
-    hour: datePartBuiltin('hour'),
-    minute: datePartBuiltin('minute'),
-    second: datePartBuiltin('second'),
-
-    // Date arithmetic and formatting — lowering varies per dialect (see
-    // render.ts, following teta's function support matrix).
-    date_add: dateAddBuiltin(),
-    date_diff: dateDiffBuiltin(),
-    date_trunc: dateTruncBuiltin(),
-    date_format: dateFormatBuiltin(),
-    date_parse: dateParseBuiltin(),
-    to_unixtime: unixTimeBuiltin('to_unixtime'),
-    from_unixtime: unixTimeBuiltin('from_unixtime'),
 
     // --- pure list combinators (the list.* namespace) --------------------
     // In-memory operations over `{ kind: 'list' }` values. These are the
@@ -2886,61 +2896,61 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     }),
     nothing: () => mkExpr(lit(null, 'null')),
 
-    from_maybe: () => fn('from_maybe', (def, at, ctx) => {
+    fromMaybe: () => fn('fromMaybe', (def, at, ctx) => {
         const defaultNode = exprNode(def);
         if (!defaultNode) {
-            ctx.diagnostics.push({ node: at ?? def.ast, message: `from_maybe expects a default expression, e.g. from_maybe "" u.nickname` });
+            ctx.diagnostics.push({ node: at ?? def.ast, message: `fromMaybe expects a default expression, e.g. fromMaybe "" u.nickname` });
             return ERROR;
         }
-        return fn('from_maybe', (m, at2, ctx2) => {
+        return fn('fromMaybe', (m, at2, ctx2) => {
             const maybeNode = exprNode(m);
             if (!maybeNode) {
-                ctx2.diagnostics.push({ node: at2 ?? m.ast, message: `from_maybe expects a nullable expression, e.g. from_maybe "" u.nickname` });
+                ctx2.diagnostics.push({ node: at2 ?? m.ast, message: `fromMaybe expects a nullable expression, e.g. fromMaybe "" u.nickname` });
                 return ERROR;
             }
-            // Aggregates are allowed here: after a fold, from_maybe over an
+            // Aggregates are allowed here: after a fold, fromMaybe over an
             // aggregate is a valid HAVING/SELECT expression (COALESCE(SUM(...),
             // default)). The enclosing filter/map step performs the positional
             // aggregate validation. Window expressions stay invalid.
-            if (forbid(maybeNode, ['window'], 'from_maybe', at2 ?? m.ast, ctx2)) return ERROR;
-            if (forbid(defaultNode, ['window'], 'from_maybe', at2 ?? m.ast, ctx2)) return ERROR;
+            if (forbid(maybeNode, ['window'], 'fromMaybe', at2 ?? m.ast, ctx2)) return ERROR;
+            if (forbid(defaultNode, ['window'], 'fromMaybe', at2 ?? m.ast, ctx2)) return ERROR;
             if (maybeNode.type !== 'null' && defaultNode.type !== 'null' && !comparable(maybeNode.type, defaultNode.type)) {
-                ctx2.diagnostics.push({ node: at2 ?? m.ast, message: `from_maybe requires matching types, got ${typeName(defaultNode.type)} and ${typeName(maybeNode.type)}` });
+                ctx2.diagnostics.push({ node: at2 ?? m.ast, message: `fromMaybe requires matching types, got ${typeName(defaultNode.type)} and ${typeName(maybeNode.type)}` });
                 return ERROR;
             }
             const t = maybeNode.type === 'null' ? defaultNode.type : maybeNode.type;
-            return mkExpr({ kind: 'call', name: 'from_maybe', args: [maybeNode, defaultNode], type: t === 'null' ? 'string' : t }, at2);
+            return mkExpr({ kind: 'call', name: 'fromMaybe', args: [maybeNode, defaultNode], type: t === 'null' ? 'string' : t }, at2);
         });
     }),
 
-    null_if: () => fn('null_if', (arg, at, ctx) => {
+    nullIf: () => fn('nullIf', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `null_if expects expressions, e.g. null_if u.nickname ""` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `nullIf expects expressions, e.g. nullIf u.nickname ""` });
             return ERROR;
         }
-        if (forbid(node, ['agg', 'group', 'order'], 'null_if', at ?? arg.ast, ctx)) return ERROR;
-        return fn('null_if', (otherArg, at2, ctx2) => {
+        if (forbid(node, ['agg', 'group', 'order'], 'nullIf', at ?? arg.ast, ctx)) return ERROR;
+        return fn('nullIf', (otherArg, at2, ctx2) => {
             const other = exprNode(otherArg);
             if (!other || !comparable(node.type, other.type)) {
-                ctx2.diagnostics.push({ node: at2 ?? otherArg.ast, message: `null_if requires matching types, got ${node.type === 'null' ? 'null' : typeName(node.type)} and ${other ? (other.type === 'null' ? 'null' : typeName(other.type)) : describe(otherArg)}` });
+                ctx2.diagnostics.push({ node: at2 ?? otherArg.ast, message: `nullIf requires matching types, got ${node.type === 'null' ? 'null' : typeName(node.type)} and ${other ? (other.type === 'null' ? 'null' : typeName(other.type)) : describe(otherArg)}` });
                 return ERROR;
             }
-            if (forbid(other, ['agg', 'group', 'order'], 'null_if', at2 ?? otherArg.ast, ctx2)) return ERROR;
+            if (forbid(other, ['agg', 'group', 'order'], 'nullIf', at2 ?? otherArg.ast, ctx2)) return ERROR;
             const t = node.type === 'null' ? other.type : node.type;
-            return mkExpr({ kind: 'call', name: 'null_if', args: [node, other], type: t === 'null' ? 'string' : t }, at2);
+            return mkExpr({ kind: 'call', name: 'nullIf', args: [node, other], type: t === 'null' ? 'string' : t }, at2);
         });
     }),
-    is_null: () => fn('is_null', (arg, at, ctx) => {
+    isNull: () => fn('isNull', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `is_null expects an expression, e.g. is_null u.nickname` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `isNull expects an expression, e.g. isNull u.nickname` });
             return ERROR;
         }
-        if (forbid(node, ['agg', 'group', 'order'], 'is_null', at ?? arg.ast, ctx)) return ERROR;
+        if (forbid(node, ['agg', 'group', 'order'], 'isNull', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'is-null', expr: node, negated: false, type: 'bool' }, at);
     }),
-    maybe_isJust: () => fn('isJust', (arg, at, ctx) => {
+    maybeIsJust: () => fn('isJust', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
             ctx.diagnostics.push({ node: at ?? arg.ast, message: `maybe.isJust expects an expression, e.g. maybe.isJust u.nickname` });
@@ -2950,12 +2960,16 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         // not (x IS NULL) — Data.Maybe's isJust over nullable SQL values.
         return mkExpr({ kind: 'is-null', expr: node, negated: true, type: 'bool' }, at);
     }),
-    is_true: truthPredicateBuiltin('is_true'),
-    is_false: truthPredicateBuiltin('is_false'),
-    is_unknown: truthPredicateBuiltin('is_unknown'),
+    isTrue: truthPredicateBuiltin('isTrue'),
+    isFalse: truthPredicateBuiltin('isFalse'),
+    isUnknown: truthPredicateBuiltin('isUnknown'),
 
     // --- type conversion --------------------------------------------------
     cast: castBuiltin('cast'),
+    // `tryCast` shares the `cast` implementation: only the IR node NAME
+    // differs, and the renderer's lowering of that name is what turns it
+    // into TRY_CAST (or the sqlite emulation).
+    tryCast: castBuiltin('tryCast'),
 
     // --- generic SQL call builder (prelude lowering) --------------------
     // `sql_func name [args]` emits an uninterpreted SQL function call. The
@@ -3007,6 +3021,47 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         }));
     }),
 
+    // `sql_fragment template [args]` — an uninterpreted SQL FRAGMENT. The
+    // template's literal text is emitted with each `{}` replaced by the
+    // corresponding rendered argument, which is what lets a library
+    // definition express the shapes the function/infix primitives cannot
+    // (`INTERVAL 7 DAY`, `INTERVAL '-7' DAY`, `(-7)`).
+    sql_fragment: () => fn('sql_fragment', (templateArg, at, ctx) => {
+        const template = stringValue(templateArg);
+        if (template === null || template.trim().length === 0) {
+            ctx.diagnostics.push({ node: at ?? templateArg.ast, message: `sql_fragment expects a non-empty SQL template string, e.g. sql_fragment "INTERVAL {} DAY" [x]` });
+            return ERROR;
+        }
+        return fn('sql_fragment', (argsArg, at2, ctx2) => {
+            if (argsArg.kind !== 'list') {
+                ctx2.diagnostics.push({ node: at2 ?? argsArg.ast, message: `sql_fragment expects a list of arguments, e.g. sql_fragment "INTERVAL {} DAY" [x] — got ${describe(argsArg)}` });
+                return ERROR;
+            }
+            const args: SqlNode[] = [];
+            for (const item of argsArg.items) {
+                const node = exprNode(item);
+                if (!node) {
+                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `sql_fragment arguments must be SQL expressions, got ${describe(item)}` });
+                    return ERROR;
+                }
+                args.push(node);
+            }
+            // The hole count is part of the contract: a template with a
+            // different number of `{}` than arguments would emit SQL with a
+            // hole left over (or an argument dropped), so it is a diagnostic
+            // rather than a silent truncation.
+            const holes = fragmentHoles(template);
+            if (holes !== args.length) {
+                ctx2.diagnostics.push({
+                    node: at2 ?? argsArg.ast,
+                    message: `sql_fragment template has ${holes} \`{}\` hole(s) but ${args.length} argument(s), e.g. sql_fragment "INTERVAL {} DAY" [x]`,
+                });
+                return ERROR;
+            }
+            return mkExpr({ kind: 'fragment', template, args, type: 'unknown' }, at2 ?? at);
+        });
+    }),
+
     sql_cast: () => fn('sql_cast', (valueArg, at, ctx) => {
         const value = exprNode(valueArg);
         if (!value) {
@@ -3025,6 +3080,24 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         });
     }),
 
+    sql_try_cast: () => fn('sql_try_cast', (valueArg, at, ctx) => {
+        const value = exprNode(valueArg);
+        if (!value) {
+            ctx.diagnostics.push({ node: at ?? valueArg.ast, message: `sql_try_cast expects a value expression and a target type, e.g. sql_try_cast x "int"` });
+            return ERROR;
+        }
+        return fn('sql_try_cast', (typeArg, at2, ctx2) => {
+            const type = stringValue(typeArg);
+            if (type === null || !(CAST_TYPES as readonly string[]).includes(type)) {
+                ctx2.diagnostics.push({ node: at2 ?? typeArg.ast, message: `sql_try_cast expects a target type as a string literal — one of: ${CAST_TYPES.join(', ')}` });
+                return ERROR;
+            }
+            // Same IR node as the `tryCast` builtin, so the renderer's
+            // TRY_CAST lowering (and the sqlite emulation) applies.
+            return mkExpr({ kind: 'call', name: 'tryCast', args: [value, lit(type, 'string')], type: type as SqlType }, at2 ?? at);
+        });
+    }),
+
     sql_bare: () => fn('sql_bare', (wordArg, at, ctx) => {
         const word = stringValue(wordArg);
         if (word === null || word.trim().length === 0 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
@@ -3034,6 +3107,65 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         // A bare SQL word (EXTRACT(YEAR FROM x) needs YEAR, not 'YEAR').
         return mkExpr({ kind: 'bare', name: word, type: 'unknown' }, at);
     }),
+
+    // `sql_error message` — reject a library definition at analysis time.
+    //
+    // A definition that dispatches on a compile-time name (`extract x
+    // "month"`, `dateAdd x "day" 7`) reaches this from its fallback arm when
+    // the name is not one it knows. The diagnostic is reported, so a typo is
+    // an error rather than silently-lowered wrong SQL, and the set of valid
+    // names stays where the dispatch is: in the library.
+    sql_error: () => fn('sql_error', (messageArg, at, ctx) => {
+        const message = stringValue(messageArg);
+        ctx.diagnostics.push({
+            node: at ?? messageArg.ast,
+            message: message ?? 'sql_error expects a message string',
+        });
+        // The result is an expression node WITHOUT a value type: an error arm
+        // sits beside the arms that produce real SQL, and case arms must agree
+        // on a type, so a concrete type here would make every dispatch that
+        // can fail a spurious "case requires matching value types".
+        return mkExpr({ kind: 'bare', name: 'NULL', type: 'unknown' }, at);
+    }),
+
+    // `sql_literal x` — the SQL text of a LITERAL argument, or "".
+    //
+    // This is the only introspection in the lowering vocabulary: a library
+    // definition sees values rather than syntax, so this is how the date
+    // layer tells `dateAdd x "day" 7` (which every dialect can embed as a
+    // native literal modifier, `INTERVAL 7 DAY`) from `dateAdd x "day" u.n`
+    // (which must be parenthesized or wrapped as an expression). The result
+    // is a plain tetaue string the library branches on — never a SQL node —
+    // so it widens what a library definition can DECIDE without widening
+    // what it can EMIT.
+    //
+    // The text is unquoted (`-7` for the literal `-7`). A caller that needs
+    // it inside SQL passes it to `sql_func`/`sql_bare`, which quote or
+    // interpolate it like any other string.
+    sql_literal: () => fn('sql_literal', (arg) => {
+        const node = exprNode(arg);
+        const text = node?.kind === 'lit' && typeof node.value === 'number'
+            ? String(node.value)
+            : '';
+        return mkExpr(lit(text, 'string'));
+    }),
+
+    // `sql_literal_amount x scale` — the signed SQL text of a literal amount.
+    //
+    // The date layer's sqlite branch needs the modifier `'-7 days'`: SQL signs
+    // a positive interval amount explicitly, and tetaue strings cannot be
+    // assembled from parts, so the number-to-text step has to happen here.
+    // `scale` folds a week amount into days (the one piece of arithmetic that
+    // branch needs). A computed argument reports "" so the library can pick
+    // the PRINTF form instead.
+    sql_literal_amount: () => fn('sql_literal_amount', (arg) => fn('sql_literal_amount', (scaleArg) => {
+        const node = exprNode(arg);
+        const scale = exprNode(scaleArg);
+        if (node?.kind !== 'lit' || typeof node.value !== 'number') return mkExpr(lit('', 'string'));
+        const factor = scale?.kind === 'lit' && typeof scale.value === 'number' ? scale.value : 1;
+        const value = node.value * factor;
+        return mkExpr(lit(`${value >= 0 ? '+' : ''}${value}`, 'string'));
+    })),
 
     // --- list-argument builtins (homogeneous variadic) -------------------
     // concat [a, b], greatest [a, b], least [a, b] take a single list
@@ -3058,7 +3190,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
 
     // --- window functions ------------------------------------------------
     // Window-only functions must be wrapped in `over (...)` — a bare
-    // `row_number` in a projection is an error (see validateWindowUses).
+    // `rowNumber` in a projection is an error (see validateWindowUses).
     // `sum u.x`, `avg u.x`, ... become windowed aggregates via over too.
     over: () => fn('over', (fnArg, at, ctx) => {
         const fnNode = exprNode(fnArg);
@@ -3072,7 +3204,7 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             const hint = fnArg.kind === 'fn'
                 ? ` — wrap it in parens when it takes arguments, e.g. over (${fnArg.name} u.x 1 nothing) { partition = [u.dept], order = [desc u.salary] }`
                 : '';
-            ctx.diagnostics.push({ node: at ?? fnArg.ast, message: `over expects a window function (row_number, rank, sum, lag, ...), got ${fnNode ? `an expression of type ${typeName(fnNode.type)}` : describe(fnArg)}${hint}` });
+            ctx.diagnostics.push({ node: at ?? fnArg.ast, message: `over expects a window function (rowNumber, rank, sum, lag, ...), got ${fnNode ? `an expression of type ${typeName(fnNode.type)}` : describe(fnArg)}${hint}` });
             return ERROR;
         }
         if (forbid(fnNode!, ['window'], 'over', at ?? fnArg.ast, ctx)) return ERROR;
@@ -3082,10 +3214,10 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
             return mkExpr({ kind: 'window', fn: fnNode!, partition: spec.partition, order: spec.order, frame: spec.frame, type: fnNode!.type as SqlType }, at2);
         });
     }),
-    row_number: () => mkExpr({ kind: 'call', name: 'row_number', args: [], type: 'int' }),
+    rowNumber: () => mkExpr({ kind: 'call', name: 'rowNumber', args: [], type: 'int' }),
     rank: () => mkExpr({ kind: 'call', name: 'rank', args: [], type: 'int' }),
-    dense_rank: () => mkExpr({ kind: 'call', name: 'dense_rank', args: [], type: 'int' }),
-    percent_rank: () => mkExpr({ kind: 'call', name: 'percent_rank', args: [], type: 'int' }),
+    denseRank: () => mkExpr({ kind: 'call', name: 'denseRank', args: [], type: 'int' }),
+    percentRank: () => mkExpr({ kind: 'call', name: 'percentRank', args: [], type: 'int' }),
     ntile: () => fn('ntile', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node || (!isNumeric(node.type) && node.type !== 'unknown')) {
@@ -3148,8 +3280,8 @@ function aggWhereBuiltin(name: string, numeric: 'numeric' | 'any'): () => Value 
                 return ERROR;
             }
             let type: SqlType = node.type as SqlType;
-            if (name === 'count_where') type = 'int';
-            if (name === 'avg_where') type = 'float';
+            if (name === 'countWhere') type = 'int';
+            if (name === 'avgWhere') type = 'float';
             return mkExpr({ kind: 'agg', name, arg: node, filter: condNode, type }, at2);
         });
     });
@@ -3195,162 +3327,9 @@ function stringFnBuiltin(name: string, result: SqlType): () => Value {
 // lowering varies per dialect (render.ts owns the per-dialect SQL).
 // ---------------------------------------------------------------------------
 
-const DATE_PARTS = ['year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second'] as const;
-
-const DATE_UNITS = ['year', 'month', 'week', 'day', 'hour', 'minute', 'second'] as const;
-
 /** True for expressions that carry a date or timestamp value. */
 function dateLike(node: SqlNode): boolean {
     return node.type === 'date' || node.type === 'timestamp' || node.type === 'unknown';
-}
-
-function dateLikeError(name: string, v: Value, node: SqlNode | null, at: AstNode | undefined, ctx: Ctx): boolean {
-    if (node && dateLike(node)) return false;
-    ctx.diagnostics.push({ node: at ?? v.ast, message: `${name} expects a date or timestamp expression, got ${node ? `type ${typeName(node.type)}` : describe(v)}` });
-    return true;
-}
-
-/** A string literal argument that must be one of `allowed` (date parts/units). */
-function datePartArg(name: string, v: Value, allowed: readonly string[], at: AstNode | undefined, ctx: Ctx): string | null {
-    const s = stringValue(v);
-    if (s !== null && (allowed as readonly string[]).includes(s)) return s;
-    ctx.diagnostics.push({ node: at ?? v.ast, message: `${name} expects a string literal — one of: ${allowed.join(', ')}` });
-    return null;
-}
-
-/** `year x`, `month x`, ... — a fixed date part over a date/timestamp value. */
-function datePartBuiltin(part: (typeof DATE_PARTS)[number]): () => Value {
-    return () => fn(part, (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (dateLikeError(part, arg, node, at, ctx)) return ERROR;
-        if (forbid(node!, ['agg', 'group', 'order'], part, at ?? arg.ast, ctx)) return ERROR;
-        return mkExpr({ kind: 'call', name: part, args: [node!], type: 'int' }, at);
-    });
-}
-
-/** `extract u.created_at "year"` — the generic form of the date-part helpers. */
-function extractBuiltin(): () => Value {
-    return () => fn('extract', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (dateLikeError('extract', arg, node, at, ctx)) return ERROR;
-        if (forbid(node!, ['agg', 'group', 'order'], 'extract', at ?? arg.ast, ctx)) return ERROR;
-        return fn('extract', (fieldArg, at2, ctx2) => {
-            const field = datePartArg('extract', fieldArg, DATE_PARTS, at2, ctx2);
-            if (field === null) return ERROR;
-            return mkExpr({ kind: 'call', name: 'extract', args: [node!, lit(field, 'string')], type: 'int' }, at2);
-        });
-    });
-}
-
-/** `date_add u.created_at "day" 1` — value, unit, amount. */
-function dateAddBuiltin(): () => Value {
-    return () => fn('date_add', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (dateLikeError('date_add', arg, node, at, ctx)) return ERROR;
-        if (forbid(node!, ['agg', 'group', 'order'], 'date_add', at ?? arg.ast, ctx)) return ERROR;
-        return fn('date_add', (unitArg, at2, ctx2) => {
-            const unit = datePartArg('date_add', unitArg, DATE_UNITS, at2, ctx2);
-            if (unit === null) return ERROR;
-            return fn('date_add', (amountArg, at3, ctx3) => {
-                const amount = exprNode(amountArg);
-                if (!amount || (!isNumeric(amount.type) && amount.type !== 'unknown')) {
-                    ctx3.diagnostics.push({ node: at3 ?? amountArg.ast, message: `date_add expects a numeric amount, got ${amount ? `type ${typeName(amount.type)}` : describe(amountArg)}` });
-                    return ERROR;
-                }
-                if (forbid(amount, ['agg', 'group', 'order'], 'date_add', at3 ?? amountArg.ast, ctx3)) return ERROR;
-                const t: SqlType = node!.type === 'date' ? 'date' : 'timestamp';
-                return mkExpr({ kind: 'call', name: 'date_add', args: [node!, lit(unit, 'string'), amount], type: t }, at3);
-            });
-        });
-    });
-}
-
-/** `date_diff u.created_at "day" current_date` — value, unit, other. */
-function dateDiffBuiltin(): () => Value {
-    return () => fn('date_diff', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (dateLikeError('date_diff', arg, node, at, ctx)) return ERROR;
-        if (forbid(node!, ['agg', 'group', 'order'], 'date_diff', at ?? arg.ast, ctx)) return ERROR;
-        return fn('date_diff', (unitArg, at2, ctx2) => {
-            const unit = datePartArg('date_diff', unitArg, DATE_UNITS, at2, ctx2);
-            if (unit === null) return ERROR;
-            return fn('date_diff', (otherArg, at3, ctx3) => {
-                const other = exprNode(otherArg);
-                if (dateLikeError('date_diff', otherArg, other, at3, ctx3)) return ERROR;
-                if (forbid(other!, ['agg', 'group', 'order'], 'date_diff', at3 ?? otherArg.ast, ctx3)) return ERROR;
-                return mkExpr({ kind: 'call', name: 'date_diff', args: [node!, lit(unit, 'string'), other!], type: 'int' }, at3);
-            });
-        });
-    });
-}
-
-/** `date_trunc u.created_at "day"` — value, unit. */
-function dateTruncBuiltin(): () => Value {
-    return () => fn('date_trunc', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (dateLikeError('date_trunc', arg, node, at, ctx)) return ERROR;
-        if (forbid(node!, ['agg', 'group', 'order'], 'date_trunc', at ?? arg.ast, ctx)) return ERROR;
-        return fn('date_trunc', (unitArg, at2, ctx2) => {
-            const unit = datePartArg('date_trunc', unitArg, DATE_UNITS, at2, ctx2);
-            if (unit === null) return ERROR;
-            // Truncating keeps the input's date-ness: date to date, timestamp
-            // (or unknown) to timestamp — same rule as `date_add`.
-            const t: SqlType = node!.type === 'date' ? 'date' : 'timestamp';
-            return mkExpr({ kind: 'call', name: 'date_trunc', args: [node!, lit(unit, 'string')], type: t }, at2);
-        });
-    });
-}
-
-/** `date_format u.created_at "%Y-%m-%d"` — value, dialect-native format. */
-function dateFormatBuiltin(): () => Value {
-    return () => fn('date_format', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (dateLikeError('date_format', arg, node, at, ctx)) return ERROR;
-        if (forbid(node!, ['agg', 'group', 'order'], 'date_format', at ?? arg.ast, ctx)) return ERROR;
-        return fn('date_format', (formatArg, at2, ctx2) => {
-            const format = stringValue(formatArg);
-            if (format === null) {
-                ctx2.diagnostics.push({ node: at2 ?? formatArg.ast, message: `date_format expects a format string literal, e.g. date_format u.created_at "%Y-%m-%d"` });
-                return ERROR;
-            }
-            return mkExpr({ kind: 'call', name: 'date_format', args: [node!, lit(format, 'string')], type: 'string' }, at2);
-        });
-    });
-}
-
-/** `date_parse u.text "%Y-%m-%d"` — string value, dialect-native format. */
-function dateParseBuiltin(): () => Value {
-    return () => fn('date_parse', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'string' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `date_parse expects a string expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], 'date_parse', at ?? arg.ast, ctx)) return ERROR;
-        return fn('date_parse', (formatArg, at2, ctx2) => {
-            const format = stringValue(formatArg);
-            if (format === null) {
-                ctx2.diagnostics.push({ node: at2 ?? formatArg.ast, message: `date_parse expects a format string literal, e.g. date_parse u.text "%Y-%m-%d"` });
-                return ERROR;
-            }
-            return mkExpr({ kind: 'call', name: 'date_parse', args: [node, lit(format, 'string')], type: 'date' }, at2);
-        });
-    });
-}
-
-/** `to_unixtime u.created_at` / `from_unixtime u.ts`. */
-function unixTimeBuiltin(name: 'to_unixtime' | 'from_unixtime'): () => Value {
-    return () => fn(name, (arg, at, ctx) => {
-        const node = exprNode(arg);
-        const wantDate = name === 'to_unixtime';
-        if (!node || (wantDate ? !dateLike(node) : !isNumeric(node.type) && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects ${wantDate ? 'a date or timestamp expression' : 'a numeric expression'}, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], name, at ?? arg.ast, ctx)) return ERROR;
-        const type: SqlType = wantDate ? 'int' : 'timestamp';
-        return mkExpr({ kind: 'call', name, args: [node], type }, at);
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3359,7 +3338,8 @@ function unixTimeBuiltin(name: 'to_unixtime' | 'from_unixtime'): () => Value {
 // ---------------------------------------------------------------------------
 
 /** `cast x "int"` — target type as a string literal. */
-function castBuiltin(name: 'cast'): () => Value {
+/** `cast x "int"` / `tryCast x "int"` — target type as a string literal. */
+function castBuiltin(name: 'cast' | 'tryCast'): () => Value {
     return () => fn(name, (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
@@ -3627,7 +3607,7 @@ function lagLeadBuiltin(name: 'lag' | 'lead'): () => Value {
 // ---------------------------------------------------------------------------
 
 /** Window-only functions: invalid anywhere outside `over (...)`'s fn position. */
-const WINDOW_ONLY = new Set(['row_number', 'rank', 'dense_rank', 'percent_rank', 'ntile', 'lag', 'lead']);
+const WINDOW_ONLY = new Set(['rowNumber', 'rank', 'denseRank', 'percentRank', 'ntile', 'lag', 'lead']);
 
 /** A list value, or a single value treated as a one-element list. */
 function listOrSingle(v: Value): Value[] | null {
@@ -3643,7 +3623,7 @@ function listOrSingle(v: Value): Value[] | null {
  */
 function windowSpec(v: Value, at: AstNode | undefined, ctx: Ctx): { partition: SqlNode[]; order: { node: SqlNode; dir: 'ASC' | 'DESC' }[]; frame: { start: number; end: number } | null } | null {
     if (v.kind !== 'record') {
-        ctx.diagnostics.push({ node: at ?? v.ast, message: `over expects a spec record, e.g. over (row_number) { partition = [u.dept], order = [desc u.salary] } — got ${describe(v)}` });
+        ctx.diagnostics.push({ node: at ?? v.ast, message: `over expects a spec record, e.g. over (rowNumber) { partition = [u.dept], order = [desc u.salary] } — got ${describe(v)}` });
         return null;
     }
     const fields = new Map(v.fields.map(f => [f.key, f.value]));
@@ -3706,7 +3686,7 @@ function windowSpec(v: Value, at: AstNode | undefined, ctx: Ctx): { partition: S
 
 /**
  * Walk a projection's expressions and reject window-only functions
- * (row_number, rank, ...) that are not wrapped in `over (...)` — a bare
+ * (rowNumber, rank, ...) that are not wrapped in `over (...)` — a bare
  * `ROW_NUMBER()` would render invalid SQL. `over (sum u.x) {...}` is fine
  * because `sum` is an aggregate, not a window-only function.
  */
@@ -3727,6 +3707,7 @@ function validateWindowUses(fields: readonly { key: string; node: SqlNode }[], a
                 if (n.filter) visit(n.filter, n, 'filter');
                 break;
             case 'call': n.args.forEach(a => visit(a, n, 'args')); break;
+            case 'fragment': n.args.forEach(a => visit(a, n, 'args')); break;
             case 'window':
                 visit(n.fn, n, 'fn');
                 n.partition.forEach(p => visit(p, n, 'partition'));
@@ -3741,7 +3722,7 @@ function validateWindowUses(fields: readonly { key: string; node: SqlNode }[], a
 }
 
 function inQueryBuiltin(negated: boolean): () => Value {
-    const name = negated ? 'not_in_query' : 'in_query';
+    const name = negated ? 'notInQuery' : 'inQuery';
     return () => fn(name, (value, at, ctx) => {
         const expr = exprNode(value);
         if (!expr) {
@@ -3770,22 +3751,22 @@ function inQueryBuiltin(negated: boolean): () => Value {
 }
 
 function inBuiltin(negated: boolean): () => Value {
-    return () => fn('is_in', (value, at, ctx) => {
+    return () => fn('isIn', (value, at, ctx) => {
         const node = exprNode(value);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? value.ast, message: `is_in expects a value expression, e.g. is_in u.id [1, 2, 3]` });
+            ctx.diagnostics.push({ node: at ?? value.ast, message: `isIn expects a value expression, e.g. isIn u.id [1, 2, 3]` });
             return ERROR;
         }
-        return fn('is_in', (listVal, at2, ctx2) => {
+        return fn('isIn', (listVal, at2, ctx2) => {
             if (listVal.kind !== 'list' || listVal.items.length === 0) {
-                ctx2.diagnostics.push({ node: at2 ?? listVal.ast, message: `is_in expects a non-empty list, e.g. is_in u.id [1, 2, 3]` });
+                ctx2.diagnostics.push({ node: at2 ?? listVal.ast, message: `isIn expects a non-empty list, e.g. isIn u.id [1, 2, 3]` });
                 return ERROR;
             }
             const items: SqlNode[] = [];
             for (const item of listVal.items) {
                 const itemNode = exprNode(item);
                 if (!itemNode) {
-                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `is_in list items must be expressions, got ${describe(item)}` });
+                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `isIn list items must be expressions, got ${describe(item)}` });
                     return ERROR;
                 }
                 const isNullItem = itemNode.kind === 'lit' && itemNode.value === null;
@@ -3794,12 +3775,12 @@ function inBuiltin(negated: boolean): () => Value {
                     continue;
                 }
                 if (!comparable(node.type, itemNode.type)) {
-                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `is_in list items must match type ${typeName(node.type)}, got ${typeName(itemNode.type)}` });
+                    ctx2.diagnostics.push({ node: item.ast ?? at2, message: `isIn list items must match type ${typeName(node.type)}, got ${typeName(itemNode.type)}` });
                     return ERROR;
                 }
                 items.push(itemNode);
             }
-            if (forbid(node, ['agg', 'group', 'order'], 'is_in', at2 ?? value.ast, ctx2)) return ERROR;
+            if (forbid(node, ['agg', 'group', 'order'], 'isIn', at2 ?? value.ast, ctx2)) return ERROR;
             return mkExpr({ kind: 'in', expr: node, list: items, negated, type: 'bool' }, at2);
         });
     });
@@ -3958,6 +3939,26 @@ export interface ProjectAnalysisOptions {
     dialect?: DialectView;
 }
 
+/**
+ * The built-in namespaces (`list.*`, `Maybe.*`) as a fresh environment.
+ *
+ * They are pure, always-in-scope core vocabulary rather than Prelude exports,
+ * so a user module gets them whether or not the Prelude is auto-imported;
+ * `# no prelude` suppresses the Prelude, not the namespaces.
+ */
+export function namespaceEnv(): Map<string, Value> {
+    const env = new Map<string, Value>();
+    for (const [alias, namespace] of Object.entries(PRELUDE_NAMESPACES)) {
+        const exports = new Map<string, Value>();
+        for (const [publicName, builtinName] of Object.entries(namespace)) {
+            const factory = BUILTINS[builtinName as BuiltinName];
+            if (factory) exports.set(publicName, factory());
+        }
+        env.set(alias, { kind: 'module', name: alias, exports });
+    }
+    return env;
+}
+
 /** The primitive environment shared by `analyzeProject` and `checkProject`. */
 export function createPreludeEnv(dialect?: DialectView): Map<string, Value> {
     const env = new Map<string, Value>();
@@ -3978,6 +3979,15 @@ export function createPreludeEnv(dialect?: DialectView): Map<string, Value> {
         { key: 'name', value: mkExpr(lit(view.name, 'string')) },
         { key: 'functions', value: recordValue(functionFields) },
     ]));
+    // The reserved `core` namespace: every primitive under a qualified name.
+    // A BASE module uses it to publish a public spelling without a
+    // self-recursive binding (`export table = core.table`), which is what
+    // lets the primitive names stay ambient for the library while the
+    // library owns the public surface.
+    const coreExports = new Map<string, Value>();
+    for (const [name, value] of env) coreExports.set(name, value);
+    env.set(CORE_NAMESPACE, { kind: 'module', name: CORE_NAMESPACE, exports: coreExports });
+
     // Built-in prelude namespaces (`list.*`, `maybe.*`): module values whose
     // exports are the pure combinators, so `list.map` / `maybe.isJust`
     // resolve exactly like a qualified import `import "..." as list`.
@@ -4012,7 +4022,11 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
     // module is evaluated, so a module's imports are always ready.
     const exportsByModule = new Map<ProjectModule, Map<string, Value>>();
 
-    const allModules = prelude ? [prelude, ...modules] : [...modules];
+    // A base module is the only kind that starts from the primitive core;
+    // every other module starts from the Prelude's exports instead.
+    const baseModules = prelude ? baseClosureFor(prelude) : [];
+    const baseSet: ReadonlySet<ProjectModule> = new Set(baseModules);
+    const allModules = [...baseModules, ...modules];
     const root = modules[modules.length - 1];
     let standardValues = new Map<string, Value>();
     let rootEnv: Map<string, Value> | undefined;
@@ -4021,12 +4035,19 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         // Each module gets its OWN immutable scope: prelude, imports, then
         // local bindings. The environment is threaded through the binding
         // fold; nothing is reassigned on a shared context object.
-        // Every module — including one marked `# no prelude` — starts from the
-        // PRIMITIVE core environment (SQL builtins, operator intrinsics, the
-        // hidden `sql_dialect` value). `# no prelude` only suppresses the
-        // automatic injection of the standard library's exported bindings.
+        //
+        // Every BASE module starts from the PRIMITIVE core environment (SQL
+        // builtins, operator intrinsics, the hidden `sql_dialect` value, the
+        // reserved `core` namespace). A user module starts from what it
+        // imports instead; `# no prelude` suppresses the automatic injection
+        // of the Prelude's exports (and nothing else).
+        const isBase = baseSet.has(module);
         const isNoPrelude = module.noPrelude === true;
-        let env = createPreludeEnv(dialect);
+        // A base module starts from the whole primitive core. A user module
+        // starts from the built-in NAMESPACES (`list.*`, `Maybe.*`) — they are
+        // core vocabulary, always in scope, and not part of the Prelude's
+        // exported surface — and then receives the Prelude's exports below.
+        let env = isBase ? createPreludeEnv(dialect) : namespaceEnv();
         const moduleBindings: Set<string> = new Set(module.model.bindings.map(b => b.name));
         const moduleDiagnostics: Diagnostic[] = [];
 
@@ -4040,7 +4061,10 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         for (const [alias, selected] of imported.namespaces) {
             env.set(alias, { kind: 'module', name: alias, exports: new Map(selected), ast: module.model.imports.find(imp => imp.alias === alias) });
         }
-        if (!isNoPrelude && module !== prelude) {
+        // The Prelude's exports are auto-imported into every USER module. A
+        // base module is skipped: it is built from the core, not from the
+        // standard surface it helps define.
+        if (!isBase && !isNoPrelude) {
             for (const [name, standardValue] of standardValues) {
                 if (!env.has(name)) env.set(name, standardValue);
             }
@@ -4091,7 +4115,11 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         // Re-exports add names to THIS module's public surface without binding
         // them locally. The target was evaluated earlier (DFS order), so its
         // export map is ready. Conflicts are errors, never silent.
-        for (const { target, exportNode } of reexportsByModule.get(module) ?? []) {
+        // Base modules carry their re-export edges on the module itself (see
+        // prelude.ts), so a caller that only passes the Prelude still gets the
+        // library's aggregation.
+        const moduleReexports = reexportsByModule.get(module) ?? module.exports ?? [];
+        for (const { target, exportNode } of moduleReexports) {
             const targetExports = exportsByModule.get(target);
             if (!targetExports) continue; // cyclic/missing target — already diagnosed
             const spec = parseStringLiteral(exportNode.path);
@@ -4121,9 +4149,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
             }
         }
         exportsByModule.set(module, exports);
-        if (module === prelude) {
-            standardValues = exports;
-        }
+        if (module === prelude) standardValues = exports;
         if (module === root) rootEnv = env;
         diagnostics.push(...moduleDiagnostics);
     }

@@ -22,10 +22,15 @@ describe('builtin completion', () => {
         const labels = await completionsAt(`${USERS}\nq = users & `, 1, 12);
         for (const name of ['filter', 'map', 'sort', 'take', 'fold', 'distinct',
             'toUpper', 'toLower', 'count', 'sum', 'coalesce', 'abs',
-            'current_date', 'date_add', 'ceil', 'floor', 'concat', 'greatest',
-            'substring', 'cast', 'like', 'is_null', 'is_true', 'is_false', 'is_unknown',
-            'sql_func', 'sql_infix', 'sql_cast', 'sql_bare']) {
+            'currentDate', 'dateAdd', 'ceil', 'floor', 'concat', 'greatest',
+            'substring', 'cast', 'like', 'isNull', 'isTrue', 'isFalse', 'isUnknown']) {
             expect(labels).toContain(name);
+        }
+        // The lowering primitives are library-internal: they are not part of
+        // the surface a user module can name, so completion must not offer
+        // them.
+        for (const name of ['sql_func', 'sql_infix', 'sql_cast', 'sql_try_cast', 'sql_bare', 'op_add']) {
+            expect(labels, name).not.toContain(name);
         }
     });
 
@@ -40,7 +45,7 @@ describe('builtin completion', () => {
     test('works at a fresh binding with an empty prefix', async () => {
         const labels = await completionsAt(`${USERS}\nq = `, 1, 4);
         expect(labels).toContain('filter');
-        expect(labels).toContain('current_date');
+        expect(labels).toContain('currentDate');
     });
 
     test('does not suggest builtins after a dot (field access wins)', async () => {

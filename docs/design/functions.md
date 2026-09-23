@@ -48,7 +48,7 @@ _&_ query step
 increment = _+_ 1
 ```
 
-The standard meanings are defined in `prelude.tetaue`. SQL-aware operators use
+The standard meanings are defined in `base/sql.tetaue`. SQL-aware operators use
 hidden intrinsics from the small core; pure operators are ordinary lambdas:
 
 ```
@@ -154,33 +154,33 @@ relational/scalar meanings.
 
 ## Date & time
 
-Constants `current_date` → `CURRENT_DATE` and `current_timestamp` →
+Constants `currentDate` → `CURRENT_DATE` and `currentTimestamp` →
 `CURRENT_TIMESTAMP` are accepted verbatim by every dialect (sqlite included).
 
 | tetaue | Trino | PostgreSQL | MySQL | SQLite | Hive |
 |---|---|---|---|---|---|
-| `year/month/day`<br>`day_of_week`<br>`hour/minute/second` | `EXTRACT(FIELD FROM x)` | `EXTRACT(FIELD FROM x)` | `EXTRACT(FIELD FROM x)`,<br>`DAYOFWEEK(x)` | `CAST(STRFTIME('%Y', x) AS INTEGER)` | `YEAR(x)` … `DAYOFWEEK(x)` |
+| `year/month/day`<br>`dayOfWeek`<br>`hour/minute/second` | `EXTRACT(FIELD FROM x)` | `EXTRACT(FIELD FROM x)` | `EXTRACT(FIELD FROM x)`,<br>`DAYOFWEEK(x)` | `CAST(STRFTIME('%Y', x) AS INTEGER)` | `YEAR(x)` … `DAYOFWEEK(x)` |
 | `extract x "field"` | `EXTRACT(FIELD FROM x)` | same | same | `STRFTIME` | same as parts |
-| `date_add x "unit" n` | `DATE_ADD('unit', n, x)` | `x + (n) * INTERVAL '1 unit'` | `DATE_ADD(x, INTERVAL n UNIT)` | `DATETIME` with literal or `PRINTF` modifier | `x + INTERVAL 'n' UNIT` |
-| `date_diff x "unit" y` | `DATE_DIFF('unit', x, y)` | `EXTRACT(unit FROM (y - x))` | `TIMESTAMPDIFF(UNIT, x, y)` | scaled `JULIANDAY(y) - JULIANDAY(x)` | `DATEDIFF` / scaled unix-second delta |
-| `date_trunc x "unit"` | `DATE_TRUNC('unit', x)` | `DATE_TRUNC('unit', x)` | `STR_TO_DATE` / `DATE_FORMAT` composition | `DATE` / `STRFTIME` (all units) | `TRUNC` / unix-second composition |
-| `date_format x "fmt"` | `DATE_FORMAT(x, 'fmt')` | `TO_CHAR(x, 'fmt')` | `DATE_FORMAT(x, 'fmt')` | `STRFTIME('fmt', x)` | `DATE_FORMAT(x, 'fmt')` |
-| `date_parse x "fmt"` | `DATE_PARSE(x, 'fmt')` | `TO_TIMESTAMP(x, 'fmt')` | `STR_TO_DATE(x, 'fmt')` | `DATETIME(x)` (fmt ignored) | `FROM_UNIXTIME(UNIX_TIMESTAMP(x, 'fmt'))` |
-| `to_unixtime x` | `TO_UNIXTIME(x)` | `EXTRACT(EPOCH FROM x)` | `UNIX_TIMESTAMP(x)` | `CAST(STRFTIME('%s', x) AS INTEGER)` | `UNIX_TIMESTAMP(x)` |
-| `from_unixtime x` | `FROM_UNIXTIME(x)` | `TO_TIMESTAMP(x)` | `FROM_UNIXTIME(x)` | `DATETIME(x, 'unixepoch')` | `FROM_UNIXTIME(x)` |
+| `dateAdd x "unit" n` | `DATE_ADD('unit', n, x)` | `x + (n) * INTERVAL '1 unit'` | `DATE_ADD(x, INTERVAL n UNIT)` | `DATETIME` with literal or `PRINTF` modifier | `x + INTERVAL 'n' UNIT` |
+| `dateDiff x "unit" y` | `DATE_DIFF('unit', x, y)` | `EXTRACT(unit FROM (y - x))` | `TIMESTAMPDIFF(UNIT, x, y)` | scaled `JULIANDAY(y) - JULIANDAY(x)` | `DATEDIFF` / scaled unix-second delta |
+| `dateTrunc x "unit"` | `DATE_TRUNC('unit', x)` | `DATE_TRUNC('unit', x)` | `STR_TO_DATE` / `DATE_FORMAT` composition | `DATE` / `STRFTIME` (all units) | `TRUNC` / unix-second composition |
+| `dateFormat x "fmt"` | `DATE_FORMAT(x, 'fmt')` | `TO_CHAR(x, 'fmt')` | `DATE_FORMAT(x, 'fmt')` | `STRFTIME('fmt', x)` | `DATE_FORMAT(x, 'fmt')` |
+| `dateParse x "fmt"` | `DATE_PARSE(x, 'fmt')` | `TO_TIMESTAMP(x, 'fmt')` | `STR_TO_DATE(x, 'fmt')` | `DATETIME(x)` (fmt ignored) | `FROM_UNIXTIME(UNIX_TIMESTAMP(x, 'fmt'))` |
+| `toUnixtime x` | `TO_UNIXTIME(x)` | `EXTRACT(EPOCH FROM x)` | `UNIX_TIMESTAMP(x)` | `CAST(STRFTIME('%s', x) AS INTEGER)` | `UNIX_TIMESTAMP(x)` |
+| `fromUnixtime x` | `FROM_UNIXTIME(x)` | `TO_TIMESTAMP(x)` | `FROM_UNIXTIME(x)` | `DATETIME(x, 'unixepoch')` | `FROM_UNIXTIME(x)` |
 
-Units for `date_add`/`date_diff`/`date_trunc` (string literal): `year`,
+Units for `dateAdd`/`dateDiff`/`dateTrunc` (string literal): `year`,
 `month`, `week`, `day`, `hour`, `minute`, `second`. Dialects that lack a
 calendar primitive use elapsed-time or formatting fallbacks, so all validated
 units remain renderable. The date family carries a `DateTime` typeclass constraint
 (`date`/`timestamp` only) on its calendar-valued inputs and outputs, so the
 static schemes match the runtime checks — see `docs/design/type-system.md`
-§7. `date_trunc` preserves its input's date-ness
-(`date` truncates to `date`, `timestamp` to `timestamp`), like `date_add`, so
-a truncated date compares with `current_date`. Date parts: `year`, `month`, `day`,
-`day_of_week`, `hour`, `minute`, `second` — `day_of_week` follows each
+§7. `dateTrunc` preserves its input's date-ness
+(`date` truncates to `date`, `timestamp` to `timestamp`), like `dateAdd`, so
+a truncated date compares with `currentDate`. Date parts: `year`, `month`, `day`,
+`dayOfWeek`, `hour`, `minute`, `second` — `dayOfWeek` follows each
 dialect's convention (PG `DOW` 0=Sunday, Trino `DAY_OF_WEEK` 1=Monday, SQLite
-`%w` 0=Sunday, MySQL/Hive `DAYOFWEEK` 1=Sunday). `date_format`/`date_parse`
+`%w` 0=Sunday, MySQL/Hive `DAYOFWEEK` 1=Sunday). `dateFormat`/`dateParse`
 format strings are dialect-native (`%Y-%m-%d` Trino/MySQL/SQLite, `YYYY-MM-DD`
 PostgreSQL, `yyyy-MM-dd` Hive).
 
@@ -204,7 +204,7 @@ numerics: int and float do not mix, like everywhere else in the language).
 ## Strings
 
 `trim`, `toUpper`, `toLower`, `length`, and `position` are now ordinary
-`prelude.tetaue` definitions over the `sql_func`/`sql_infix` primitives (see
+`base/sql.tetaue` definitions over the `sql_func`/`sql_infix` primitives (see
 the `sql_dialect` mechanism in [sql-dialect.md](sql-dialect.md)) — only
 `reverse` remains a core builtin because sqlite lowers it to a scalar
 recursive CTE.
@@ -217,8 +217,8 @@ recursive CTE.
 | `position x n` | `POSITION(n IN x)` | Direct | **Mapped** `LOCATE(n, x)` | **Mapped** `INSTR(x, n)` | `INSTR(x, n)` |
 | `replace x s r` | `REPLACE(x, s, r)` | Direct | Direct | Direct | Direct |
 | `reverse x` | `REVERSE(x)` | Direct | Direct | correlated recursive-CTE fallback | Direct |
-| `left_substring x n` | `LEFT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, 1, n)` | Direct |
-| `right_substring x n` | `RIGHT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, -n)` | Direct |
+| `leftSubstring x n` | `LEFT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, 1, n)` | Direct |
+| `rightSubstring x n` | `RIGHT(x, n)` | Direct | Direct | **Fallback** `SUBSTR(x, -n)` | Direct |
 | `lpad x n p` / `rpad x n p` (pad required) | `LPAD(x, n, p)` | Direct | Direct | `PRINTF`/`REPLACE`/`SUBSTR` composition | Direct |
 
 Regex helpers are deliberately absent from the common prelude: stock SQLite
@@ -230,11 +230,11 @@ extension or reintroduce a dialect-only render failure.
 | tetaue | SQL |
 |---|---|
 | `like x "a%"` | `x LIKE 'a%'` (binary operator) |
-| `null_if x y` | `NULLIF(x, y)` |
-| `is_null x` / `is_not_null x` | `x IS NULL` / `x IS NOT NULL` |
+| `nullIf x y` | `NULLIF(x, y)` |
+| `isNull x` / `isNotNull x` | `x IS NULL` / `x IS NOT NULL` |
 | `exists q` | `EXISTS (subquery)` — correlated queries allowed |
 | `scalar q` | `(subquery)` — exactly one output column; result is `(maybe T)` |
-| `in_query x q` / `not_in_query x q` | `x [NOT] IN (subquery)` |
+| `inQuery x q` / `notInQuery x q` | `x [NOT] IN (subquery)` |
 | `fmap f x` | closed Functor lift over maybe values, lists, and query rows; SQL NULL propagates |
 | `replaceWith x fa` / `x <$ fa` | replace every value in a maybe, list, or query Functor |
 | `ap ff fa` / `ff <*> fa` | closed maybe/list Applicative application |
@@ -246,7 +246,7 @@ extension or reintroduce a dialect-only render failure.
 | `param "name"` | dialect bind placeholder (`?`, or `$n` in PostgreSQL) |
 | `cast x "int"` … | `CAST(x AS TYPE)` — target as a string literal |
 
-`try_cast` is also omitted because substituting ordinary `CAST` changes its
+`tryCast` is also omitted because substituting ordinary `CAST` changes its
 failure semantics on PostgreSQL, MySQL, SQLite, and Hive.
 
 The compiler owns a closed set of Haskell-inspired classes. `Eq` and `Ord`
@@ -256,7 +256,7 @@ queries; and `Applicative`, `Alternative`, and `Monad` are executable for
 maybe values and lists. List application/sequencing uses Cartesian-product
 order, while list bind concatenates the function's result lists. Queries are
 not generic Monad instances: relational composition remains explicit through
-query steps, fixed joins, and `join_lateral`. Higher-kinded user declarations
+query steps, fixed joins, and `joinLateral`. Higher-kinded user declarations
 and generic dictionaries are not yet representable, so there is no
 polymorphic `mempty` or `pure` surface.
 
@@ -307,7 +307,7 @@ the unified branch value type.
 
 | tetaue | SQL |
 |---|---|
-| `count_distinct x` | `COUNT(DISTINCT x)` |
+| `countDistinct x` | `COUNT(DISTINCT x)` |
 | `drop n` | `OFFSET n` (dialect-specific without LIMIT; Hive errors) |
 
 `drop` composes with `take` in source order: `drop 10 & take 5` is
@@ -316,11 +316,11 @@ derived table and applies `OFFSET 2` to it.
 
 ## Lateral joins
 
-`join_lateral` takes a left-row → right-query function instead of a static
+`joinLateral` takes a left-row → right-query function instead of a static
 right query, so the right side can be correlated:
 
 ```
-q = users & join_lateral
+q = users & joinLateral
     (l => (orders & filter (o => o.user_id == l.id) & sort (o => desc o.total) & take 1))
     (l => r => true)
     (l => r => { id = l.id, name = l.name, total = r.total })
@@ -343,13 +343,13 @@ inferred result row contains only the selected fields.
 
 ## Filtered aggregates
 
-`count_where`, `sum_where`, `avg_where`, `min_where`, and
-`max_where` take a boolean condition followed by the value:
+`countWhere`, `sumWhere`, `avgWhere`, `minWhere`, and
+`maxWhere` take a boolean condition followed by the value:
 
 ```
 fold (o => {
-    paid_total = sum_where (o.status == "paid") o.total,
-    n         = count_where (o.status == "paid") o.total,
+    paid_total = sumWhere (o.status == "paid") o.total,
+    n         = countWhere (o.status == "paid") o.total,
 })
 ```
 
@@ -389,8 +389,8 @@ function with a spec record (fields optional; `{}` renders `OVER ()`).
 `rows = [n, m]` renders `ROWS BETWEEN n PRECEDING AND m FOLLOWING`.
 `partition` takes
 a list of column expressions (or one), `order` takes asc/desc items like
-`sort`. **Zero-argument functions (`row_number`, `rank`, `dense_rank`,
-`percent_rank`) can be written bare** — `over row_number {...}`; functions
+`sort`. **Zero-argument functions (`rowNumber`, `rank`, `denseRank`,
+`percentRank`) can be written bare** — `over rowNumber {...}`; functions
 with arguments need parens (`over (ntile 4) {...}`, `over (lag u.salary 1 (just 0))
 {...}`, `over (sum u.salary) {...}`), because a bare `lag u.salary 1 (just 0)` would
 flatten into separate application arguments (an error message explains this).
@@ -399,17 +399,17 @@ SQLite 3.25+, Trino, Hive all support the standard `FN(...) OVER (...)` form):
 
 | tetaue | SQL |
 |---|---|
-| `over row_number { ... }` | `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` |
-| `rank`, `dense_rank`, `percent_rank` | `RANK()` / `DENSE_RANK()` / `PERCENT_RANK()` |
+| `over rowNumber { ... }` | `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` |
+| `rank`, `denseRank`, `percentRank` | `RANK()` / `DENSE_RANK()` / `PERCENT_RANK()` |
 | `over (ntile 4) { ... }` | `NTILE(4) OVER (...)`, `ntile` takes a numeric bucket count |
 | `over (lag u.x 1 (just 0)) { ... }` | `LAG(x, 1, 0) OVER (...)`, `lead` — value, offset required, optional default |
 | `over (sum u.x) { ... }` | `SUM(x) OVER (...)`, windowed `avg`/`count`/`min`/`max`/`array` too |
 
 The wrapped expression must be an aggregate (`sum`/`avg`/`count`/`min`/`max`/`array`)
-or a window-only function (`row_number`, `rank`, `dense_rank`,
-`percent_rank`, `ntile`, `lag`, `lead`) — anything else is rejected. The
+or a window-only function (`rowNumber`, `rank`, `denseRank`,
+`percentRank`, `ntile`, `lag`, `lead`) — anything else is rejected. The
 window-only functions are also rejected **outside** `over` (a bare
-`row_number` in a projection is an error, since `ROW_NUMBER()` without
+`rowNumber` in a projection is an error, since `ROW_NUMBER()` without
 `OVER` is invalid SQL), as are window functions inside `filter` predicates,
 join conditions, and window specs' own `partition`/`order`. Window results are
 referenced in later steps by their projection alias (`WHERE rn = 1`), because
@@ -421,7 +421,7 @@ inlining the `OVER` expression would be invalid SQL.
   annotations exist, but there are no array literals, indexing, or
   element-wise array functions yet.
 - **Query features** — none of the original gaps remain for the supported
-  dialects: correlated `exists`, `scalar`, `in_query`, `join_lateral`,
+  dialects: correlated `exists`, `scalar`, `inQuery`, `joinLateral`,
   and recursive CTEs are implemented.
 - `case` inside `fold` is supported when branch values wrap aggregates and
   the CASE conditions are constants or grouped columns:
@@ -448,7 +448,7 @@ inlining the `OVER` expression would be invalid SQL.
   `case` short-circuits) and composes `sql_func` / `sql_infix` /
   `sql_bare` to emit the dialect-specific SQL. Migrated functions: `toUpper`,
   `toLower`, `length`, `trim`, `replace`, `mod`, `like`, `div`,
-  `left_substring` / `right_substring`, `abs`, `ceil`, `floor`, `sqrt`,
+  `leftSubstring` / `rightSubstring`, `abs`, `ceil`, `floor`, `sqrt`,
   `pow`, `position`. `reverse` stays a core builtin (sqlite's scalar
   recursive-CTE fallback is query-shape). See
   `docs/design/sql-dialect.md`.

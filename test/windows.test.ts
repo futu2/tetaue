@@ -11,10 +11,10 @@ const USERS = `users: query {
 
 const RANKED = `
     q = users & map (u => {
-        rn = over (row_number) { partition = [u.dept], order = [desc u.salary] },
+        rn = over (rowNumber) { partition = [u.dept], order = [desc u.salary] },
         r = over (rank) { partition = [u.dept], order = [desc u.salary] },
-        dr = over (dense_rank) { partition = [u.dept], order = [desc u.salary] },
-        pr = over (percent_rank) { partition = [u.dept], order = [desc u.salary] },
+        dr = over (denseRank) { partition = [u.dept], order = [desc u.salary] },
+        pr = over (percentRank) { partition = [u.dept], order = [desc u.salary] },
         nt = over (ntile 4) { partition = [u.dept], order = [desc u.salary] },
     })
 `;
@@ -67,7 +67,7 @@ describe('window functions', () => {
     });
 
     test('empty spec renders OVER ()', () => {
-        const sql = render(`${USERS}\nq = users & map (u => { e = over (row_number) {} })`, 'trino');
+        const sql = render(`${USERS}\nq = users & map (u => { e = over (rowNumber) {} })`, 'trino');
         expect(sql).toContain('ROW_NUMBER() OVER () AS e');
     });
 
@@ -80,12 +80,12 @@ describe('window functions', () => {
     });
 
     test('single (non-list) partition and order values are accepted', () => {
-        const sql = render(`${USERS}\nq = users & map (u => { rn = over (row_number) { partition = u.dept, order = desc u.salary } })`, 'trino');
+        const sql = render(`${USERS}\nq = users & map (u => { rn = over (rowNumber) { partition = u.dept, order = desc u.salary } })`, 'trino');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn');
     });
 
     test('multi-column partition', () => {
-        const sql = render(`${USERS}\nq = users & map (u => { rn = over (row_number) { partition = [u.dept, u.name] } })`, 'trino');
+        const sql = render(`${USERS}\nq = users & map (u => { rn = over (rowNumber) { partition = [u.dept, u.name] } })`, 'trino');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY dept, name) AS rn');
     });
 
@@ -93,10 +93,10 @@ describe('window functions', () => {
         const sql = render(`
             ${USERS}
             q = users & map (u => {
-                rn = over row_number { partition = [u.dept], order = [desc u.salary] },
+                rn = over rowNumber { partition = [u.dept], order = [desc u.salary] },
                 r = over rank { partition = [u.dept] },
-                dr = over dense_rank {},
-                pr = over percent_rank {},
+                dr = over denseRank {},
+                pr = over percentRank {},
             })
         `, 'trino');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn');
@@ -115,7 +115,7 @@ describe('window functions', () => {
         const sql = render(`
             ${USERS}
             q = users
-                & map (u => { id = u.id, rn = over (row_number) { partition = [u.dept], order = [desc u.salary] } })
+                & map (u => { id = u.id, rn = over (rowNumber) { partition = [u.dept], order = [desc u.salary] } })
                 & filter (u => u.rn == 1)
         `, 'trino');
         expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn');
@@ -126,7 +126,7 @@ describe('window functions', () => {
 
 describe('window function validation', () => {
     test('window-only functions must be wrapped in over', () => {
-        for (const fn of ['row_number', 'rank', 'dense_rank', 'percent_rank', 'ntile 4', 'lag u.salary 1 nothing', 'lead u.salary 1 nothing']) {
+        for (const fn of ['rowNumber', 'rank', 'denseRank', 'percentRank', 'ntile 4', 'lag u.salary 1 nothing', 'lead u.salary 1 nothing']) {
             expect(errors(`${USERS}\nq = users & map (u => { x = ${fn} })`).join('\n')).toContain('must be wrapped in over');
         }
     });
@@ -137,16 +137,16 @@ describe('window function validation', () => {
     });
 
     test('over spec must be a record with only partition/order', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { x = over (row_number) 5 })`).join('\n')).toContain('over expects a spec record');
-        expect(errors(`${USERS}\nq = users & map (u => { x = over (row_number) { foo = 1 } })`).join('\n')).toContain("unknown over spec field 'foo'");
+        expect(errors(`${USERS}\nq = users & map (u => { x = over (rowNumber) 5 })`).join('\n')).toContain('over expects a spec record');
+        expect(errors(`${USERS}\nq = users & map (u => { x = over (rowNumber) { foo = 1 } })`).join('\n')).toContain("unknown over spec field 'foo'");
     });
 
     test('partition entries must be plain expressions', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { x = over (row_number) { partition = [sum u.salary] } })`).join('\n')).toContain('partition cannot contain aggregates');
+        expect(errors(`${USERS}\nq = users & map (u => { x = over (rowNumber) { partition = [sum u.salary] } })`).join('\n')).toContain('partition cannot contain aggregates');
     });
 
     test('order entries must be asc/desc items', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { x = over (row_number) { order = [u.salary] } })`).join('\n')).toContain('over spec expects order items like asc u.name');
+        expect(errors(`${USERS}\nq = users & map (u => { x = over (rowNumber) { order = [u.salary] } })`).join('\n')).toContain('over spec expects order items like asc u.name');
     });
 
     test('lag/lead validate their arguments', () => {
@@ -156,7 +156,7 @@ describe('window function validation', () => {
     });
 
     test('window functions are rejected in filter predicates', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => over (row_number) {} == 1)`).join('\n')).toContain('filter predicate cannot contain window functions');
+        expect(errors(`${USERS}\nq = users & filter (u => over (rowNumber) {} == 1)`).join('\n')).toContain('filter predicate cannot contain window functions');
     });
 });
 
@@ -165,7 +165,7 @@ describe('type inference', () => {
         const src = `
             ${USERS}
             q = users & map (u => {
-                rn = over (row_number) { partition = [u.dept], order = [desc u.salary] },
+                rn = over (rowNumber) { partition = [u.dept], order = [desc u.salary] },
                 lg = over (lag u.salary 1 (just 0.0)) { partition = [u.dept] },
                 ws = over (sum u.salary) { partition = [u.dept] },
             })
@@ -176,7 +176,7 @@ describe('type inference', () => {
     test('over result keeps the window function type', () => {
         const src = `
             ${USERS}
-            q = users & map (u => { rn = over (row_number) {} })
+            q = users & map (u => { rn = over (rowNumber) {} })
                 & filter (u => u.rn >= 1)
         `;
         expect(typeErrors(src)).toEqual([]);
@@ -184,12 +184,12 @@ describe('type inference', () => {
 });
 
 describe('review fix: window-only functions are a static mode', () => {
-    test('inference types row_number as a window-mode value and requires over in projections', () => {
-        expect(typeErrors(`${USERS}\nq = users & map (u => { x = row_number })`).join('\n')).toContain('row_number must be wrapped in over');
-        expect(typeErrors(`${USERS}\nq = users & map (u => { x = over (row_number) {} })`)).toEqual([]);
+    test('inference types rowNumber as a window-mode value and requires over in projections', () => {
+        expect(typeErrors(`${USERS}\nq = users & map (u => { x = rowNumber })`).join('\n')).toContain('rowNumber must be wrapped in over');
+        expect(typeErrors(`${USERS}\nq = users & map (u => { x = over (rowNumber) {} })`)).toEqual([]);
     });
 
     test('window-mode values cannot be used as plain scalars', () => {
-        expect(typeErrors('x = row_number + 1').join('\n')).toContain("'+' requires numeric operands");
+        expect(typeErrors('x = rowNumber + 1').join('\n')).toContain("'+' requires numeric operands");
     });
 });

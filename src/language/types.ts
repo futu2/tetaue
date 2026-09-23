@@ -511,6 +511,17 @@ export class TypeUniverse {
         if (b.kind === 'builtin') return this.unifyInternal(a, b.of);
 
         if (a.kind === 'var') {
+            // A RIGID variable (skolemized from an annotation) must not be
+            // bound to a structure — but meeting a plain flexible variable is
+            // fine, and the flexible side is the one to bind. Without this,
+            // applying a polymorphic helper inside an annotated lambda body
+            // (`f: a -> int -> a = x => m => g "u" x m`) fails: the helper's
+            // instantiated variable reached the rigid `a`, unification
+            // refused, and a correct application was reported as a mismatch.
+            if (this.varInfo(a.id).rigid && b.kind === 'var' && !this.varInfo(b.id).rigid) {
+                this.bind(b.id, a);
+                return a;
+            }
             this.bind(a.id, b);
             return b;
         }

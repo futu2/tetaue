@@ -217,7 +217,7 @@ their payload — but the type-checking pass deliberately re-inspects the raw,
 ## 7. SQL NULL and outer joins
 
 `maybe` is the type of SQL NULL. `null : ∀a. maybe a`, `just : a -> maybe a`,
-`from_maybe : a -> maybe a -> a`, `is_null : maybe a -> bool` (builtin.ts:243-248).
+`fromMaybe : a -> maybe a -> a`, `isNull : maybe a -> bool` (builtin.ts:243-248).
 There is **no** implicit `T → maybe T`.
 
 **Outer joins** expose the null-extended input as a **field-wise** null-extended
@@ -267,12 +267,12 @@ map  (u => { ℓᵢ = eᵢ })     rejects group / order / window entries
                              (inference.ts:2220-2233)
 over (e) { ... }            requires e : mode agg t ∨ mode window t
                              (inference.ts:1786)
-window-only (row_number…)    must be wrapped by over  (inference.ts:1781-1790)
+window-only (rowNumber…)    must be wrapped by over  (inference.ts:1781-1790)
 ```
 
 An un-aggregated plain column inside `fold` is a static error
 (`fold entry 'x' must be wrapped in an aggregate ... or group`); a `group`
-key in a `map` projection is a static error; a bare `row_number` outside
+key in a `map` projection is a static error; a bare `rowNumber` outside
 `over` is a static error (and the interpreter renders the same diagnostic so
 the merged checker dedupes exactly — `inference.ts:2224-2229`).
 
@@ -344,7 +344,7 @@ what it would take to eliminate:
 3. **`truth`** (types.ts:147, 490-508). SQL three-valued logic is encoded as
    a *third* boolean that unifies with `bool` and `maybe bool`. It works but
    it is not compositional — there is no `truth → τ` arrow type, and
-   `is_true`/`is_false`/`is_unknown` (inference.ts:1952) are special-cased.
+   `isTrue`/`isFalse`/`isUnknown` (inference.ts:1952) are special-cased.
    *To eliminate*: an overloading `Pred` constraint (`Pred bool`, `Pred (maybe
    bool)`) resolved like the other classes.
 4. **`order` as an atomic type** (builtin.ts:151-152, inference.ts:2620).

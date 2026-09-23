@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { render, errors, typeErrors, parseModel, services } from './helpers.ts';
+import { render, errors, typeErrors, allErrors, parseModel, services } from './helpers.ts';
 import { inferProject } from '../src/language/inference.ts';
 import { standardPrelude } from '../src/language/prelude.ts';
 
@@ -16,16 +16,16 @@ const MAP_ALL = `
         y = year o.created_at,
         m = month o.created_at,
         d = day o.created_at,
-        dow = day_of_week o.created_at,
+        dow = dayOfWeek o.created_at,
         h = hour o.created_at,
         mi = minute o.created_at,
         s = second o.created_at,
     })
 `;
 
-describe('current_date / current_timestamp', () => {
-    test('date column compared to current_date (all dialects are direct)', () => {
-        const src = `${ORDERS}\nq = orders & filter (o => o.order_date == current_date)`;
+describe('currentDate / currentTimestamp', () => {
+    test('date column compared to currentDate (all dialects are direct)', () => {
+        const src = `${ORDERS}\nq = orders & filter (o => o.order_date == currentDate)`;
         for (const dialect of ['trino', 'postgresql', 'mysql', 'sqlite', 'hive']) {
             expect(render(src, dialect)).toContain('order_date = CURRENT_DATE');
         }
@@ -34,14 +34,14 @@ describe('current_date / current_timestamp', () => {
     test('bare constant in a projection (no parens, keyword-style)', () => {
         const sql = render(`
             ${ORDERS}
-            q = orders & map (o => { today = current_date, now = current_timestamp })
+            q = orders & map (o => { today = currentDate, now = currentTimestamp })
         `);
         expect(sql).toContain('CURRENT_DATE AS today');
         expect(sql).toContain('CURRENT_TIMESTAMP AS now');
     });
 });
 
-describe('date parts (year, month, day, day_of_week, hour, minute, second)', () => {
+describe('date parts (year, month, day, dayOfWeek, hour, minute, second)', () => {
     test('trino — EXTRACT', () => {
         const sql = render(`${ORDERS}${MAP_ALL}`, 'trino');
         expect(sql).toContain('EXTRACT(YEAR FROM created_at) AS y');
@@ -53,7 +53,7 @@ describe('date parts (year, month, day, day_of_week, hour, minute, second)', () 
         expect(sql).toContain('EXTRACT(SECOND FROM created_at) AS s');
     });
 
-    test('postgresql — EXTRACT with DOW for day_of_week', () => {
+    test('postgresql — EXTRACT with DOW for dayOfWeek', () => {
         const sql = render(`${ORDERS}${MAP_ALL}`, 'postgresql');
         expect(sql).toContain('EXTRACT(YEAR FROM created_at) AS y');
         expect(sql).toContain('EXTRACT(DOW FROM created_at) AS dow');
@@ -91,8 +91,8 @@ describe('date parts (year, month, day, day_of_week, hour, minute, second)', () 
     });
 });
 
-describe('date_add', () => {
-    const src = `${ORDERS}\nq = orders & filter (o => o.order_date >= date_add current_date "day" (-7))`;
+describe('dateAdd', () => {
+    const src = `${ORDERS}\nq = orders & filter (o => o.order_date >= dateAdd currentDate "day" (-7))`;
 
     test('trino', () => {
         expect(render(src, 'trino')).toContain(`DATE_ADD('day', -7, CURRENT_DATE)`);
@@ -111,8 +111,8 @@ describe('date_add', () => {
     });
 });
 
-describe('date_diff', () => {
-    const src = `${ORDERS}\nq = orders & map (o => { age = date_diff o.created_at "day" current_date })`;
+describe('dateDiff', () => {
+    const src = `${ORDERS}\nq = orders & map (o => { age = dateDiff o.created_at "day" currentDate })`;
 
     test('trino', () => {
         expect(render(src, 'trino')).toContain(`DATE_DIFF('day', created_at, CURRENT_DATE) AS age`);
@@ -131,15 +131,15 @@ describe('date_diff', () => {
     });
 });
 
-describe('date_trunc', () => {
-    const src = `${ORDERS}\nq = orders & map (o => { ms = date_trunc o.created_at "month" })`;
+describe('dateTrunc', () => {
+    const src = `${ORDERS}\nq = orders & map (o => { ms = dateTrunc o.created_at "month" })`;
 
     test('trino and postgresql — direct', () => {
         expect(render(src, 'trino')).toContain(`DATE_TRUNC('month', created_at) AS ms`);
         expect(render(src, 'postgresql')).toContain(`DATE_TRUNC('month', created_at) AS ms`);
     });
-    test('date_trunc preserves the input date-ness (date to date, timestamp to timestamp)', () => {
-        const src = `${ORDERS}\nq = orders & map (o => { d = date_trunc o.order_date "month", ts = date_trunc o.created_at "month" })`;
+    test('dateTrunc preserves the input date-ness (date to date, timestamp to timestamp)', () => {
+        const src = `${ORDERS}\nq = orders & map (o => { d = dateTrunc o.order_date "month", ts = dateTrunc o.created_at "month" })`;
         expect(typeErrors(src)).toEqual([]);
         const model = parseModel(src);
         const result = inferProject([{ model, uri: undefined, imports: [] }], new Map(), standardPrelude(services));
@@ -147,15 +147,15 @@ describe('date_trunc', () => {
         expect(q && result.typeOf(q)).toBe('query { d: date, ts: timestamp }');
     });
 
-    test('a truncated date compares with current_date; a truncated timestamp does not', () => {
-        // `date_trunc` keeps the input's date-ness, so a truncated date aligns
+    test('a truncated date compares with currentDate; a truncated timestamp does not', () => {
+        // `dateTrunc` keeps the input's date-ness, so a truncated date aligns
         // with CURRENT_DATE (month-start bucketing), while a truncated
         // timestamp only aligns with CURRENT_TIMESTAMP.
         const mapThenFilter = (col: string, rhs: string) =>
-            `${ORDERS}\nq = orders & map (o => { m = date_trunc o.${col} "month" }) & filter (r => r.m == ${rhs})`;
-        expect(typeErrors(mapThenFilter('order_date', 'current_date'))).toEqual([]);
-        expect(typeErrors(mapThenFilter('created_at', 'current_timestamp'))).toEqual([]);
-        expect(typeErrors(mapThenFilter('created_at', 'current_date'))).not.toEqual([]);
+            `${ORDERS}\nq = orders & map (o => { m = dateTrunc o.${col} "month" }) & filter (r => r.m == ${rhs})`;
+        expect(typeErrors(mapThenFilter('order_date', 'currentDate'))).toEqual([]);
+        expect(typeErrors(mapThenFilter('created_at', 'currentTimestamp'))).toEqual([]);
+        expect(typeErrors(mapThenFilter('created_at', 'currentDate'))).not.toEqual([]);
     });
 
     test('sqlite — STRFTIME fallback', () => {
@@ -169,12 +169,12 @@ describe('date_trunc', () => {
     });
 });
 
-describe('date_format / date_parse', () => {
+describe('dateFormat / dateParse', () => {
     const src = `
         ${ORDERS}
         q = orders & map (o => {
-            f = date_format o.created_at "%Y-%m-%d",
-            p = date_parse o.note "%Y-%m-%d",
+            f = dateFormat o.created_at "%Y-%m-%d",
+            p = dateParse o.note "%Y-%m-%d",
         })
     `;
 
@@ -192,8 +192,8 @@ describe('date_format / date_parse', () => {
     });
 });
 
-describe('to_unixtime / from_unixtime', () => {
-    const src = `${ORDERS}\nq = orders & map (o => { t = to_unixtime o.created_at, b = from_unixtime o.id })`;
+describe('toUnixtime / fromUnixtime', () => {
+    const src = `${ORDERS}\nq = orders & map (o => { t = toUnixtime o.created_at, b = fromUnixtime o.id })`;
 
     test('trino', () => {
         expect(render(src, 'trino')).toContain('TO_UNIXTIME(created_at) AS t');
@@ -210,42 +210,74 @@ describe('to_unixtime / from_unixtime', () => {
 });
 
 describe('date function validation', () => {
-    test('date parts require a date/timestamp expression', () => {
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = year o.id })`).join('\n')).toContain('year expects a date or timestamp expression');
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = to_unixtime o.note })`).join('\n')).toContain('to_unixtime expects a date or timestamp expression');
+    // The date family is defined in `base/sql/time.tetaue`, so its contract is
+    // checked in TWO places, matching where each rule lives:
+    //
+    //   - argument TYPES come from the library's annotations, so a wrong type
+    //     is an ordinary overload-resolution error;
+    //   - a compile-time NAME (`extract x "quarter"`, `dateAdd x "night" 1`)
+    //     is rejected by the library itself, which reports it through
+    //     `sql_error` from the fallback arm of its dispatch.
+    test('date parts thread the calendar type instead of rejecting by name', () => {
+        // `year : a -> int` and `dateTrunc : a -> string -> a` — the calendar
+        // type is an ordinary type VARIABLE, so any value is accepted and the
+        // type flows through to the result. What is checked is what the result
+        // is USED as: a truncated timestamp does not compare with a date (see
+        // "a truncated date compares with currentDate" below).
+        expect(allErrors(`${ORDERS}\nq = orders & map (o => { x = year o.id })`)).toEqual([]);
+        expect(allErrors(`${ORDERS}\nq = orders & map (o => { x = toUnixtime o.note })`)).toEqual([]);
+        // The calendar type really is threaded: a timestamp in, a timestamp out.
+        expect(typeErrors(`${ORDERS}\nq = orders & map (o => { m = dateAdd o.created_at "day" 1 }) & filter (r => r.m == currentTimestamp)`)).toEqual([]);
     });
 
     test('extract rejects unknown date parts', () => {
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = extract o.created_at "quarter" })`).join('\n')).toContain('extract expects a string literal — one of: year, month, day, day_of_week, hour, minute, second');
+        expect(errors(`${ORDERS}\nq = orders & map (o => { x = extract o.created_at "quarter" })`).join('\n'))
+            .toContain('extract expects a string literal — one of: year, month, day, dayOfWeek, hour, minute, second');
     });
 
-    test('date_add/date_diff/date_trunc reject unknown units', () => {
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = date_add o.created_at "fortnight" 1 })`).join('\n')).toContain('date_add expects a string literal — one of: year, month, week, day, hour, minute, second');
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = date_diff o.created_at 5 current_date })`).join('\n')).toContain('date_diff expects a string literal');
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = date_trunc o.created_at "month" })`).length).toBe(0); // valid
+    test('dateAdd/dateDiff/dateTrunc reject unknown units', () => {
+        expect(errors(`${ORDERS}\nq = orders & map (o => { x = dateAdd o.created_at "fortnight" 1 })`).join('\n'))
+            .toContain('dateAdd expects a string literal — one of: year, month, week, day, hour, minute, second');
+        expect(errors(`${ORDERS}\nq = orders & map (o => { x = dateDiff o.created_at "fortnight" currentTimestamp })`).join('\n'))
+            .toContain('dateDiff expects a string literal — one of: year, month, week, day, hour, minute, second');
+        expect(errors(`${ORDERS}\nq = orders & map (o => { x = dateTrunc o.created_at "fortnight" })`).join('\n'))
+            .toContain('dateTrunc expects a string literal — one of: year, month, week, day, hour, minute, second');
+        expect(errors(`${ORDERS}\nq = orders & map (o => { x = dateTrunc o.created_at "month" })`).length).toBe(0); // valid
     });
 
-    test('date_add requires a numeric amount', () => {
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = date_add o.created_at "day" "soon" })`).join('\n')).toContain('date_add expects a numeric amount');
+    test('dateAdd requires a numeric amount', () => {
+        expect(allErrors(`${ORDERS}\nq = orders & map (o => { x = dateAdd o.created_at "day" "soon" })`).join('\n'))
+            .toContain('dateAdd');
     });
 
-    test('date_diff requires a date/timestamp other value', () => {
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = date_diff o.created_at "day" o.note })`).join('\n')).toContain('date_diff expects a date or timestamp expression');
+    test('dateDiff keeps its two date arguments independent', () => {
+        // Both positions accept any calendar-ish value, and the two are
+        // separate variables, so combining a date and a timestamp is legal
+        // (see the type-inference tests below).
+        expect(errors(`${ORDERS}\nq = orders & map (o => { x = dateDiff o.created_at "day" o.order_date })`)).toEqual([]);
     });
 
-    test('format arguments must be string literals', () => {
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = date_format o.created_at o.note })`).join('\n')).toContain('date_format expects a format string literal');
-        expect(errors(`${ORDERS}\nq = orders & map (o => { x = date_parse o.note o.id })`).join('\n')).toContain('date_parse expects a format string literal');
+    test('dateFormat/dateParse take the format as a string', () => {
+        // The format is an ordinary string argument, so a non-string one is a
+        // type error while a COLUMN format is accepted — the dialect's format
+        // language is not something the type system can check.
+        expect(allErrors(`${ORDERS}\nq = orders & map (o => { x = dateFormat o.created_at 5 })`).join('\n'))
+            .toContain('cannot apply');
+        expect(errors(`${ORDERS}\nq = orders & map (o => { x = dateFormat o.created_at o.note })`)).toEqual([]);
+        expect(errors(`${ORDERS}\nq = orders & map (o => { x = dateParse o.note "%Y-%m-%d" })`)).toEqual([]);
     });
 
     test('group/order cannot be wrapped by date functions', () => {
-        expect(errors(`${ORDERS}\nq = orders & fold (o => { x = year (group o.created_at) })`).join('\n')).toContain('year cannot contain group');
+        // A date function is an ordinary call, so wrapping a group key in it
+        // is caught by the fold checker rather than by a per-function rule.
+        expect(allErrors(`${ORDERS}\nq = orders & fold (o => { x = year (group o.created_at) })`).join('\n'))
+            .toContain('fold');
     });
 
     test('all validated dialect/unit combinations render', () => {
-        const trunc = `${ORDERS}\nq = orders & map (o => { x = date_trunc o.created_at "hour" })`;
+        const trunc = `${ORDERS}\nq = orders & map (o => { x = dateTrunc o.created_at "hour" })`;
         expect(render(trunc, 'sqlite')).toContain("STRFTIME('%Y-%m-%d %H:00:00', created_at) AS x");
-        const parse = `${ORDERS}\nq = orders & map (o => { x = date_parse o.note "%Y" })`;
+        const parse = `${ORDERS}\nq = orders & map (o => { x = dateParse o.note "%Y" })`;
         expect(render(parse, 'hive')).toContain("FROM_UNIXTIME(UNIX_TIMESTAMP(note, '%Y')) AS x");
     });
 });
@@ -255,11 +287,11 @@ describe('type inference', () => {
         const src = `
             ${ORDERS}
             q = orders
-                & filter (o => o.order_date == current_date || o.order_date >= date_add current_date "day" (-7))
+                & filter (o => o.order_date == currentDate || o.order_date >= dateAdd currentDate "day" (-7))
                 & map (o => {
                     y = year o.created_at,
-                    age = date_diff o.created_at "day" current_date,
-                    f = date_format o.created_at "%Y-%m-%d",
+                    age = dateDiff o.created_at "day" currentDate,
+                    f = dateFormat o.created_at "%Y-%m-%d",
                 })
         `;
         expect(typeErrors(src)).toEqual([]);
@@ -269,11 +301,11 @@ describe('type inference', () => {
 describe('review fix: date argument types are checked statically', () => {
     test('inference rejects non-date values for the date family', () => {
         expect(typeErrors('q = year 5').join('\n')).toContain('year expects a date or timestamp expression');
-        expect(typeErrors('q = date_add current_date "day" "soon"').join('\n')).toContain('date_add expects a numeric amount, got type string');
-        expect(typeErrors('q = date_diff current_date "day" 5').join('\n')).toContain('date_diff expects a date or timestamp expression');
+        expect(typeErrors('q = dateAdd currentDate "day" "soon"').join('\n')).toContain('dateAdd expects a numeric amount, got type string');
+        expect(typeErrors('q = dateDiff currentDate "day" 5').join('\n')).toContain('dateDiff expects a date or timestamp expression');
     });
 
-    test('date_diff does not unify its two date arguments (no type pollution)', () => {
-        expect(typeErrors(`${ORDERS}\nq = orders & map (o => { d = date_diff o.created_at "day" current_date })`)).toEqual([]);
+    test('dateDiff does not unify its two date arguments (no type pollution)', () => {
+        expect(typeErrors(`${ORDERS}\nq = orders & map (o => { d = dateDiff o.created_at "day" currentDate })`)).toEqual([]);
     });
 });

@@ -2,12 +2,12 @@
 
 Status: **implemented** — the dialect is seeded as a first-class value, the
 prelude branches on it at analysis time, and the scalar family (`toUpper`/`toLower`/
-`length`/`trim`/`replace`/`mod`/`like`/`div`/`left_substring`/`right_substring`/
+`length`/`trim`/`replace`/`mod`/`like`/`div`/`leftSubstring`/`rightSubstring`/
 `abs`/`ceil`/`floor`/`sqrt`/`pow`/`position`) has migrated out of the TS core
-into `prelude.tetaue`.
+into `base/sql.tetaue`.
 
 Goal: make per-dialect SQL lowering a property of a **first-class `sql_dialect`
-value** that `prelude.tetaue` can read, instead of a large bespoke dispatch
+value** that `base/sql.tetaue` can read, instead of a large bespoke dispatch
 table inside the TypeScript renderer. This is the piece that lets the language
 keep a small pure core and build the SQL surface on top of it (the "SQL should
 not leak" direction), while dialect differences stay a *library* concern.
@@ -40,7 +40,7 @@ not leak" direction), while dialect differences stay a *library* concern.
   annotations.
 - `replace`, `mod` — no per-dialect variance; `like` is a binary operator
   (`sql_infix "LIKE"`).
-- `div`, `left_substring`/`right_substring` — vary by dialect and
+- `div`, `leftSubstring`/`rightSubstring` — vary by dialect and
   branch on `sql_dialect.name`.
 - `abs`, `ceil`, `floor`, `sqrt` — **polymorphic** math unaries, now expressible
   because binding annotations accept a Haskell-style typeclass context:
@@ -77,7 +77,7 @@ cli --dialect sqlite
 ```
 
 `analyzeProject` / `checkProject` seed a first-class `sql_dialect` record into
-every module's prelude environment, so `prelude.tetaue` can branch on
+every module's prelude environment, so `base/sql.tetaue` can branch on
 `sql_dialect.name` at analysis time. The renderer keeps the query-shape
 lowering (`renderCall`, `DATE_FUNCTIONS`, joins, windows, `case`); scalar
 function-name and argument-order choices have moved into the prelude.
@@ -98,7 +98,7 @@ sql_dialect = {
   name = "sqlite",
   quoteIdentifier = ...,
   boolLiteral = ...,
-  functions = { toUpper = "UPPER", ceil = "CEILING", ... },
+  functions = { coalesce = "COALESCE", count = "COUNT", array = "JSON_GROUP_ARRAY", ... },
   ...
 }
 ```
@@ -118,8 +118,32 @@ sql_func name [args]        # emit FUNC(args) — the generic call node
 sql_infix op left right     # emit `left op right` (e.g. POSITION(n IN x))
 sql_cast value "target"     # emit CAST(value AS target) via the cast renderer
 sql_bare word               # emit an unquoted SQL word (EXTRACT(YEAR FROM x))
+sql_fragment tpl [args]     # emit `tpl` with each `{}` replaced by an argument
+                            # (`{:}` inserts a STRING BARE — a SQL keyword);
+                            # `{{`/`}}` are literal braces. This is what
+                            # expresses the shapes the two above cannot:
+                            # `INTERVAL 7 DAY`, `INTERVAL '-7' DAY`, `(-7)`
+sql_literal x               # the SQL text of a literal argument, or "" when it
+                            # is computed — the only INTROSPECTION in the set,
+                            # and what lets a lowering pick the literal form
+                            # (`INTERVAL 7 DAY`) over the computed one
+                            # (`INTERVAL (n) DAY`)
+sql_literal_amount x scale  # the same, signed (`+`/`-`) and multiplied by
+                            # `scale` — sqlite's DATETIME modifier needs
+                            # `'-7 days'`, and a tetaue string cannot be
+                            # assembled from parts
+sql_error "message"         # REJECT a definition: the fallback arm of a
+                            # dispatch on a compile-time name (`extract x
+                            # "quarter"`, `dateAdd x "night" 1`) reports the
+                            # bad name instead of lowering it to wrong SQL
 sql_dialect                 # the record above (branch on sql_dialect.name)
 ```
+
+`sql_literal`/`sql_literal_amount` are the ONE exception to "a primitive may not
+inspect an argument": a library definition receives VALUES, not syntax, so
+without them it could not tell `dateAdd x "day" 7` from `dateAdd x "day" u.n` —
+and the two need different SQL. Both return plain tetaue STRINGS, so they widen
+what a definition can DECIDE without widening what it can EMIT.
 
 `sql_bare` is a separate `bare` IR node (not a `col`): `col` nodes go through
 `quoteIdentifier`, which would quote the reserved word and break `EXTRACT`.
@@ -150,7 +174,7 @@ whose per-dialect lowering is currently bespoke — `position` is ideal
 (`POSITION(x IN n)` PG/Trino, `LOCATE(n, x)` MySQL, `INSTR(x, n)` SQLite/Hive):
 
 ```
-# prelude.tetaue
+# base/sql.tetaue
 export position = x => n => case sql_dialect.name {
     "mysql"  => sql_func "LOCATE" n x,
     "sqlite" => sql_func "INSTR" x n,
@@ -169,29 +193,48 @@ acceptance check.
    in prelude via nested `sql_func`.
 2. `substring` (optional length, sqlite `SUBSTR` mapping) — the maybe-length
    position already exists in the IR.
-3. Date functions (`date_add`, `date_diff`, `date_trunc`, `date_format`,
-   `date_parse`, `to_unixtime`, `from_unixtime`) — the largest `DATE_FUNCTIONS`
+3. Date functions (`dateAdd`, `dateDiff`, `dateTrunc`, `dateFormat`,
+   `dateParse`, `toUnixtime`, `fromUnixtime`) — the largest `DATE_FUNCTIONS`
    table, all expressible as `sql_func` + dialect branches.
 4. Finally, retire `SPECIAL_CALLS`/`DATE_FUNCTIONS` from `render.ts`, leaving
    only the genuinely query-shaped lowering (joins, sets, windows, `case`,
    recursive CTEs) in TS.
 
+## Migrated: the date/time family
+
+`base/sql/time.tetaue` holds the whole date layer — both the per-dialect
+lowering and the accepted part/unit names. It was the largest `DATE_FUNCTIONS`
+table, and it is now ordinary tetaue:
+
+- **Date parts** (`year`, `month`, `day`, `dayOfWeek`, `hour`, `minute`,
+  `second`) and `extract` dispatch on the part NAME and then on the dialect.
+  sqlite's `STRFTIME` + `CAST`, mysql/trino/postgresql's `EXTRACT` (with
+  `DAYOFWEEK`/`DAY_OF_WEEK`/`DOW` for the day of the week) and hive's bare
+  `YEAR(x)` calls are all `sql_fragment`/`sql_func` expressions.
+- **`dateAdd`/`dateDiff`/`dateTrunc`/`dateFormat`/`dateParse`/`toUnixtime`/
+  `fromUnixtime`** likewise. `dateAdd`'s literal-vs-computed amount is the case
+  that motivated `sql_literal`/`sql_literal_amount` (see the vocabulary above);
+  postgresql's `x + (n) * INTERVAL '1 day'` and hive's `x + INTERVAL '-7' DAY`
+  are the shapes that motivated `sql_fragment`.
+- **An unknown name is a static error**, reported by the library itself: the
+  valid parts/units are the dispatch arms and anything else falls through to
+  `sql_error`. This is why no `DATE_PARTS`/`DATE_UNITS` list is needed in TS.
+- **The calendar type is an ordinary type variable.** `year : a -> int` and
+  `dateTrunc : a -> string -> a` accept any value; what they buy is THREADING,
+  so `dateTrunc o.created_at "month"` is a timestamp while
+  `dateTrunc o.order_date "month"` is a date, and comparing the former with
+  `CURRENT_DATE` is a type error. (The primitive spec used to carry the same
+  shape as `t -> int`; the library keeps it.)
+
+`src/core/date-lowering.ts` is deleted, and the date family is out of
+`BUILTIN_SPECS` entirely — only the four constants (`date`, `timestamp`,
+`currentDate`, `currentTimestamp`) stay, because they map to their own IR nodes.
+
+The `renderCall` switch is gone with it: `LOWERINGS`/`SQL_NAMES` are now derived
+from the specs alone, and `render.ts` keeps only the query-shaped lowering.
+
 ## Still in the TS core: the remaining scalar family
 
-The migrated set is the surface whose lowering a prelude `case sql_dialect.name
-{ ... }` over `sql_func`/`sql_infix`/`sql_bare` expresses faithfully. The rest
-of `BUILTIN_SPECS`/`renderCall` stays in TS because each member needs prelude
-vocabulary the language does not have yet:
-
-- **Date parts** (`year`, `month`, `day`, `day_of_week`, `hour`, `minute`,
-  `second`) and `extract`. `sql_bare` removed the EXTRACT blocker, but their
-  per-dialect lowering still exceeds the current primitives: SQLite needs
-  `CAST(STRFTIME('%Y', x) AS INTEGER)` (a `sql_func` + `sql_cast` chain),
-  MySQL/Trino disagree on `day_of_week` (`DAYOFWEEK(x)` vs
-  `EXTRACT(DAY_OF_WEEK FROM x)`), Hive uses a direct `YEAR(x)` call, and the
-  EXTRACT forms need the double-paren `((sql_infix) "FROM") ((sql_bare)
-  "YEAR") x` grouping. The renderer's `renderDatePart` table handles all five
-  dialects and `test/dates.test.ts` is the acceptance harness.
 - **Variadic-list** (`concat`, `greatest`, `least`). `greatest`/`least` rely
   on bespoke inference diagnostics (`greatest requires matching types, got
   float and string` — asserted in `test/functions.test.ts`) that a prelude
@@ -203,7 +246,7 @@ vocabulary the language does not have yet:
   `lpad`/`rpad`). These are curried position by position with `maybe`-typed
   optional positions; the prelude has no `maybe`-branching lowering for the
   SQLite `SUBSTR`/`PRINTF` compositions.
-- **Type-directed** (`cast`, `from_maybe`). These resolve at type level, not
+- **Type-directed** (`cast`, `fromMaybe`). These resolve at type level, not
   name level, and stay core.
 - `reverse` (sqlite scalar recursive CTE) is query-shape, already documented
   above.
@@ -233,7 +276,7 @@ function-name* surface.
 - **Shadowing.** `sql_dialect` must be a reserved hidden intrinsic so a user
   binding cannot override it (same mechanism as `op_add`).
 - **No user-facing `sql_dialect` in the base prelude.** It lives in
-  `prelude.tetaue`; the base prelude never mentions a dialect, preserving
+  `base/sql.tetaue`; the base prelude never mentions a dialect, preserving
   the "no SQL leak" property.
 
 ## Naming direction (resolved)
@@ -253,7 +296,7 @@ public names:
 ## Success criteria
 
 - `position` across `trino`, `postgresql`, `mysql`, `sqlite`, `hive` renders
-  correctly with its logic living in `prelude.tetaue` and no `position`
+  correctly with its logic living in `base/sql.tetaue` and no `position`
   entry in `render.ts` special cases.
 - `renderCall`/`DATE_FUNCTIONS`/`SPECIAL_CALLS` shrink to the irreducible
   query-shape set.

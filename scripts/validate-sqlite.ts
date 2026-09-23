@@ -67,6 +67,7 @@ const EXAMPLES = [
     'examples/rename.tetaue',
     'examples/report.tetaue',
     'examples/selective.tetaue',
+    'examples/set-operations.tetaue',
     'examples/strings.tetaue',
     'examples/tables.tetaue',
     'examples/lib-project/main.tetaue',

@@ -130,7 +130,7 @@ describe('string functions', () => {
     });
 
     test('left/right substring; sqlite uses SUBSTR', () => {
-        const src = `${USERS}\nq = users & map (u => { l = left_substring u.name 3, r = right_substring u.name 2 })`;
+        const src = `${USERS}\nq = users & map (u => { l = leftSubstring u.name 3, r = rightSubstring u.name 2 })`;
         expect(render(src, 'trino')).toContain('LEFT(name, 3) AS l');
         expect(render(src, 'trino')).toContain('RIGHT(name, 2) AS r');
         expect(render(src, 'sqlite')).toContain('SUBSTR(name, 1, 3) AS l');
@@ -158,22 +158,22 @@ describe('like and null handling', () => {
         expect(sql).toContain(`name LIKE 'a%'`);
     });
 
-    test('null_if / is_null / is_not_null', () => {
+    test('nullIf / isNull / isNotNull', () => {
         const sql = render(`
             ${USERS}
             q = users & map (u => {
-                n = null_if u.name "",
-                a = is_null u.name,
-                b = is_not_null u.name,
+                n = nullIf u.name "",
+                a = isNull u.name,
+                b = isNotNull u.name,
             })
         `);
-        expect(sql).toContain(`NULL_IF(name, '') AS n`);
+        expect(sql).toContain(`NULLIF(name, '') AS n`);
         expect(sql).toContain('name IS NULL AS a');
         expect(sql).toContain('name IS NOT NULL AS b');
     });
 
-    test('null_if requires matching types', () => {
-        expect(errors(`${USERS}\nq = users & map (u => { n = null_if u.id "" })`).join('\n')).toContain('null_if requires matching types');
+    test('nullIf requires matching types', () => {
+        expect(errors(`${USERS}\nq = users & map (u => { n = nullIf u.id "" })`).join('\n')).toContain('nullIf requires matching types');
     });
 });
 
@@ -323,11 +323,35 @@ describe('cast', () => {
 });
 
 describe('non-portable functions are not in the common prelude', () => {
-    test('regex helpers and try_cast are unknown in every dialect', () => {
-        for (const name of ['regex_like', 'regex_replace', 'regex_extract', 'try_cast']) {
+    test('regex helpers are unknown in every dialect', () => {
+        for (const name of ['regex_like', 'regex_replace', 'regex_extract']) {
             const source = `${USERS}\nq = users & map (u => { x = ${name} u.name })`;
             expect(allErrors(source).join('\n')).toContain(`unknown identifier '${name}'`);
         }
+    });
+});
+
+describe('tryCast', () => {
+    test('types like cast and renders TRY_CAST where the dialect has it', () => {
+        const source = `${USERS}\nq = users & map (u => { i = tryCast u.name "int" })`;
+        expect(typeErrors(source)).toEqual([]);
+        for (const dialect of ['postgresql', 'mysql', 'trino', 'hive']) {
+            expect(render(source, dialect)).toContain('TRY_CAST(name AS');
+        }
+    });
+
+    test('emulates the NULL result on sqlite, which has no TRY_CAST', () => {
+        // SQLite detects the failed conversion by the round-trip test: a
+        // value that does not survive CAST(... AS <target>) back to TEXT was
+        // not convertible, so the CASE yields NULL.
+        const rendered = render(`${USERS}\nq = users & map (u => { i = tryCast u.name "int" })`, 'sqlite');
+        expect(rendered).toContain('CASE WHEN');
+        expect(rendered).toContain('ELSE NULL END');
+    });
+
+    test('validates the target type like cast', () => {
+        expect(errors(`${USERS}\nq = users & map (u => { i = tryCast u.id "integer" })`).join('\n'))
+            .toContain('tryCast expects a target type as a string literal — one of: int, float, decimal, string, bool, date, timestamp');
     });
 });
 
@@ -492,10 +516,10 @@ q = users & filter (u => exists (orders & filter (o => o.user_id == u.id))) & ma
 });
 
 describe('IN subqueries', () => {
-    test('in_query renders and executes IN (SELECT ...)', () => {
+    test('inQuery renders and executes IN (SELECT ...)', () => {
         const src = `users: query { id: int } = table "users"
 orders: query { user_id: int } = table "orders"
-q = users & filter (u => in_query u.id (orders & map (o => { user_id = o.user_id }))) & map (u => { id })`;
+q = users & filter (u => inQuery u.id (orders & map (o => { user_id = o.user_id }))) & map (u => { id })`;
         expect(typeErrors(src)).toEqual([]);
         const sql = render(src, 'sqlite', 'compact');
         expect(sql).toContain('id IN (SELECT user_id FROM orders)');
@@ -508,10 +532,10 @@ q = users & filter (u => in_query u.id (orders & map (o => { user_id = o.user_id
         expect(db.query(sql).all()).toEqual([{ id: 1 }]);
     });
 
-    test('not_in_query is correlated like exists', () => {
+    test('notInQuery is correlated like exists', () => {
         const src = `users: query { id: int } = table "users"
 orders: query { user_id: int } = table "orders"
-q = users & filter (u => not_in_query u.id (orders & filter (o => o.user_id == u.id) & map (o => { user_id = o.user_id })))`;
+q = users & filter (u => notInQuery u.id (orders & filter (o => o.user_id == u.id) & map (o => { user_id = o.user_id })))`;
         const sql = render(src, 'postgresql', 'compact');
         expect(sql).toContain('id NOT IN (SELECT user_id FROM orders WHERE user_id = users.id)');
     });
@@ -535,10 +559,10 @@ q = t & map (u => { x = scalar t })`;
 });
 
 describe('lateral joins', () => {
-    test('join_lateral renders a correlated LATERAL subquery', () => {
+    test('joinLateral renders a correlated LATERAL subquery', () => {
         const src = `users: query { id: int, name: string } = table "users"
 orders: query { user_id: int, total: float } = table "orders"
-q = users & join_lateral (l => (orders & filter (o => o.user_id == l.id) & sort (o => desc o.total) & take 1)) (l => r => true) (l => r => { id = l.id, name = l.name, total = r.total })`;
+q = users & joinLateral (l => (orders & filter (o => o.user_id == l.id) & sort (o => desc o.total) & take 1)) (l => r => true) (l => r => { id = l.id, name = l.name, total = r.total })`;
         expect(typeErrors(src)).toEqual([]);
         const pg = render(src, 'postgresql', 'compact');
         expect(pg).toContain('INNER JOIN LATERAL');
@@ -549,7 +573,7 @@ q = users & join_lateral (l => (orders & filter (o => o.user_id == l.id) & sort 
     test('lateral is capability-gated for SQLite', () => {
         const src = `users: query { id: int } = table "users"
 orders: query { user_id: int } = table "orders"
-q = users & join_lateral (l => orders) (l => r => l.id == r.user_id) (l => r => { id = l.id })`;
+q = users & joinLateral (l => orders) (l => r => l.id == r.user_id) (l => r => { id = l.id })`;
         expect(() => render(src, 'sqlite')).toThrow(/lateral joins are not supported/);
     });
 
@@ -560,7 +584,7 @@ ranked = orders
     & fold (o => { user_id = group o.user_id, total = sum o.total })
     & map (r => { id = r.user_id, total = r.total })
 q = users
-    & join_lateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })`;
+    & joinLateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })`;
         expect(typeErrors(src)).toEqual([]);
         const pg = render(src, 'postgresql');
         expect(pg).toContain('INNER JOIN LATERAL (');
@@ -571,9 +595,9 @@ q = users
 });
 
 describe('filtered aggregates', () => {
-    test('sum_where / count_where type-check and execute', () => {
+    test('sumWhere / countWhere type-check and execute', () => {
         const src = `orders: query { status: string, total: float } = table "orders"
-q = orders & fold (o => { paid_total = sum_where (o.status == "paid") o.total, n = count_where (o.status == "paid") o.total })`;
+q = orders & fold (o => { paid_total = sumWhere (o.status == "paid") o.total, n = countWhere (o.status == "paid") o.total })`;
         expect(typeErrors(src)).toEqual([]);
         const sql = render(src, 'sqlite', 'compact');
         expect(sql).toContain('SUM(total) FILTER (WHERE status = \'paid\')');
@@ -586,7 +610,7 @@ q = orders & fold (o => { paid_total = sum_where (o.status == "paid") o.total, n
 
     test('MySQL/Hive toLower FILTER to CASE WHEN', () => {
         const src = `t: query { flag: bool, x: int } = table "t"
-q = t & fold (u => { s = sum_where u.flag u.x })`;
+q = t & fold (u => { s = sumWhere u.flag u.x })`;
         expect(render(src, 'mysql', 'compact')).toContain('SUM(CASE WHEN flag THEN x END)');
         expect(render(src, 'hive', 'compact')).toContain('SUM(CASE WHEN flag THEN x END)');
     });
@@ -673,7 +697,7 @@ describe('type inference', () => {
                 sub = substring u.name 1 (just 3),
                 pos = position u.name "a",
                 li = like u.name "a%",
-                nf = null_if (just u.name) (just ""),
+                nf = nullIf (just u.name) (just ""),
                 ci = cast u.id "string",
             })
         `;

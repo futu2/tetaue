@@ -22,6 +22,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { AstUtils, URI } from 'langium';
 import type { TetaueServices } from './tetaue-module.js';
 import type { Model } from './generated/ast.js';
+import { baseModuleSource, isBaseUri } from './prelude.js';
 
 /** Largest imported module that is still parsed (source length in UTF-16 units). */
 export const DEFAULT_MODULE_BUDGET_BYTES = 4 * 1024 * 1024;
@@ -113,6 +114,11 @@ export function createModuleLoader(options: ModuleLoaderOptions = {}): ModuleLoa
     };
 
     const read = (uri: string): string | undefined => {
+        // Base-library modules are embedded, not files on disk: their URI is
+        // a synthetic `base/...` path (see resolve.ts). Serving them here
+        // keeps ONE loader for both kinds of module, so the LSP and the CLI
+        // resolve an imported base module exactly like a project module.
+        if (isBaseUri(uri)) return baseModuleSource(uri);
         try {
             const fsPath = URI.parse(uri).fsPath;
             const mtimeMs = statSync(fsPath).mtimeMs;
@@ -132,6 +138,7 @@ export function createModuleLoader(options: ModuleLoaderOptions = {}): ModuleLoa
     };
 
     const versionOf = (uri: string): string | undefined => {
+        if (isBaseUri(uri)) return undefined; // embedded: never changes at runtime
         try {
             return textCache.get(URI.parse(uri).fsPath)?.hash;
         } catch {

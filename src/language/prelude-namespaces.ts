@@ -4,7 +4,7 @@
  * unqualified (relational/SQL) namespace so the two never collide.
  *
  * Pure operations are ordinary core builtins (`list_map`, `list_fold`,
- * `maybe_isJust`, ...) whose public spelling is namespaced: `list.map`,
+ * `maybeIsJust`, ...) whose public spelling is namespaced: `list.map`,
  * `list.fold`, `maybe.isJust`. This module is the single source of truth for
  * that mapping — both the interpreter (which seeds a namespace module VALUE
  * in every module's environment) and the inferencer (which seeds a namespace
@@ -40,16 +40,16 @@ export const LIST_NAMESPACE: Readonly<Record<string, string>> = {
  * The Haskell Data.Maybe vocabulary over nullable SQL expressions. The alias
  * is capitalized `Maybe` (as in Haskell) because lowercase `maybe` is the
  * reserved type keyword and cannot follow a namespace dot. Most members are
- * the existing maybe builtins (`just`, `nothing`, `from_maybe`, `is_null`);
- * `isJust` is a dedicated builtin (`maybe_isJust`) because it is
- * `not (is_null x)` — a composition that needs no new SQL primitive.
+ * the existing maybe builtins (`just`, `nothing`, `fromMaybe`, `isNull`);
+ * `isJust` is a dedicated builtin (`maybeIsJust`) because it is
+ * `not (isNull x)` — a composition that needs no new SQL primitive.
  */
 export const MAYBE_NAMESPACE: Readonly<Record<string, string>> = {
     just: 'just',
     nothing: 'nothing',
-    isJust: 'maybe_isJust',
-    isNothing: 'is_null',
-    fromMaybe: 'from_maybe',
+    isJust: 'maybeIsJust',
+    isNothing: 'isNull',
+    fromMaybe: 'fromMaybe',
 };
 
 /**
@@ -62,3 +62,17 @@ export const PRELUDE_NAMESPACES: Readonly<Record<string, Readonly<Record<string,
     list: LIST_NAMESPACE,
     Maybe: MAYBE_NAMESPACE,
 };
+
+/**
+ * The reserved `core` namespace: EVERY primitive under a qualified name
+ * (`core.table`, `core.sql_func`, `core.op_add`, ...).
+ *
+ * It exists so a base module can publish a public spelling for a primitive
+ * without writing a self-recursive binding: `export table = core.table` is a
+ * plain alias, whereas `export table = table` would resolve the right-hand
+ * `table` to the binding being defined and be reported as a cycle.
+ *
+ * `core` is seeded into BASE modules only (see `checker.ts`), so a user
+ * module can neither reach the primitives this way nor shadow the name.
+ */
+export const CORE_NAMESPACE = 'core';

@@ -19,6 +19,7 @@
 import { statSync } from 'node:fs';
 import * as path from 'node:path';
 import { URI } from 'langium';
+import { baseModuleSource, BASE_PREFIX } from './prelude.js';
 
 /** Result of resolving an import specifier. */
 export interface ResolvedImport {
@@ -45,14 +46,38 @@ function candidates(dir: string, spec: string): string[] {
 export interface ImportResolverOptions {
     /** Directory used when `importerUri` is undefined. Defaults to process.cwd(). */
     cwd?: string;
+    /**
+     * Resolve `base/...` specifiers against the EMBEDDED base library (see
+     * prelude.ts) instead of the filesystem. The CLI and the language server
+     * enable it; a bare resolver used for plain relative imports does not.
+     */
+    base?: boolean;
+}
+
+/**
+ * Resolve a `base/...` specifier against the embedded base library. The
+ * library ships inside the binary (`base-sources.ts`), so a
+ * resolved base import always reads successfully — there is no search
+ * path and no installation step.
+ */
+function resolveBaseImport(spec: string): ResolvedImport {
+    if (baseModuleSource(spec) === undefined) {
+        return { uri: undefined, searched: [`<base library> (no module '${spec}')`] };
+    }
+    // A stable synthetic URI: `base/data/maybe.tetaue`. It is NOT a file
+    // path, which is why the module loader's read() special-cases the prefix.
+    const bare = spec.replace(/^\.\//, '').replace(/^base\//, '').replace(/\.tetaue$/, '');
+    return { uri: `${BASE_PREFIX}${bare}.tetaue`, searched: ['<base library>'] };
 }
 
 /**
  * Resolve an import specifier relative to the importing file. `spec` may be
  * any path (`./x`, `../x`, `x/y`, absolute); `..` and absolute paths are
- * allowed — this is a local language tool, not a sandbox.
+ * allowed — this is a local language tool, not a sandbox. With `base`
+ * enabled, a `base/...` specifier resolves into the embedded base library.
  */
-function resolveImportWith(importerUri: string | undefined, spec: string, cwd: string): ResolvedImport {
+function resolveImportWith(importerUri: string | undefined, spec: string, cwd: string, useBase: boolean): ResolvedImport {
+    if (useBase && spec.startsWith(BASE_PREFIX)) return resolveBaseImport(spec);
     const importerDir = importerUri ? path.dirname(URI.parse(importerUri).fsPath) : cwd;
     const searched: string[] = [importerDir];
     for (const candidate of candidates(importerDir, spec)) {
@@ -65,11 +90,12 @@ function resolveImportWith(importerUri: string | undefined, spec: string, cwd: s
 
 /** Resolve an import specifier relative to the importing file. */
 export function resolveImport(importerUri: string | undefined, spec: string, options: ImportResolverOptions = {}): ResolvedImport {
-    return resolveImportWith(importerUri, spec, options.cwd ?? process.cwd());
+    return resolveImportWith(importerUri, spec, options.cwd ?? process.cwd(), options.base ?? false);
 }
 
 /** Build a reusable resolver (e.g. for the CLI/LSP). Resolution is stateless. */
 export function createImportResolver(options: ImportResolverOptions = {}): (importerUri: string | undefined, spec: string) => ResolvedImport {
     const cwd = options.cwd ?? process.cwd();
-    return (importerUri, spec) => resolveImportWith(importerUri, spec, cwd);
+    const useBase = options.base ?? false;
+    return (importerUri, spec) => resolveImportWith(importerUri, spec, cwd, useBase);
 }

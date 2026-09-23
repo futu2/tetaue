@@ -95,31 +95,38 @@ function freeModuleRefs(node: AstNode, moduleNames: ReadonlySet<string>, shadow:
  * Order a module's bindings so every binding comes after the bindings its
  * value references (a stable topological sort, source order as tiebreak).
  * Bindings involved in reference cycles (recursion) are returned separately
- * and reported by the caller; a module with duplicate names falls back to
- * source order (duplicates are already errors).
+ * and reported by the caller.
+ *
+ * A name may have SEVERAL definitions — that is how overloading works
+ * (`export year: date -> int = ...` next to `export year: timestamp -> int =
+ * ...`). All definitions of one name are a single node in the ordering graph,
+ * because a reference to `year` may resolve to any of them: keeping the group
+ * together is what lets a definition in one group call a helper in another
+ * with only the source-order tiebreak to settle the rest.
  */
 export function topoOrderBindings(bindings: readonly Binding[]): { order: readonly Binding[]; cycles: readonly Binding[] } {
     const names = new Set(bindings.map(b => b.name));
-    if (names.size !== bindings.length) {
-        return { order: bindings, cycles: [] }; // duplicates are diagnosed separately
-    }
     const byName = new Map(bindings.map(b => [b.name, b] as const));
     const indegree = new Map<string, number>();
-    const dependents = new Map<string, Binding[]>();
+    const dependents = new Map<string, Set<string>>();
     const refsByBinding = new Map<Binding, Set<string>>();
     for (const b of bindings) {
         const refs = new Set<string>();
         if (b.value) freeModuleRefs(b.value as unknown as AstNode, names, new Set(), refs);
         refsByBinding.set(b, refs);
-        indegree.set(b.name, 0);
+        if (!indegree.has(b.name)) indegree.set(b.name, 0);
     }
     for (const b of bindings) {
         for (const r of refsByBinding.get(b)!) {
-            if (!byName.has(r)) continue;
-            indegree.set(b.name, indegree.get(b.name)! + 1);
-            const deps = dependents.get(r) ?? [];
-            deps.push(b);
+            if (!byName.has(r) || r === b.name) continue;
+            // One edge per (dependent name, dependency name) pair, so an
+            // overloaded name does not count its dependencies once per
+            // definition.
+            const deps = dependents.get(r) ?? new Set<string>();
+            if (deps.has(b.name)) continue;
+            deps.add(b.name);
             dependents.set(r, deps);
+            indegree.set(b.name, indegree.get(b.name)! + 1);
         }
     }
     const order: Binding[] = [];
@@ -130,10 +137,15 @@ export function topoOrderBindings(bindings: readonly Binding[]): { order: readon
         for (const b of bindings) {
             if (placed.has(b.name) || indegree.get(b.name)! > 0) continue;
             placed.add(b.name);
-            order.push(b);
+            // Every definition of the name travels together: an overloaded
+            // name is ONE node in the graph, so all its definitions are
+            // emitted at once, in source order.
+            for (const overload of bindings) {
+                if (overload.name === b.name) order.push(overload);
+            }
             progressed = true;
             for (const dep of dependents.get(b.name) ?? []) {
-                indegree.set(dep.name, indegree.get(dep.name)! - 1);
+                indegree.set(dep, indegree.get(dep)! - 1);
             }
         }
     }
@@ -147,7 +159,7 @@ export function topoOrderBindings(bindings: readonly Binding[]): { order: readon
         if (seen.has(start)) return false;
         seen.add(start);
         for (const dep of dependents.get(start) ?? []) {
-            if (dep.name === target || reaches(dep.name, target, seen)) return true;
+            if (dep === target || reaches(dep, target, seen)) return true;
         }
         return false;
     };

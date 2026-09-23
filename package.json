@@ -12,12 +12,13 @@
     "bin",
     "src",
     "examples",
-    "prelude.tetaue",
+    "base",
     "README.md"
   ],
   "scripts": {
     "langium:generate": "langium generate",
-    "build": "bun run langium:generate",
+    "base:generate": "bun run scripts/embed-base.ts",
+    "build": "bun run langium:generate && bun run base:generate",
     "build:cli": "bun build src/cli.ts --target=node --outfile=dist/cli.mjs --banner '#!/usr/bin/env node'",
     "prepack": "bun run build:cli",
     "check": "tsc --noEmit",

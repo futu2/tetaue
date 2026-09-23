@@ -6,7 +6,7 @@
  * inference.ts `prelude()`). The runtime implementations stay in
  * interpreter.ts (`BUILTINS`) — this catalog and that table are checked for
  * name parity by test/catalog.test.ts. Derived public functions live in
- * prelude.tetaue and therefore do not appear in either table.
+ * base/sql.tetaue and therefore do not appear in either table.
  *
  * The schemes encode the DSL's MODES as types:
  *   - aggregates return `agg t` and `group` returns `group t`, so a fold's
@@ -39,10 +39,6 @@
  *     list.
  ******************************************************************************/
 import {
-    renderDatePart, renderDateAdd, renderDateDiff, renderDateTrunc,
-    renderDateFormat, renderDateParse, renderToUnixtime, renderFromUnixtime,
-} from '../core/date-lowering.js';
-import {
     type PrimName, type Scheme, type Type, type TypeUniverse, type VarKind,
     fun, listOf, maybeOf, nullRowOf, prim, queryOf, rowOf,
 } from './types.js';
@@ -50,20 +46,20 @@ import {
 export type BuiltinCategory =
     | 'query-root'      // table
     | 'query-step'      // filter, map, sort, take, distinct, fold, joins
-    | 'set'              // union, union_all, intersect, except
+    | 'set'              // union, unionAll, intersect, except
     | 'aggregate'       // count, sum, avg, min, max, list
     | 'group'           // group
     | 'order'           // asc, desc
     | 'record'          // merge
-    | 'logic'           // not, is_in, is_not_in, like, case helpers
+    | 'logic'           // not, isIn, isNotIn, like, case helpers
     | 'scalar'          // toUpper, toLower, length, abs, coalesce, trim, ...
-    | 'date'            // current_date, extract, year, date_add, ...
+    | 'date'            // currentDate, extract, year, dateAdd, ...
     | 'math'            // ceil, floor, sqrt, pow, mod
     | 'string'          // concat, substring, lpad, rpad, ...
     | 'list'            // pure in-memory list combinators (list.* namespace)
-    | 'window'          // over, row_number, rank, lag, lead, ...
+    | 'window'          // over, rowNumber, rank, lag, lead, ...
     | 'cast'            // cast
-    | 'constant';       // current_timestamp
+    | 'constant';       // currentTimestamp
 
 /**
  * What a per-dialect lowering is given: the call's ARGUMENTS ALREADY RENDERED
@@ -93,7 +89,7 @@ export interface LowerCtx {
      * The raw value of argument `i` when it is a literal, else null. Needed by
      * lowerings that treat an argument as METADATA rather than data — `cast`'s
      * target type is a string literal naming a SQL type, so it must not be
-     * rendered (and quoted) like a value; `extract`'s field and `date_add`'s
+     * rendered (and quoted) like a value; `extract`'s field and `dateAdd`'s
      * unit are likewise keywords rather than values.
      */
     literal(i: number): string | null;
@@ -120,9 +116,24 @@ export interface BuiltinSpec {
     /**
      * A special SQL lowering, when the default `NAME(arg, ...)` form is wrong
      * for at least one dialect. Absent (the common case) → the renderer uses
-     * the dialect's `functions` name map, then the upper-cased name.
+     * the dialect's `functions` name map, then `sqlName`.
      */
     lower?: Lowering;
+    /**
+     * The SQL word(s) the default `NAME(args)` render emits — `ROW_NUMBER`
+     * for `rowNumber`, `CURRENT_DATE` for `currentDate`, `IS NULL` for
+     * `isNull`.
+     *
+     * REQUIRED for every builtin whose tetaue name is not already the SQL name
+     * in upper case: tetaue names are camelCase, so the renderer can no longer
+     * derive the SQL word by upper-casing (`rowNumber` -> `ROWNUMBER` is not a
+     * function any dialect has). Keeping this next to the spec — rather than
+     * as a second table in the renderer — is what stops the two drifting.
+     *
+     * Omit it when `name.toUpperCase()` IS the SQL name (`sum`, `count`,
+     * `rank`, `ntile`, ...).
+     */
+    sqlName?: string;
 }
 
 /** Primitive scalar types supplied by the core. */
@@ -189,7 +200,7 @@ export const BUILTIN_SPECS = [
     { name: 'drop', category: 'query-step', doc: 'OFFSET n — skip the first n rows', scheme: u => poly(u, [rowVar], r => fun(p('int'), fun(queryOf(r), queryOf(r)))) },
     { name: 'recursive', category: 'query-step', doc: 'recursive f — WITH RECURSIVE fixed point (UNION ALL)', scheme: u => poly(u, [rowVar], r => fun(fun(queryOf(r), queryOf(r)), fun(queryOf(r), queryOf(r)))) },
     { name: 'distinct', category: 'query-step', doc: 'dedupe rows (SELECT DISTINCT)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), queryOf(r))) },
-    { name: 'join_lateral', category: 'query-step', doc: 'join_lateral right_fn on merger — LATERAL join (PG/MySQL)', scheme: u => poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
+    { name: 'joinLateral', category: 'query-step', doc: 'joinLateral right_fn on merger — LATERAL join (PG/MySQL)', scheme: u => poly(u, [rowVar, sRowVar, tVar], (r, s, t) => {
         const rightFn = fun(r, queryOf(s));     // l => query over right rows
         const on = fun(r, fun(s, p('bool')));   // l => r => bool
         const merger = fun(r, fun(s, t));       // l => r => row t
@@ -202,7 +213,7 @@ export const BUILTIN_SPECS = [
 
     // --- set operations (pure query -> query functions) -----------------
     { name: 'union', category: 'set', doc: 'UNION (distinct set union)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
-    { name: 'union_all', category: 'set', doc: 'UNION ALL', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
+    { name: 'unionAll', category: 'set', doc: 'UNION ALL', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
     { name: 'intersect', category: 'set', doc: 'INTERSECT (distinct set intersection)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
     { name: 'except', category: 'set', doc: 'EXCEPT (distinct set difference)', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), fun(queryOf(r), queryOf(r)))) },
 
@@ -217,12 +228,12 @@ export const BUILTIN_SPECS = [
     { name: 'desc', category: 'order', doc: 'a descending ORDER BY item', scheme: u => poly(u, [tVar], t => fun(t, t)) },
 
     // --- aggregates & grouping (aggregate/group MODES) -------------------
-    { name: 'count_distinct', category: 'aggregate', doc: 'COUNT(DISTINCT x) — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
-    { name: 'count_where', category: 'aggregate', doc: 'count_where cond x — filtered COUNT', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, p('int')))) },
-    { name: 'sum_where', category: 'aggregate', doc: 'sum_where cond x — filtered SUM', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, maybeOf(t)))) },
-    { name: 'avg_where', category: 'aggregate', doc: 'avg_where cond x — filtered AVG', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, maybeOf(p('float'))))) },
-    { name: 'min_where', category: 'aggregate', doc: 'min_where cond x — filtered MIN', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, maybeOf(t)))) },
-    { name: 'max_where', category: 'aggregate', doc: 'max_where cond x — filtered MAX', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, maybeOf(t)))) },
+    { name: 'countDistinct', category: 'aggregate', doc: 'COUNT(DISTINCT x) — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), sqlName: 'COUNT' },
+    { name: 'countWhere', category: 'aggregate', doc: 'countWhere cond x — filtered COUNT', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, p('int')))) },
+    { name: 'sumWhere', category: 'aggregate', doc: 'sumWhere cond x — filtered SUM', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, maybeOf(t)))) },
+    { name: 'avgWhere', category: 'aggregate', doc: 'avgWhere cond x — filtered AVG', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, maybeOf(p('float'))))) },
+    { name: 'minWhere', category: 'aggregate', doc: 'minWhere cond x — filtered MIN', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, maybeOf(t)))) },
+    { name: 'maxWhere', category: 'aggregate', doc: 'maxWhere cond x — filtered MAX', scheme: u => poly(u, [tVar], t => fun(p('bool'), fun(t, maybeOf(t)))) },
     { name: 'count', category: 'aggregate', doc: 'COUNT — aggregate mode', scheme: u => poly(u, [tVar], t => fun(t, p('int'))) },
     { name: 'sum', category: 'aggregate', doc: 'SUM — aggregate mode (maybe result: empty/all-null input is NULL)', scheme: u => poly(u, [tVar], t => fun(t, maybeOf(t))) },
     { name: 'avg', category: 'aggregate', doc: 'AVG — aggregate mode (maybe result)', scheme: u => poly(u, [tVar], t => fun(t, maybeOf(p('float')))) },
@@ -247,80 +258,26 @@ export const BUILTIN_SPECS = [
     { name: 'exists', category: 'logic', doc: 'exists query — correlated EXISTS subquery', scheme: u => poly(u, [rowVar], r => fun(queryOf(r), p('bool'))) },
     { name: 'scalar', category: 'logic', doc: 'scalar query — a correlated scalar subquery returning one nullable column', scheme: u => poly(u, [rowVar, tVar], (r, t) => fun(queryOf(r), t)) },
     { name: 'not', category: 'logic', doc: 'NOT', scheme: () => mono(fun(p('bool'), p('bool'))) },
-    { name: 'in_query', category: 'logic', doc: 'IN (SELECT ...) — in_query x subquery', scheme: u => poly(u, [tVar, rowVar], (t, r) => fun(t, fun(queryOf(r), p('bool')))) },
-    { name: 'is_in', category: 'logic', doc: 'IN — is_in x [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(t, fun(listOf(t), p('bool')))) },
-    // `like` (binary operator) lives in prelude.tetaue as sql_infix "LIKE".
+    { name: 'inQuery', category: 'logic', doc: 'IN (SELECT ...) — inQuery x subquery', scheme: u => poly(u, [tVar, rowVar], (t, r) => fun(t, fun(queryOf(r), p('bool')))), sqlName: 'IN' },
+    { name: 'isIn', category: 'logic', doc: 'IN — isIn x [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(t, fun(listOf(t), p('bool')))), sqlName: 'IN' },
+    // `like` (binary operator) lives in base/sql.tetaue as sql_infix "LIKE".
 
     // --- scalar functions ------------------------------------------------
-    // `toUpper`, `toLower`, `length`, `trim` live in prelude.tetaue; `abs`,
+    // `toUpper`, `toLower`, `length`, `trim` live in base/sql.tetaue; `abs`,
     // `ceil`, `floor`, `sqrt` live there too (Num-constrained, sql_func).
     { name: 'coalesce', category: 'scalar', doc: 'COALESCE', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))) },
 
     // --- date & time -----------------------------------------------------
+    // Only the CONSTANTS stay core: they map to their own IR nodes
+    // (`date-literal`, `current-date`, ...), which no lowering can express.
+    // The whole date/time FUNCTION family (year, extract, dateAdd, dateDiff,
+    // dateTrunc, dateFormat, dateParse, toUnixtime, fromUnixtime) lives in
+    // `base/sql/time.tetaue`, written as ordinary tetaue over the lowering
+    // vocabulary.
     { name: 'date', category: 'constant', doc: 'date "2024-01-01" — ISO date literal', scheme: () => mono(fun(p('string'), p('date'))) },
     { name: 'timestamp', category: 'constant', doc: 'timestamp "2024-01-01 12:00:00" — ISO timestamp literal', scheme: () => mono(fun(p('string'), p('timestamp'))) },
-    { name: 'current_date', category: 'date', doc: 'CURRENT_DATE', scheme: () => mono(p('date')) },
-    { name: 'current_timestamp', category: 'constant', doc: 'CURRENT_TIMESTAMP', scheme: () => mono(p('timestamp')) },
-    { name: 'extract', category: 'date', doc: 'extract x "field"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('int')))), lower: (ctx) => {
-        return renderDatePart(ctx, ctx.literal(1) ?? 'day', ctx.arg(0));
-        }
-    },
-    { name: 'year', category: 'date', doc: 'year of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), lower: (ctx) => {
-        return renderDatePart(ctx, 'year', ctx.arg(0));
-        }
-    },
-    { name: 'month', category: 'date', doc: 'month of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), lower: (ctx) => {
-        return renderDatePart(ctx, 'month', ctx.arg(0));
-        }
-    },
-    { name: 'day', category: 'date', doc: 'day of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), lower: (ctx) => {
-        return renderDatePart(ctx, 'day', ctx.arg(0));
-        }
-    },
-    { name: 'day_of_week', category: 'date', doc: 'day of week of a date', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), lower: (ctx) => {
-        return renderDatePart(ctx, 'day_of_week', ctx.arg(0));
-        }
-    },
-    { name: 'hour', category: 'date', doc: 'hour of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), lower: (ctx) => {
-        return renderDatePart(ctx, 'hour', ctx.arg(0));
-        }
-    },
-    { name: 'minute', category: 'date', doc: 'minute of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), lower: (ctx) => {
-        return renderDatePart(ctx, 'minute', ctx.arg(0));
-        }
-    },
-    { name: 'second', category: 'date', doc: 'second of a timestamp', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), lower: (ctx) => {
-        return renderDatePart(ctx, 'second', ctx.arg(0));
-        }
-    },
-    { name: 'date_add', category: 'date', doc: 'date_add x "day" 1', scheme: u => poly(u, [tVar, aVar], (t, n) => fun(t, fun(p('string'), fun(n, t)))), lower: (ctx) => {
-        return renderDateAdd(ctx, ctx.arg(0), ctx.literal(1) ?? 'day', ctx.arg(2), ctx.numberLiteral(2));
-        }
-    },
-    { name: 'date_diff', category: 'date', doc: 'date_diff x "day" other', scheme: u => poly(u, [tVar, aVar], (t, other) => fun(t, fun(p('string'), fun(other, p('int'))))), lower: (ctx) => {
-        return renderDateDiff(ctx, ctx.arg(0), ctx.literal(1) ?? 'day', ctx.arg(2));
-        }
-    },
-    { name: 'date_trunc', category: 'date', doc: 'date_trunc x "month" — date stays date, timestamp stays timestamp', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), t))), lower: (ctx) => {
-        return renderDateTrunc(ctx, ctx.arg(0), ctx.literal(1) ?? 'day');
-        }
-    },
-    { name: 'date_format', category: 'date', doc: 'date_format x "%Y-%m-%d"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), p('string')))), lower: (ctx) => {
-        return renderDateFormat(ctx, ctx.arg(0), ctx.literal(1) ?? '%Y-%m-%d');
-        }
-    },
-    { name: 'date_parse', category: 'date', doc: 'date_parse x "%Y-%m-%d"', scheme: () => mono(fun(p('string'), fun(p('string'), p('date')))), lower: (ctx) => {
-        return renderDateParse(ctx, ctx.arg(0), ctx.literal(1) ?? '%Y-%m-%d');
-        }
-    },
-    { name: 'to_unixtime', category: 'date', doc: 'date to unix seconds', scheme: u => poly(u, [tVar], t => fun(t, p('int'))), lower: (ctx) => {
-        return renderToUnixtime(ctx, ctx.arg(0));
-        }
-    },
-    { name: 'from_unixtime', category: 'date', doc: 'unix seconds to timestamp', scheme: u => poly(u, [tVar], t => fun(p('int'), p('timestamp'))), lower: (ctx) => {
-        return renderFromUnixtime(ctx, ctx.arg(0));
-        }
-    },
+    { name: 'currentDate', category: 'constant', doc: 'CURRENT_DATE', scheme: () => mono(p('date')) },
+    { name: 'currentTimestamp', category: 'constant', doc: 'CURRENT_TIMESTAMP', scheme: () => mono(p('timestamp')) },
 
     // --- math ------------------------------------------------------------
     // All math builtins are now prelude definitions: abs/ceil/floor/sqrt
@@ -370,12 +327,83 @@ export const BUILTIN_SPECS = [
     // The result type is left open (`b`) — the prelude definition pins it via
     // its annotation (e.g. `year: date -> int`).
     { name: 'sql_cast', category: 'scalar', doc: 'sql_cast value "target" — an uninterpreted CAST(value AS target)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))) },
+    // `sql_try_cast value "target"` emits an uninterpreted TRY_CAST(value AS
+    // target) — NULL rather than an error when the conversion fails. Like
+    // sql_cast, the result type is left open for the prelude annotation.
+    { name: 'sql_try_cast', category: 'scalar', doc: 'sql_try_cast value "target" — an uninterpreted TRY_CAST(value AS target)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))) },
     // `sql_bare "YEAR"` emits an unquoted SQL identifier/word (EXTRACT(YEAR
     // FROM x) needs a bare field name, not a quoted string).
     { name: 'sql_bare', category: 'scalar', doc: 'sql_bare "YEAR" — an unquoted SQL word (e.g. an EXTRACT field)', scheme: () => mono(fun(p('string'), p('string'))) },
+    // `sql_literal x` reports whether an argument is a LITERAL — a numeric
+    // literal or a string literal — as that literal's SQL text, and the empty
+    // string when the argument is a computed expression.
+    //
+    // A library definition receives VALUES, not syntax, so it cannot other-
+    // wise tell `dateAdd x "day" 7` from `dateAdd x "day" u.n`; the two need
+    // different SQL (`INTERVAL 7 DAY` vs `INTERVAL (n) DAY`, `DATETIME(x,
+    // '+7 days')` vs `DATETIME(x, PRINTF(...))`). This is the one piece of
+    // introspection the date layer needs, and it keeps the DECISION in
+    // tetaue: the library branches on the returned text ("" or not) and on
+    // the literal's own value, and no dialect rule lives in TypeScript.
+    //
+    // The text is the literal's SQL spelling, NOT quoted — `-7` for the
+    // literal `-7`, `%Y` for the literal `"%Y"`. A caller that needs a quoted
+    // form passes it to `sql_func`/`sql_bare`, which quote it the usual way.
+    { name: 'sql_literal', category: 'scalar', doc: 'sql_literal x — the SQL text of a literal argument, or "" when the argument is computed', scheme: u => mono(fun(u.fresh(), p('string'))) },
+    // `sql_literal_amount x scale` — the same literal report, but FORMATTED as
+    // a signed SQL interval amount. Tests path:
+    //
+    //     sql_literal_amount (-7) 1   -> "-7"
+    //     sql_literal_amount   7  7   -> "+49"
+    //     sql_literal_amount u.n  1   -> ""      (computed: not a literal)
+    //
+    // The SIGN is what sqlite's DATETIME modifier needs (`DATETIME(x, '-7
+    // days')`): SQL spells a positive modifier with an explicit `+`, and a
+    // tetaue string cannot be assembled from parts (there is no string
+    // concatenation — `<>` is the SQL `||` operator). `scale` folds a week
+    // amount into days, which is the one piece of arithmetic the sqlite
+    // branch needs. Everything about WHICH dialect uses which form stays in
+    // `base/sql/time.tetaue`.
+    { name: 'sql_literal_amount', category: 'scalar', doc: 'sql_literal_amount x scale — the signed SQL text of a literal amount, or "" when it is computed', scheme: u => mono(fun(u.fresh(), fun(p('int'), p('string')))) },
+    // `sql_fragment template [args]` — an uninterpreted SQL FRAGMENT: the
+    // template's literal text with each `{}` replaced by the corresponding
+    // rendered argument.
+    //
+    // The other primitives can only emit two shapes, `NAME(a, b)` and
+    // `a OP b`. A few SQL forms are neither — `INTERVAL 7 DAY`,
+    // `INTERVAL '-7' DAY`, `(-7)` — and they are exactly the shapes the
+    // postgres/hive interval arithmetic needs. `{}` rather than named
+    // placeholders keeps it positional, like every other application.
+    //
+    // The template is SQL text, so a literal brace in it is written `{{` (the
+    // same escape as a format string). It is otherwise opaque: this primitive
+    // widens what a library definition can EMIT, and the safety argument is
+    // the library boundary, not the primitive — user modules cannot reach it.
+    { name: 'sql_fragment', category: 'scalar', doc: 'sql_fragment "INTERVAL {} DAY" [x] — an uninterpreted SQL fragment with rendered holes', scheme: u => {
+        const a = u.fresh('flex', 'a');
+        return poly(u, [tVar], b => fun(p('string'), fun(listOf(a), b)));
+    } },
+    // `sql_error message` — REJECT a definition at analysis time with `message`.
+    //
+    // A library definition that dispatches on a compile-time NAME (`extract x
+    // "month"`, `dateAdd x "day" 7`) must be able to reject a name it does not
+    // know, or the mistake would silently lower to wrong SQL instead of being
+    // reported. This is that rejection: evaluation stops with the message, so
+    // the whole contract — which names are valid and what each lowers to —
+    // stays in the library rather than splitting into a TypeScript table.
+    //
+    // It is only reachable from the fallback arm of such a dispatch, and only
+    // from a base module: user modules cannot name it.
+    //
+    // The result is a POLYMORPHIC variable, generalized at the definition of
+    // the library binding that wraps it (`fail = sql_error`). Its use in a
+    // `case` arm is then independent per arm, and — crucially — it never
+    // forces the SIBLING arms' type: the arm that produces real SQL settles
+    // the case's type on its own.
+    { name: 'sql_error', category: 'scalar', doc: 'sql_error "message" — reject a library definition with a diagnostic', scheme: u => poly(u, [tVar], t => fun(p('string'), t)) },
 
     // --- strings ---------------------------------------------------------
-    // `trim` lives in prelude.tetaue (a plain `sql_func "TRIM"` wrapper).
+    // `trim` lives in base/sql.tetaue (a plain `sql_func "TRIM"` wrapper).
     // `reverse` stays a core builtin: sqlite lowers it to a recursive CTE,
     // which sql_func cannot express yet (see sql-dialect.md).
     { name: 'reverse', category: 'string', doc: 'REVERSE (dialect fallback where needed)', scheme: () => mono(fun(p('string'), p('string'))), lower: ({ dialect, arg }) => {
@@ -389,7 +417,7 @@ export const BUILTIN_SPECS = [
             + `FROM __tetaue_reverse WHERE i > 0`
             + `) SELECT value FROM __tetaue_reverse WHERE i = 0)`;
     } },
-    // `replace`, `left_substring`/`right_substring` live in prelude.tetaue
+    // `replace`, `leftSubstring`/`rightSubstring` live in base/sql.tetaue
     // (dialect-branching over sql_func/sql_infix).
 
     // --- closed Functor / Applicative / Alternative / Monad operations ----
@@ -405,13 +433,13 @@ export const BUILTIN_SPECS = [
     { name: 'then', category: 'scalar', doc: 'then first second — closed Monad sequencing for maybe values and lists', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(maybeOf(a), fun(maybeOf(b), maybeOf(b)))) },
     { name: 'just', category: 'scalar', doc: 'just x — lift a non-null SQL value into maybe', scheme: u => poly(u, [tVar], t => fun(t, maybeOf(t))) },
     { name: 'nothing', category: 'constant', doc: 'nothing — SQL NULL as maybe', scheme: u => poly(u, [tVar], t => maybeOf(t)) },
-    { name: 'from_maybe', category: 'scalar', doc: 'from_maybe default maybe_value — COALESCE', scheme: u => poly(u, [tVar], t => fun(t, fun(maybeOf(t), t))), lower: ({ arg }) => `COALESCE(${arg(0)}, ${arg(1)})` },
-    { name: 'null_if', category: 'scalar', doc: 'NULLIF', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))) },
-    { name: 'is_null', category: 'logic', doc: 'IS NULL', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
-    { name: 'maybe_isJust', category: 'logic', doc: 'maybe.isJust x — not (is_null x); the Data.Maybe isJust', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
-    { name: 'is_true', category: 'logic', doc: 'SQL three-valued logic: IS TRUE', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS TRUE` },
-    { name: 'is_false', category: 'logic', doc: 'SQL three-valued logic: IS FALSE', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS FALSE` },
-    { name: 'is_unknown', category: 'logic', doc: 'SQL three-valued logic: IS UNKNOWN / NULL', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS NULL` },
+    { name: 'fromMaybe', category: 'scalar', doc: 'fromMaybe default maybe_value — COALESCE', scheme: u => poly(u, [tVar], t => fun(t, fun(maybeOf(t), t))), lower: ({ arg }) => `COALESCE(${arg(0)}, ${arg(1)})` },
+    { name: 'nullIf', category: 'scalar', doc: 'NULLIF', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))), sqlName: 'NULLIF' },
+    { name: 'isNull', category: 'logic', doc: 'IS NULL', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
+    { name: 'maybeIsJust', category: 'logic', doc: 'maybe.isJust x — not (isNull x); the Data.Maybe isJust', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
+    { name: 'isTrue', category: 'logic', doc: 'SQL three-valued logic: IS TRUE', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS TRUE` },
+    { name: 'isFalse', category: 'logic', doc: 'SQL three-valued logic: IS FALSE', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS FALSE` },
+    { name: 'isUnknown', category: 'logic', doc: 'SQL three-valued logic: IS UNKNOWN / NULL', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS NULL` },
 
     // --- casts -----------------------------------------------------------
     { name: 'cast', category: 'cast', doc: 'cast x "int"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))), lower: (ctx) => {
@@ -422,6 +450,29 @@ export const BUILTIN_SPECS = [
         // the target before rendering is reached).
         const target = ctx.literal(1) ?? 'int';
         return `CAST(${ctx.arg(0)} AS ${ctx.castTypeName(target)})`;
+    } },
+    // TRY_CAST returns NULL instead of raising when the value cannot be
+    // converted. Two dialect groups:
+    //   - postgresql/trino/mysql/hive spell it TRY_CAST;
+    //   - sqlite has no TRY_CAST, so it is emulated with the round-trip
+    //     idiom: CAST the value, then CAST the result back to TEXT and keep
+    //     it only when that reproduces the input. A value that does not
+    //     survive the round trip was not convertible → NULL.
+    //     `decimal`/`timestamp` are excluded from the round-trip check: they
+    //     do not compare as text (SQLite has no decimal type, and its
+    //     numeric affinity makes the reverse conversion lossy by design), so
+    //     those fall back to a plain CAST.
+    { name: 'tryCast', category: 'cast', doc: 'tryCast x "int" — NULL when the conversion fails', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))), lower: (ctx) => {
+        const target = ctx.literal(1) ?? 'int';
+        const value = ctx.arg(0);
+        if (ctx.dialect !== 'sqlite') {
+            return `TRY_CAST(${value} AS ${ctx.castTypeName(target)})`;
+        }
+        const casted = `CAST(${value} AS ${ctx.castTypeName(target)})`;
+        if (target === 'decimal' || target === 'timestamp') return casted;
+        // Note the CAST(... AS TEXT) of an already-cast value: comparing the
+        // two conversions as text is what detects the lossy conversion.
+        return `CASE WHEN CAST(${casted} AS TEXT) = CAST(${value} AS TEXT) THEN ${casted} ELSE NULL END`;
     } },
 
     // --- list-argument builtins (homogeneous variadic: the list types exactly
@@ -488,10 +539,10 @@ export const BUILTIN_SPECS = [
 
     // --- window functions ------------------------------------------------
     { name: 'over', category: 'window', doc: 'over (fn) { partition = [...], order = [...] }', scheme: u => poly(u, [aVar, bVar], (a, b) => fun(a, fun(b, a))) },
-    { name: 'row_number', category: 'window', doc: 'ROW_NUMBER — window-only', scheme: () => mono(p('int')) },
+    { name: 'rowNumber', category: 'window', doc: 'ROW_NUMBER — window-only', scheme: () => mono(p('int')), sqlName: 'ROW_NUMBER' },
     { name: 'rank', category: 'window', doc: 'RANK — window-only', scheme: () => mono(p('int')) },
-    { name: 'dense_rank', category: 'window', doc: 'DENSE_RANK — window-only', scheme: () => mono(p('int')) },
-    { name: 'percent_rank', category: 'window', doc: 'PERCENT_RANK — window-only', scheme: () => mono(p('int')) },
+    { name: 'denseRank', category: 'window', doc: 'DENSE_RANK — window-only', scheme: () => mono(p('int')), sqlName: 'DENSE_RANK' },
+    { name: 'percentRank', category: 'window', doc: 'PERCENT_RANK — window-only', scheme: () => mono(p('int')), sqlName: 'PERCENT_RANK' },
     { name: 'ntile', category: 'window', doc: 'NTILE — window-only', scheme: () => mono(fun(p('int'), p('int'))) },
 
     // --- monoid identity ---------------------------------------------------
@@ -506,7 +557,7 @@ export const BUILTIN_SPECS = [
 
 /**
  * Core names whose scheme matches another primitive even though their runtime
- * behavior differs (for example `is_not_in` and `is_in`). The inference pass
+ * behavior differs (for example `isNotIn` and `isIn`). The inference pass
  * copies the target's scheme under the second name.
  */
 /**
@@ -547,11 +598,11 @@ export function builtinModeOf(name: string): SqlMode | null {
 }
 
 export const BUILTIN_ALIASES = {
-    is_not_in: 'is_in',
+    isNotIn: 'isIn',
     least: 'greatest',
     rpad: 'lpad',
     lead: 'lag',
-    not_in_query: 'in_query',
+    notInQuery: 'inQuery',
 } as const;
 
 /** Every builtin name the type system knows (specs + aliases). */

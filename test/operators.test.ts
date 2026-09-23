@@ -157,7 +157,7 @@ main = users & map (u => { email = u.email ? "n/a", id = u.id })`;
     });
 
     test('is a first-class curried operator section', () => {
-        // `_?_` is ordinary prelude curried function; `x ? d` = `from_maybe d x`.
+        // `_?_` is ordinary prelude curried function; `x ? d` = `fromMaybe d x`.
         const src = `users: query { id: int, nick: (maybe string) } = table "users"
 unwrapped = users & map (u => { nick = _?_ u.nick "anon" })`;
         expect(typeErrors(src)).toEqual([]);

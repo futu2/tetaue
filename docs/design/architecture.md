@@ -28,7 +28,7 @@ The dataflow is a single traversal, and that is the design's real asset:
 ```
 .tetaue ──Langium──▶ AST ──checkProject──▶ (Value/Query IR ‖ Types) ──▶ optimize
                               ▲                    │                    +capabilities
-                       prelude.tetaue              └──────────▶ render ──▶ SQL text
+                       base/*.tetaue               └──────────▶ render ──▶ SQL text
 ```
 
 `checkProject` (`checker.ts:126-238`) walks modules imports-first, root last.
@@ -70,7 +70,7 @@ tables is the codebase telling us it wants one table.
 The name-keyed special-case pattern in `inference.ts` is the same symptom:
 ~35 sites dispatch on `name === '…'` (`'table'`, `'merge'`, `'take'`,
 `'sort'`, `'drop'`, `'mempty'`, `'abs'`, `'sqrt'`, `'pow'`, `'mod'`, `'ceil'`,
-`'floor'`, `'round'`, `'avg'`, `'sum'`, `'date_add'`, `'date_diff'`, `'cast'`,
+`'floor'`, `'round'`, `'avg'`, `'sum'`, `'dateAdd'`, `'dateDiff'`, `'cast'`,
 `'string'`, `'int'`, `'float'`, `'decimal'`, …), alongside dedicated methods
 `inferFmap`, `inferApTypes`, `inferSequenceTypes`, `inferBindTypes`,
 `inferOrElseTypes`, `inferJoin`, `inferFold`, `inferMap`, `inferSelect`,
@@ -106,10 +106,10 @@ elaborator.
 
 `docs/design/sql-dialect.md` records a deliberate move: per-dialect lowering
 from a bespoke table inside `render.ts` to a first-class `sql_dialect` value
-that `prelude.tetaue` branches on at analysis time, over the primitives
+that `base/sql.tetaue` branches on at analysis time, over the primitives
 `sql_func` / `sql_bare` / `sql_infix` / `sql_cast`. Fifteen scalar functions
 have migrated (`upper`, `lower`, `length`, `trim`, `replace`, `mod`, `like`,
-`div`, `left_substring`, `right_substring`, `abs`, `ceil`, `floor`, `sqrt`,
+`div`, `leftSubstring`, `rightSubstring`, `abs`, `ceil`, `floor`, `sqrt`,
 `pow`, `position`).
 
 `render.ts` still owns the rest:
@@ -133,7 +133,7 @@ new function.
 ## 2. What is actually wrong (and what is not)
 
 Not wrong: the single-traversal pipeline, the prelude-as-real-module idea
-(`prelude.ts` parses `prelude.tetaue` and runs it through the same parser,
+(`prelude.ts` parses `base/sql.tetaue` and runs it through the same parser,
 inferencer, and interpreter), the closed builtin-only type vocabulary, the
 symbolic `Query`/`SqlNode` IR (a clean, small algebra worth keeping), and the
 decision to make dialect lowering data rather than code.
@@ -323,7 +323,7 @@ NEGATIVE tests (`types.test.ts`, `pipeline-order.test.ts`, `windows.test.ts`,
 `truth.test.ts`). Three examples:
 
   - dropping the `sort` diagnostic when the return type was still a variable;
-  - `over (row_number)` breaking because a nullary builtin unwraps to a bare
+  - `over (rowNumber)` breaking because a nullary builtin unwraps to a bare
     `Identifier`;
   - the `lag` arity check disappearing when the mode tag stopped pinning the
     type.
@@ -360,8 +360,8 @@ them in `core/eval/` during Stages 3 and 6. Only the SQL IR moved here.
 **Stage 1b — DONE (schemes + lowerings).** Per-dialect lowering is now registry
 data. `BuiltinSpec` gained an optional `lower: (ctx: LowerCtx) => string | null`,
 and **25 entries** declare one: the 10 scalar wrappers (`concat`, `greatest`,
-`substring`, `reverse`, `lpad`, `from_maybe`, `is_true`, `is_false`,
-`is_unknown`, `cast`) and the 15 date/time functions. `LowerCtx` hands a
+`substring`, `reverse`, `lpad`, `fromMaybe`, `isTrue`, `isFalse`,
+`isUnknown`, `cast`) and the 15 date/time functions. `LowerCtx` hands a
 lowering the call's *already-rendered* argument texts plus the dialect, a
 string-literal quoter, a cast-type namer, and literal/number readers — so a
 lowering is a pure string function that cannot reach back into the plan.
@@ -415,7 +415,7 @@ lowerings:
   map at lines 109-164.
 - `SELECT`/`FROM`/`WHERE`/`LIMIT`/`OFFSET` are the renderer's structural job.
 - The filtered-aggregate `CASE WHEN` / `FILTER` choice dispatches on the IR's
-  `agg` node, handles `_where` name suffixes and `count_distinct`, and picks a
+  `agg` node, handles `_where` name suffixes and `countDistinct`, and picks a
   form per dialect. That is plan-shape rendering, and `LowerCtx` — which takes
   already-rendered SCALAR args — is the wrong shape for it. Forcing it into the
   registry would mean handing lowerings live IR nodes, which is exactly the
@@ -433,7 +433,7 @@ query-shape bindings (`set_union`, `set_union_all`, `set_intersect`,
 previously-unguarded lowering families — before it, the golden net could not
 see a set-operation, window, recursive, or lateral regression at all (verified
 by injecting `INTERSECT -> UNION`, which now correctly reports `DRIFT`). One
-family remains unguarded (MySQL's `to_unixtime`/`date_parse` spellings).
+family remains unguarded (MySQL's `toUnixtime`/`dateParse` spellings).
 
 `scripts/validate-dialects.ts` and `validate-sqlite.ts` were not re-run in this
 session; the equivalent coverage comes from the 650-test suite plus the golden
@@ -562,8 +562,8 @@ the projection's ENTRIES directly — the same transformation `order` just
 received, repeated three times with payloads. That is mechanical but
 substantial, and it is where the remaining risk sits.
 
-**`truth` is also removed from `Type`.** The tag existed so `is_true`/`is_false`/
-`is_unknown` accept `bool` **or** `maybe bool` while still rejecting every other
+**`truth` is also removed from `Type`.** The tag existed so `isTrue`/`isFalse`/
+`isUnknown` accept `bool` **or** `maybe bool` while still rejecting every other
 scalar. It is now a direct acceptance predicate on the argument
 (`isTruthAccepting`: `bool`, `maybe bool`, or unresolved) plus a check at the
 call site; `truthType()` and its three-way unification special case are gone,
@@ -572,7 +572,7 @@ and the three schemes take an ordinary type variable. 647/647 pass.
 Three more findings:
 
 4. **The tag was doing DEFERRAL, and that had to be reproduced deliberately.**
-   `is_unknown u.id` sees `u.id` as a row-field variable. The old marker
+   `isUnknown u.id` sees `u.id` as a row-field variable. The old marker
    unified itself INTO that variable, so the enclosing lambda's row became
    `{ id: bool? | r }` and the failure surfaced at the application site as
    `cannot apply`. Dropping the marker silently lost the error on the
@@ -585,7 +585,7 @@ Three more findings:
    diagnostic TWICE (the merged list dedupes on `(node, message)`, and the two
    nodes differ). The resolution: let the interpreter own it, and have the
    static pass only handle already-known types. **The user-facing message is
-   now better** — `is_unknown expects a boolean or nullable boolean expression,
+   now better** — `isUnknown expects a boolean or nullable boolean expression,
    got type int`, naming the builtin and the real type, instead of
    `cannot apply a function of type (query { id: int } -> t506) -> t506 to an
    argument of type query { id: bool? | r500 } -> ...`. Verified through the
@@ -621,9 +621,9 @@ Four more findings, all from tests that are NOT about modes:
    argument regardless of whether the type has resolved. Note both
    `lag u.salary ...` (open) and `lag 1.5 ...` (concrete) must be caught — the
    concrete case alone passes by accident.
-8. **`over (row_number)` broke**, because `entryModeOf` unwrapped a nullary
+8. **`over (rowNumber)` broke**, because `entryModeOf` unwrapped a nullary
    builtin to a bare `Identifier` and then required an `Application`. A nullary
-   builtin (`row_number`) and an applied one (`sum u.x`) reach the head
+   builtin (`rowNumber`) and an applied one (`sum u.x`) reach the head
    differently; both must be handled.
 9. **`case`-wrapped aggregates stopped being recognized.** `case { c => sum x,
    _ => sum y }` has `case` as its head, so the mode had to be looked up in the
@@ -772,7 +772,7 @@ redesign must *strengthen*, not merely preserve:
   worth resolving *during* Stage 1 rather than after.
 - **Not decided here:** whether the prelude should gain the ability to
   *declare* registry entries (i.e. whether dialect lowerings live in
-  `prelude.tetaue` for user-extensible dialects, or in TypeScript
+  `base/sql.tetaue` for user-extensible dialects, or in TypeScript
   registries for speed). `sql-dialect.md` pushes lowering toward the source
   prelude; §3.3 pushes it toward data. A future stage could reconcile them by
   making the registry serializable — but that is a separate decision and is

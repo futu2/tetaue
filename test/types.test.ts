@@ -267,10 +267,10 @@ q = table "users"`)).toEqual([]);
 
 describe('nullability', () => {
     test('null only unifies with maybe values (no implicit conversion)', () => {
-        // A non-null string column cannot be compared with null — is_null is
+        // A non-null string column cannot be compared with null — isNull is
         // the explicit way to ask "is this nullable value missing?".
         expect(typeErrors(`${USERS}\nq = users & filter (u => u.name == null)`)).not.toEqual([]);
-        expect(typeErrors(`users: query { name: (maybe string) } = table "users"\nq = users & filter (u => is_null u.name)`)).toEqual([]);
+        expect(typeErrors(`users: query { name: (maybe string) } = table "users"\nq = users & filter (u => isNull u.name)`)).toEqual([]);
         expect(typeErrors(`users: query { name: (maybe string), fallback: string } = table "users"\nq = users & map (u => { x = coalesce u.name (just u.fallback) })`)).toEqual([]);
     });
 
@@ -280,7 +280,7 @@ describe('nullability', () => {
 
     test('nullable types are expressible in annotations and require explicit unwrapping', () => {
         expect(typeErrors(`${USERS}\nq = users & filter (u: { age: (maybe int) | r }) => u.age >= 18`).join('\n')).toContain('expects non-null values');
-        expect(typeErrors(`users_maybe: query { age: (maybe int), name: string } = table "users_maybe"\nq = users_maybe & filter (u: { age: (maybe int) | r }) => from_maybe 0 u.age >= 18`)).toEqual([]);
+        expect(typeErrors(`users_maybe: query { age: (maybe int), name: string } = table "users_maybe"\nq = users_maybe & filter (u: { age: (maybe int) | r }) => fromMaybe 0 u.age >= 18`)).toEqual([]);
     });
 
     test('null == null stays an interpreter (semantic) error', () => {
@@ -389,7 +389,7 @@ describe('type errors', () => {
     });
 
     test('heterogeneous list items', () => {
-        expect(typeErrors(`${USERS}\nq = users & filter (u => is_in u.age [1, 2, "x"])`).join('\n')).toContain('list items must match type');
+        expect(typeErrors(`${USERS}\nq = users & filter (u => isIn u.age [1, 2, "x"])`).join('\n')).toContain('list items must match type');
     });
 
     test('filter with a non-lambda argument', () => {
@@ -404,7 +404,7 @@ describe('type errors', () => {
         // neither side may be abstracted into a whole-argument lambda.
         expect(allErrors(`
             s03: query { pt_dt: date } = table "s03"
-            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03
+            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= currentDate) s03
         `)).toEqual([]);
         expect(allErrors(`
             s03: query { pt_dt: date } = table "s03"
@@ -415,7 +415,7 @@ describe('type errors', () => {
     test('this/that are the implicit row parameters', () => {
         expect(allErrors(`
             s03: query { pt_dt: date } = table "s03"
-            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= current_date) s03
+            main = filter (cast this.pt_dt "date" >= date "2025-12-31") $ filter (cast this.pt_dt "date" <= currentDate) s03
         `)).toEqual([]);
         expect(allErrors(`
             users: query { id: int } = table "users"
@@ -717,7 +717,7 @@ describe('DSL modes are static types', () => {
     });
 
     test('a fold result row is plain: HAVING filters and ORDER BY on aggregate columns work', () => {
-        const src = `${USERS}\norders: query { user_id: int, total: float } = table "orders"\nq = users\n    & joinInner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, total = r.total })\n    & fold (r => { uid = group r.uid, total = sum r.total })\n    & filter (r => from_maybe 0.0 r.total > 100.0)\n    & sort (r => [desc r.total])`;
+        const src = `${USERS}\norders: query { user_id: int, total: float } = table "orders"\nq = users\n    & joinInner orders (l => r => l.id == r.user_id) (l => r => { uid = l.id, total = r.total })\n    & fold (r => { uid = group r.uid, total = sum r.total })\n    & filter (r => fromMaybe 0.0 r.total > 100.0)\n    & sort (r => [desc r.total])`;
         expect(typeErrors(src)).toEqual([]);
     });
 

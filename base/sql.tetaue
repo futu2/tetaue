@@ -1,0 +1,362 @@
+# The SQL surface, in ordinary tetaue.
+#
+# This module is where the primitive core meets the library. It has two jobs:
+#
+#   1. PUBLISH the primitive names under their public spellings, so
+#      `table "users"` / `filter (u => ...)` reach a real exported binding of
+#      this module rather than a hidden global. Each is an alias for the
+#      reserved `core.*` namespace — `core` is seeded into base modules only,
+#      so a user module cannot reach the primitives directly.
+#   2. DEFINE the scalar layer on top of the small lowering vocabulary:
+#
+#        sql_func name [args]      emit FUNC(args)
+#        sql_infix op left right   emit `left op right`
+#        sql_cast value "target"   emit CAST(value AS target)
+#        sql_bare word             emit an unquoted SQL word
+#        sql_dialect               the dialect record (branch on .name)
+#
+# Per-dialect variance is a LIBRARY concern: a definition branches on
+# `sql_dialect.name`, and evaluation constant-folds the branch at analysis
+# time (literal `==` and `case` short-circuit), so exactly one SQL form is
+# emitted. The TypeScript core keeps only the query-shape machinery (joins,
+# sets, windows, recursive CTEs) that is not a plain scalar call.
+#
+# The lowering primitives (`sql_func`, `sql_infix`, `sql_cast`, `sql_bare`,
+# `sql_dialect`, `op_*`) are deliberately NOT published here: they are the
+# library's private vocabulary, and the Prelude does not re-export them.
+
+# ---------------------------------------------------------------------------
+# Query roots and steps
+# ---------------------------------------------------------------------------
+
+export param = core.param
+export table = core.table
+export select = core.select
+export filter = core.filter
+export map = core.map
+export fold = core.fold
+export sort = core.sort
+export take = core.take
+export drop = core.drop
+export distinct = core.distinct
+export recursive = core.recursive
+
+# ---------------------------------------------------------------------------
+# Joins
+# ---------------------------------------------------------------------------
+
+export joinLateral = core.joinLateral
+export joinInner = core.joinInner
+export joinLeft = core.joinLeft
+export joinRight = core.joinRight
+export joinFull = core.joinFull
+
+# ---------------------------------------------------------------------------
+# Set operations
+# ---------------------------------------------------------------------------
+
+export union = core.union
+export unionAll = core.unionAll
+export intersect = core.intersect
+export except = core.except
+
+# ---------------------------------------------------------------------------
+# Ordering
+#
+# `asc`/`desc` are TRANSPARENT in the type system: they return the very type
+# of their argument (`asc u.name : string`). "This is an ORDER BY item" is a
+# property of the EXPRESSION, checked at the `sort` call site.
+# ---------------------------------------------------------------------------
+
+export asc = core.asc
+export desc = core.desc
+
+# ---------------------------------------------------------------------------
+# Aggregates, grouping, and windows
+#
+# The aggregate/group/window MODE of each name is declared once in the core
+# (`BUILTIN_MODES`), derived from the same table the type schemes live in, so
+# a `fold` entry that is not an aggregate stays a static error.
+# ---------------------------------------------------------------------------
+
+export count = core.count
+export countDistinct = core.countDistinct
+export countWhere = core.countWhere
+export sum = core.sum
+export sumWhere = core.sumWhere
+export avg = core.avg
+export avgWhere = core.avgWhere
+export min = core.min
+export minWhere = core.minWhere
+export max = core.max
+export maxWhere = core.maxWhere
+export array = core.array
+export group = core.group
+
+export over = core.over
+export rowNumber = core.rowNumber
+export rank = core.rank
+export denseRank = core.denseRank
+export percentRank = core.percentRank
+export ntile = core.ntile
+export lag = core.lag
+
+# ---------------------------------------------------------------------------
+# Records
+# ---------------------------------------------------------------------------
+
+export merge = core.merge
+export rename = core.rename
+export pick = core.pick
+export omit = core.omit
+
+# ---------------------------------------------------------------------------
+# Logic and subqueries
+# ---------------------------------------------------------------------------
+
+export exists = core.exists
+export scalar = core.scalar
+export not = core.not
+export isIn = core.isIn
+export inQuery = core.inQuery
+export cast = core.cast
+export tryCast = core.tryCast
+
+# ---------------------------------------------------------------------------
+# Cast helpers
+#
+# The primitive spellings name the target type as a STRING LITERAL
+# (`cast u.id "int"`), which is easy to get wrong: a typo is a static error,
+# but the reader still has to remember that the second argument is a type
+# NAME rather than a value. These helpers fix the target in the definition,
+# so a cast reads as an ordinary one-argument function:
+#
+#     asInt u.id          asString u.id        asFloat u.balance
+#     asBool u.flag       asDate u.pt_dt       asTimestamp u.joined
+#
+# Each is a `sql_cast`/`sql_try_cast` wrapper with a precise annotation
+# pinning the RESULT type (the primitives leave it open on purpose — see
+# their comments in the core). The `_or_null` variants are `tryCast`: NULL
+# instead of an error when the conversion fails.
+#
+# NOTE: the body is written out per definition rather than shared through an
+# `asImpl = target => x => sql_cast x target` helper. A helper is
+# MONOMORPHIC at its definition site (`sql_cast` leaves its result open), so
+# every `x => asImpl "…" x` annotation would have to match that ONE inferred
+# type and all but the first target would be rejected.
+# ---------------------------------------------------------------------------
+
+export asInt: a -> int = x => sql_cast x "int"
+export asIntOrNull: a -> int = x => sql_try_cast x "int"
+
+export asFloat: a -> float = x => sql_cast x "float"
+export asFloatOrNull: a -> float = x => sql_try_cast x "float"
+
+export asDecimal: a -> decimal = x => sql_cast x "decimal"
+export asDecimalOrNull: a -> decimal = x => sql_try_cast x "decimal"
+
+export asString: a -> string = x => sql_cast x "string"
+export asStringOrNull: a -> string = x => sql_try_cast x "string"
+
+export asBool: a -> bool = x => sql_cast x "bool"
+export asBoolOrNull: a -> bool = x => sql_try_cast x "bool"
+
+export asDate: a -> date = x => sql_cast x "date"
+export asDateOrNull: a -> date = x => sql_try_cast x "date"
+
+export asTimestamp: a -> timestamp = x => sql_cast x "timestamp"
+export asTimestampOrNull: a -> timestamp = x => sql_try_cast x "timestamp"
+
+# ---------------------------------------------------------------------------
+# Aliases
+#
+# A second spelling for an operation whose lowered SQL differs by ARGUMENT
+# (not by definition): `rpad` is `lpad` spelled the other way, and its
+# lowering reads the written name to decide the direction. Kept as ordinary
+# aliases so both spellings resolve to one implementation.
+# ---------------------------------------------------------------------------
+
+export isNotIn = core.isNotIn
+export least = core.least
+export rpad = core.rpad
+export lead = core.lead
+export notInQuery = core.notInQuery
+
+# ---------------------------------------------------------------------------
+# Date & time constants
+#
+# The date/time FUNCTIONS (year, dateAdd, dateTrunc, ...) live in
+# `./sql/time.tetaue`, where the per-dialect lowering is written as ordinary
+# tetaue. What stays here is the part that is not a lowering at all: the
+# literal constructors and the niladic current-time constants, which the
+# evaluator maps to their own IR nodes (`date-literal`, `current-date`, ...).
+# ---------------------------------------------------------------------------
+
+export date = core.date
+export timestamp = core.timestamp
+export currentDate = core.currentDate
+export currentTimestamp = core.currentTimestamp
+
+# ---------------------------------------------------------------------------
+# Strings and many-argument builtins
+#
+# A HOMOGENEOUS-variadic function takes ONE list argument (`concat [a, b]`);
+# a function with HETEROGENEOUS arguments is curried position by position
+# (`round x n`, `substring x s (just l)`, `lpad s n pad`), because a list
+# cannot type `[string, int, ...]` soundly. An argument is `maybe`-typed only
+# when omitting it changes the meaning.
+# ---------------------------------------------------------------------------
+
+export concat = core.concat
+export greatest = core.greatest
+export substring = core.substring
+export round = core.round
+export lpad = core.lpad
+export coalesce = core.coalesce
+export nullIf = core.nullIf
+export reverse = core.reverse
+
+# ---------------------------------------------------------------------------
+# Maybe
+# ---------------------------------------------------------------------------
+
+export just = core.just
+export nothing = core.nothing
+export fromMaybe = core.fromMaybe
+export isNull = core.isNull
+export maybeIsJust = core.maybeIsJust
+export isTrue = core.isTrue
+export isFalse = core.isFalse
+export isUnknown = core.isUnknown
+
+# ---------------------------------------------------------------------------
+# Closed Functor / Applicative / Alternative / Monad operations
+#
+# The container is chosen at the USE SITE (maybe values, lists, or queries),
+# so these stay closed operations rather than type-class methods.
+# ---------------------------------------------------------------------------
+
+export fmap = core.fmap
+export replaceWith = core.replaceWith
+export ap = core.ap
+export applyLeft = core.applyLeft
+export applyRight = core.applyRight
+export orElse = core.orElse
+export bind = core.bind
+export then = core.then
+
+# ---------------------------------------------------------------------------
+# Monoid identity
+# ---------------------------------------------------------------------------
+
+export mempty = core.mempty
+
+# ---------------------------------------------------------------------------
+# Infix operator meanings
+#
+# The public `_+_`/`_*_`/... bindings in the Prelude alias these.
+# ---------------------------------------------------------------------------
+
+export sql_multiply = core.op_multiply
+export sql_divide = core.op_divide
+export sql_add = core.op_add
+export sql_subtract = core.op_subtract
+export sql_merge = core.op_merge
+export sql_equal = core.op_equal
+export sql_not_equal = core.op_not_equal
+export sql_less_than = core.op_less_than
+export sql_less_than_or_equal = core.op_less_than_or_equal
+export sql_greater_than = core.op_greater_than
+export sql_greater_than_or_equal = core.op_greater_than_or_equal
+export sql_and = core.op_and
+export sql_or = core.op_or
+
+# ---------------------------------------------------------------------------
+# Scalar layer
+#
+# Private vocabulary the definitions below are written in. These are base
+# module LOCALS (unexported), so they never leave this module.
+#
+# (They are bound to the ambient primitives rather than to `core.*` because
+# they are used positionally inside lambdas; both spellings refer to the same
+# value.)
+# ---------------------------------------------------------------------------
+
+lowering_func = sql_func
+lowering_infix = sql_infix
+dialect = sql_dialect
+
+# --- no per-dialect variance ---
+#
+# The precise annotation keeps each type exact (`length` is int, not a fresh
+# variable); `sql_func` itself leaves the result type open on purpose.
+
+export toUpper: string -> string = x => lowering_func "UPPER" [x]
+export toLower: string -> string = x => lowering_func "LOWER" [x]
+export length: string -> int = x => lowering_func "LENGTH" [x]
+export trim: string -> string = x => lowering_func "TRIM" [x]
+export replace: string -> string -> string -> string = s => f => r => lowering_func "REPLACE" [s, f, r]
+
+# `mod` renders MOD(a, b) in every dialect; `like` is a binary operator.
+export mod: int -> int -> int = a => b => lowering_func "MOD" [a, b]
+export like: string -> string -> bool = x => p => lowering_infix "LIKE" x p
+
+# --- per-dialect variance ---
+
+export div: int -> int -> int = a => b => case dialect.name {
+    "mysql" => lowering_infix "DIV" a b,
+    "hive"  => lowering_infix "DIV" a b,
+    _       => lowering_infix "/" a b,
+}
+
+export leftSubstring: string -> int -> string = s => n => case dialect.name {
+    "sqlite" => lowering_func "SUBSTR" [s, 1, n],
+    _        => lowering_func "LEFT" [s, n],
+}
+
+export rightSubstring: string -> int -> string = s => n => case dialect.name {
+    "sqlite" => lowering_func "SUBSTR" [s, (-n)],
+    _        => lowering_func "RIGHT" [s, n],
+}
+
+# `ceil` is spelled differently on sqlite. The shared body keeps that branch
+# in ONE place instead of repeating it per overload. It is private
+# (unexported), so it never becomes part of this module's public surface.
+ceil_impl = x => case dialect.name {
+    "sqlite" => lowering_func "CEILING" [x],
+    _        => lowering_func "CEIL" [x],
+}
+
+# Numeric math unaries are OVERLOADED, one definition per numeric type —
+# this is what replaces the compiler-owned Num class: the argument's type
+# selects the definition (`abs u.age` takes the int one, `abs u.balance` the
+# float one), and a non-numeric argument matches no definition at all.
+export abs: int -> int = x => lowering_func "ABS" [x]
+export abs: float -> float = x => lowering_func "ABS" [x]
+export abs: decimal -> decimal = x => lowering_func "ABS" [x]
+
+export ceil: int -> int = x => ceil_impl x
+export ceil: float -> float = x => ceil_impl x
+export ceil: decimal -> decimal = x => ceil_impl x
+
+export floor: int -> int = x => lowering_func "FLOOR" [x]
+export floor: float -> float = x => lowering_func "FLOOR" [x]
+export floor: decimal -> decimal = x => lowering_func "FLOOR" [x]
+
+export sqrt: float -> float = x => lowering_func "SQRT" [x]
+export sqrt: decimal -> decimal = x => lowering_func "SQRT" [x]
+
+export pow: int -> int -> int = x => y => lowering_func "POW" [x, y]
+export pow: float -> float -> float = x => y => lowering_func "POW" [x, y]
+export pow: decimal -> decimal -> decimal = x => y => lowering_func "POW" [x, y]
+
+# `position` varies per dialect in BOTH the function name and the argument
+# order, so its lowering branches on the dialect record. The argument-
+# reordered form (POSITION(needle IN value)) is expressed with the infix
+# primitive.
+export position: string -> string -> int = x => n => case dialect.name {
+    "postgresql" => lowering_func "POSITION" [lowering_infix "IN" n x],
+    "trino"      => lowering_func "POSITION" [lowering_infix "IN" n x],
+    "mysql"      => lowering_func "LOCATE" [n, x],
+    _            => lowering_func "INSTR" [x, n],
+}

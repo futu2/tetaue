@@ -3,7 +3,7 @@ import { analyze } from '../src/language/interpreter.ts';
 import { checkDialectCapabilities } from '../src/language/capabilities.ts';
 import { DIALECTS, renderQuery } from '../src/language/render.ts';
 import { standardPrelude } from '../src/language/prelude.ts';
-import { parseModel, services } from './helpers.ts';
+import { checkWithLowerings, parseModel, services } from './helpers.ts';
 
 function queryOf(source: string) {
     const result = analyze(parseModel(source), standardPrelude(services));
@@ -29,7 +29,7 @@ describe('dialect capability preflight', () => {
     test('checks date fallbacks and set/join capabilities in one traversal', () => {
         const dateQuery = queryOf(`
             events: query { happened: date, amount: int } = table "events"
-            q = events & map (e => { shifted = date_add e.happened "day" e.amount })
+            q = events & map (e => { shifted = dateAdd e.happened "day" e.amount })
         `);
         expect(checkDialectCapabilities(dateQuery, DIALECTS.sqlite!)).toEqual([]);
 
@@ -44,10 +44,16 @@ describe('dialect capability preflight', () => {
     });
 
     test('bare SqlNodes (sql_bare) traverse the capability walker without noise', () => {
-        const query = queryOf(`
+        // `sql_*` are the LIBRARY's lowering vocabulary (see helpers.ts):
+        // the module is checked with them in scope, exactly like base/sql.tetaue.
+        const result = checkWithLowerings(`
             events: query { happened_at: date } = table "events"
             q = events & map (e => { y = sql_func "EXTRACT" [((sql_infix) "FROM") ((sql_bare) "YEAR") e.happened_at] })
         `);
+        expect(result.diagnostics).toEqual([]);
+        expect(result.value.kind).toBe('query');
+        if (result.value.kind !== 'query') return;
+        const query = result.value.query;
         for (const dialect of ['sqlite', 'mysql', 'trino', 'postgresql', 'hive'] as const) {
             const d = DIALECTS[dialect]!;
             expect(checkDialectCapabilities(query, d), `${dialect} capabilities`).toEqual([]);

@@ -7,11 +7,11 @@
 # branch on the first-class `sql_dialect` value, so every dialect renders its
 # own spelling. See docs/design/sql-dialect.md.
 #
-#   left_substring / right_substring   SUBSTR vs LEFT/RIGHT
+#   leftSubstring / rightSubstring   SUBSTR vs LEFT/RIGHT
 #   lpad / rpad                        native vs a CASE WHEN emulation (sqlite)
 #   substring s 1 3                    SUBSTRING vs SUBSTR
 #   position / div / mod / pow         name and argument-order differences
-#   date_add / date_diff / extract     interval syntax per engine
+#   dateAdd / dateDiff / extract     interval syntax per engine
 #   cast                               dialect type names
 #   concat                             CONCAT vs `||` with NULL semantics
 #
@@ -22,7 +22,7 @@
 #
 #   union / intersect / except         set operations
 #   recursive                          WITH RECURSIVE (unsupported on Hive)
-#   join_lateral                       INNER JOIN LATERAL (PG/MySQL only)
+#   joinLateral                       INNER JOIN LATERAL (PG/MySQL only)
 #   over (...)                         window functions (RANK family)
 #
 # `main` is the scalar binding; the shape queries are library bindings, so
@@ -48,19 +48,19 @@ archived: query {
     last_seen: timestamp,
 } = table "archived"
 
-# Set operations: union, union_all, intersect and except combine two
+# Set operations: union, unionAll, intersect and except combine two
 # complete relational expressions, so each is a binding of its own.
 scalar_side = users & map (u => { id = u.id, label = toUpper u.name })
 archived_side = archived & map (u => { id = u.id, label = toUpper u.name })
 set_union = scalar_side & union archived_side
-set_union_all = scalar_side & union_all archived_side
+set_union_all = scalar_side & unionAll archived_side
 set_intersect = scalar_side & intersect archived_side
 set_except = scalar_side & except archived_side
 
-# Window projection: over (row_number) { partition = [...], order = [...] }.
+# Window projection: over (rowNumber) { partition = [...], order = [...] }.
 windowed = users & map (u => {
     id = u.id,
-    rn = over (row_number) { partition = [u.active], order = [desc u.balance] },
+    rn = over (rowNumber) { partition = [u.active], order = [desc u.balance] },
     rk = over (rank) { partition = [u.active], order = [desc u.balance] },
 })
 
@@ -76,14 +76,14 @@ closure = (nodes
 # Lateral join: the right side is correlated with the current left row.
 ranked = users & map (u => { id = u.id, total = u.balance })
 lateral = users
-    & join_lateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })
+    & joinLateral (l => (ranked & filter (r => r.id == l.id))) (l => r => true) (l => r => { id = l.id, total = r.total })
 
 main = users
     & filter (u => u.active && position u.name "a" > 0)
     & map (u => {
         id = u.id,
-        left3 = left_substring u.name 3,
-        right2 = right_substring u.name 2,
+        left3 = leftSubstring u.name 3,
+        right2 = rightSubstring u.name 2,
         pad = lpad u.code 8 "0",
         rpad_ = rpad u.code 8 "0",
         sub = substring u.name 1 3,
@@ -93,17 +93,21 @@ main = users
         squared = pow u.id 2,
         joined_day = extract u.joined "day",
         joined_month = extract u.joined "month",
-        day_of_week = extract u.joined "day_of_week",
-        shifted = date_add u.joined "day" 7,
-        age_days = date_diff u.joined "day" current_date,
+        dayOfWeek = extract u.joined "dayOfWeek",
+        shifted = dateAdd u.joined "day" 7,
+        age_days = dateDiff u.joined "day" currentDate,
         label = concat [u.name, u.code],
-        as_int = cast u.balance "int",
-        as_string = cast u.id "string",
-        as_float = cast u.id "float",
-        as_decimal = cast u.id "decimal",
-        as_bool = cast u.active "bool",
-        as_date = cast u.last_seen "date",
-        as_timestamp = cast u.joined "timestamp",
+        # The cast helpers fix the target type, so a cast reads as a unary
+        # function (`asInt x` is `cast x "int"`); the `_or_null` spelling is
+        # `tryCast` — NULL instead of an error when the conversion fails.
+        asInt = asInt u.balance,
+        asString = asString u.id,
+        asFloat = asFloat u.id,
+        asDecimal = asDecimal u.id,
+        asBool = asBool u.active,
+        asDate = asDate u.last_seen,
+        asTimestamp = asTimestamp u.joined,
+        code_int = asIntOrNull u.code,
         when_msg = case {
             u.balance > 100.0 => "high",
             u.balance > 10.0 => "mid",

@@ -9,3 +9,4 @@ extension/out/
 extension/server/
 extension/*.vsix
 /result
+.probe

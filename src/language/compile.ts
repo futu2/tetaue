@@ -26,7 +26,7 @@ import { createImportResolver } from './resolve.js';
 import { createModuleLoader, parseModel, detectNoPrelude, detectStrict } from './module-cache.js';
 import { checkStrictSchema } from './strict-schema.js';
 import type { Model } from './generated/ast.js';
-import { standardPrelude } from './prelude.js';
+import { baseLibraryExports, baseLibraryImports, baseLibraryModules, standardPrelude } from './prelude.js';
 import { stringEscapeWarningsFor } from './strings.js';
 
 export interface CompileDiagnostic {
@@ -104,9 +104,10 @@ export interface ProjectTree {
 export function projectTreeFor(root: ProjectModule, services: TetaueServices): ProjectTree {
     // Imports and re-exports resolve relative to the importing file — see
     // resolve.ts. The same loader serves both, so a diamond graph parses
-    // each module once.
+    // each module once. `base/...` specifiers resolve into the EMBEDDED base
+    // library instead of the filesystem (see resolveBaseImport).
     const tree = collectModuleTree(root, {
-        resolve: createImportResolver(),
+        resolve: createImportResolver({ base: true }),
         read: moduleLoader.read,
         parse: (text, uri) => moduleLoader.parse(text, uri, services),
     });
@@ -185,24 +186,33 @@ export function compileModuleText(
     }
 
     const { modules, importsByModule, exportsByModule, diagnostics: treeDiagnostics } = projectTreeFor(main, services);
-    // The prelude module anchors its own diagnostics (e.g. an error raised
-    // while applying the `_&_` pipeline lambda must point at prelude.tetaue,
-    // not at the importing file).
+    // The base library is a module tree of its own (the Prelude re-exports
+    // `base/data/function`, `base/sql`, ...), processed before the user's
+    // modules. `anchorModules` is also the diagnostic universe: an error
+    // raised while applying the `_&_` pipeline lambda must point at the BASE
+    // module that defines it, not at the importing file.
+    const baseModules = baseLibraryModules(services);
     const prelude = standardPrelude(services);
-    const anchorModules = [...modules, prelude];
+    // A user module may `import "base/sql"` explicitly. That module is
+    // already part of the base tree (and is processed with the primitive
+    // environment), so it must not be walked a second time as a user module —
+    // it would lose its primitives and be checked twice.
+    const baseUris = new Set(baseModules.map(m => m.uri));
+    const userModules = modules.filter(m => !baseUris.has(m.uri));
+    const anchorModules = [...userModules, ...baseModules];
     // Attach noPrelude meta based on source text
     const readMyFile = (uri: string) => moduleLoader.read(uri);
     if (detectNoPrelude(rootText)) main.noPrelude = true;
     if (detectStrict(rootText)) main.strict = true;
     // Propagate noPrelude for all collected modules by re-reading their source
-    for (const m of modules) {
+    for (const m of userModules) {
         if (m.uri) {
             const txt = readMyFile(m.uri) ?? '';
             if (detectNoPrelude(txt)) m.noPrelude = true;
             if (detectStrict(txt)) m.strict = true;
         }
     }
-    const { value, diagnostics: merged } = checkProject(modules, {
+    const { value, diagnostics: merged } = checkProject(userModules, {
         requireQuery,
         // Strict main by default for render/check; `build` opts in via
         // requireMain while keeping requireQuery off (library detection).
@@ -211,6 +221,9 @@ export function compileModuleText(
         reexportsByModule: exportsByModule,
         entryBinding: binding,
         prelude,
+        baseModules,
+        baseImportsByModule: baseLibraryImports(services),
+        baseExportsByModule: baseLibraryExports(services),
         dialect: DIALECTS[dialect],
     });
 
@@ -247,7 +260,7 @@ export function compileModuleText(
     if (!rendered.ok) {
         return {
             ok: false,
-            diagnostics: rendered.diagnostics.map(d => renderDiagnostic(d, rootUri, modules, main)),
+            diagnostics: rendered.diagnostics.map(d => renderDiagnostic(d, rootUri, anchorModules, main)),
         };
     }
     return {

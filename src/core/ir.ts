@@ -33,6 +33,7 @@ export type Schema = ReadonlyMap<string, SqlColumn>;
 export type SqlNodeBase =
     | { readonly kind: 'col'; readonly name: string; readonly table: string | null; readonly type: SqlType }
     | { readonly kind: 'bare'; readonly name: string; readonly type: SqlType }
+    | { readonly kind: 'fragment'; readonly template: string; readonly args: readonly SqlNode[]; readonly type: SqlType }
     | { readonly kind: 'lit'; readonly value: number | string | boolean | null; readonly type: TypeOrNull }
     | { readonly kind: 'bin'; readonly op: string; readonly left: SqlNode; readonly right: SqlNode; readonly type: SqlType }
     | { readonly kind: 'is-null'; readonly expr: SqlNode; readonly negated: boolean; readonly type: 'bool' }

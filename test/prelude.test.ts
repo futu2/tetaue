@@ -2,7 +2,13 @@ import { describe, expect, test } from 'bun:test';
 import { NodeFileSystem } from 'langium/node';
 import { readFileSync } from 'node:fs';
 import { createTetaueServices } from '../src/language/tetaue-module.js';
-import { standardPrelude, standardPreludeNames, STANDARD_PRELUDE_SOURCE } from '../src/language/prelude.js';
+import {
+    standardPrelude,
+    standardPreludeNames,
+    baseLibraryModules,
+    baseModuleSource,
+    baseLibraryOptions,
+} from '../src/language/prelude.js';
 import { BUILTINS, createPreludeEnv } from '../src/language/interpreter.js';
 import { BUILTIN_NAMES } from '../src/language/builtin.js';
 import { MAYBE_NAMESPACE, PRELUDE_NAMESPACES } from '../src/language/prelude-namespaces.js';
@@ -38,9 +44,44 @@ describe('standard prelude', () => {
         expect(standardPrelude(otherServices)).not.toBe(standardPrelude(services));
     });
 
-    test('the checked-in source matches the embedded distribution source', () => {
-        const file = readFileSync(new URL('../prelude.tetaue', import.meta.url), 'utf8').trim();
-        expect(file).toBe(STANDARD_PRELUDE_SOURCE.trim());
+    test('the files under base/ are the source of truth for the embedded library', () => {
+        // The library is edited as real files and embedded by
+        // `bun run base:generate`; a stale embed is the one failure mode, so
+        // every module is compared against its file.
+        for (const path of ['prelude.tetaue', 'sql.tetaue', 'sql/time.tetaue', 'data/function.tetaue', 'data/maybe.tetaue']) {
+            const file = readFileSync(new URL(`../base/${path}`, import.meta.url), 'utf8');
+            expect(baseModuleSource(path), path).toBe(file);
+        }
+    });
+
+    test('the base library is a real module tree, in dependency order', () => {
+        const modules = baseLibraryModules(services);
+        const uris = modules.map(m => m.uri);
+        expect(new Set(uris)).toEqual(new Set([
+            'base/prelude.tetaue',
+            'base/sql.tetaue',
+            'base/sql/time.tetaue',
+            'base/data/function.tetaue',
+            'base/data/maybe.tetaue',
+        ]));
+        // Every module comes AFTER everything it imports or re-exports, so
+        // the checker always sees a target's exports before the module that
+        // uses them; the Prelude is the aggregation point and comes last.
+        const position = new Map(uris.map((uri, i) => [uri, i]));
+        for (const module of modules) {
+            for (const edge of [...(module.imports ?? []), ...(module.exports ?? [])]) {
+                expect(position.get(edge.target.uri!), `${module.uri} -> ${edge.target.uri}`)
+                    .toBeLessThan(position.get(module.uri!)!);
+            }
+        }
+        expect(uris[uris.length - 1]).toBe('base/prelude.tetaue');
+        // The Prelude is an aggregator: it re-exports the other modules.
+        expect(standardPrelude(services).model.exports.map(e => e.path).sort()).toEqual([
+            '"./data/function.tetaue"',
+            '"./data/maybe.tetaue"',
+            '"./sql.tetaue"',
+            '"./sql/time.tetaue"',
+        ]);
     });
 
     test('is ordinary tetaue and is checked by the shared pass', () => {
@@ -59,10 +100,10 @@ describe('standard prelude', () => {
         const alternative = prelude.model.bindings.find(binding => binding.name === '_<|>_');
         const bind = prelude.model.bindings.find(binding => binding.name === '_>>=_');
         expect(plus?.export).toBe(true);
-        expect(plus?.$cstNode?.text).toBe('export _+_ = op_add');
-        expect(forward?.$cstNode?.text).toBe('export _>>>_ = f => g => x => g (f x)');
+        expect(plus?.$cstNode?.text).toBe('export _+_ = sql.sql_add');
+        expect(forward?.$cstNode?.text).toBe('export _>>>_ = fn.compose');
         expect(pipeline?.$cstNode?.text).toBe('export _&_ = x => f => f x');
-        expect(apply?.$cstNode?.text).toBe('export _$_ = f => x => f x');
+        expect(apply?.$cstNode?.text).toBe('export _$_ = fn.apply');
         expect(fmap?.$cstNode?.text).toBe('export _<$>_ = fmap');
         expect(alternative?.$cstNode?.text).toBe('export _<|>_ = orElse');
         expect(bind?.$cstNode?.text).toBe('export _>>=_ = bind');
@@ -72,31 +113,50 @@ describe('standard prelude', () => {
         expect(core.has('op_apply')).toBe(false);
     });
 
-    test('builtin names are native — no @ prefix, no alias shims', () => {
-        const prelude = standardPrelude(services);
-        // The prelude no longer re-exports every builtin: builtins are native
-        // names supplied by the core, so the source prelude binds only the
-        // derived helpers and operator sections.
-        expect(prelude.model.bindings.find(b => b.name === 'table')).toBeUndefined();
+    test('the primitive core is reachable only from base modules', () => {
+        // The primitive env still holds every builtin under its plain name —
+        // that is what base modules are evaluated against.
         const core = createPreludeEnv();
         expect(core.has('filter')).toBe(true);
-        expect(core.has('@filter')).toBe(false);
         expect(core.has('table')).toBe(true);
         expect(core.has('int')).toBe(false); // types are not runtime values
+        // ... and under the reserved `core` namespace, so a base module can
+        // publish a public spelling without a self-recursive binding.
+        const coreNs = core.get('core');
+        expect(coreNs?.kind).toBe('module');
 
         const inferencer = new Inferencer();
         inferencer.prelude();
-        expect(inferencer.env.has('filter')).toBe(true);
-        expect(inferencer.env.has('@filter')).toBe(false);
-        // Every builtin name is reachable natively.
         for (const name of BUILTIN_NAMES) {
             expect(inferencer.env.has(name)).toBe(true);
         }
     });
 
+    test('the SQL surface is exported by the library, not injected by the checker', () => {
+        // `table`/`filter`/`map`/... are ordinary exported bindings of
+        // base/sql.tetaue that the Prelude re-exports — not names the checker
+        // sprinkles into every module.
+        const names = standardPreludeNames(services);
+        for (const name of ['table', 'filter', 'map', 'take', 'union', 'joinInner', 'count', 'asc']) {
+            expect(names, name).toContain(name);
+        }
+        // The lowering primitives stay library-internal.
+        for (const name of ['sql_func', 'sql_infix', 'sql_cast', 'sql_try_cast', 'sql_bare', 'sql_dialect', 'op_add']) {
+            expect(names, name).not.toContain(name);
+        }
+    });
+
+    test('a module without the Prelude cannot reach the primitives', () => {
+        // `# no prelude` leaves the module with nothing auto-imported, so the
+        // SQL surface is gone with it.
+        const module = { ...parsedModule('# no prelude\nq = table "users"'), noPrelude: true };
+        const result = checkProject([module], { requireQuery: false, prelude: standardPrelude(services) });
+        expect(result.diagnostics.map(d => d.message).join('\n')).toContain("unknown identifier 'table'");
+    });
+
     test('defines derived helpers outside the primitive builtin table', () => {
         const names = standardPreludeNames(services);
-        for (const name of ['is_nothing', 'is_just', 'is_not_null']) {
+        for (const name of ['isNothing', 'isJust', 'isNotNull']) {
             expect(names).toContain(name);
             expect(Object.keys(BUILTINS)).not.toContain(name);
         }
@@ -104,7 +164,7 @@ describe('standard prelude', () => {
 
         const result = checked(`
             users: query { name: (maybe string) } = table "users"
-            q = users & filter (u => is_just u.name && is_not_null u.name && is_nothing nothing)
+            q = users & filter (u => isJust u.name && isNotNull u.name && isNothing nothing)
         `);
         expect(result.diagnostics).toEqual([]);
         expect(result.value.kind).toBe('query');
@@ -116,21 +176,80 @@ describe('standard prelude', () => {
         expect(result.value.kind).toBe('query');
     });
 
-    test('the source prelude controls the public surface', () => {
-        // Without the prelude, only the native builtin names are visible.
+    test('cast helpers fix the target type, so a cast reads as a unary function', () => {
+        const names = standardPreludeNames(services);
+        for (const name of [
+            'asInt', 'asFloat', 'asDecimal', 'asString', 'asBool', 'asDate', 'asTimestamp',
+            'asIntOrNull', 'asFloatOrNull', 'asDecimalOrNull', 'asStringOrNull',
+            'asBoolOrNull', 'asDateOrNull', 'asTimestampOrNull',
+        ]) {
+            expect(names, name).toContain(name);
+            expect(Object.keys(BUILTINS), name).not.toContain(name);
+        }
+        // `tryCast` itself is a primitive now, so it stays out of the
+        // derived-helper set but is published by the library.
+        expect(names).toContain('tryCast');
+
+        const result = checked(`
+            users: query { id: int, name: string, balance: float, joined: string } = table "users"
+            q = users & map (u => {
+                i = asInt u.name,
+                s = asString u.id,
+                f = asFloat u.balance,
+                b = asBool u.name,
+                d = asDate u.joined,
+                ts = asTimestamp u.joined,
+                dec = asDecimal u.balance,
+            })
+        `);
+        expect(result.diagnostics).toEqual([]);
+        expect(result.value.kind).toBe('query');
+    });
+
+    test('each cast helper pins its own target type, not one shared instance', () => {
+        // The helpers are written out per definition rather than sharing an
+        // `asImpl` helper: a shared helper is monomorphic at its definition
+        // site, which would make all but the first target type a mismatch.
+        const source = (target: string) => `
+            users: query { id: int, name: string } = table "users"
+            q = users & map (u => { v = as_${target} u.name })
+        `;
+        for (const target of ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp']) {
+            expect(typeErrors(source(target)), target).toEqual([]);
+        }
+    });
+
+    test('as_*_or_null renders NULL-on-failure, tryCast on dialects that have it', () => {
+        const source = `
+            users: query { name: string } = table "users"
+            q = users & map (u => { i = asIntOrNull u.name })
+        `;
+        expect(render(source, 'postgresql')).toContain('TRY_CAST(name AS INTEGER)');
+        // SQLite has no TRY_CAST, so the fallback detects the lossy conversion.
+        const sqlite = render(source, 'sqlite');
+        expect(sqlite).toContain('CASE WHEN');
+        expect(sqlite).toContain('ELSE NULL END');
+    });
+
+    test('the Prelude controls the public surface', () => {
+        // Without the Prelude the SQL surface is gone with it: `table` and
+        // `filter` are ordinary exported bindings of the library, not names
+        // an ambient environment supplies. Only the always-available
+        // namespaces (`list.*`, `Maybe.*`) remain.
         const coreUse = checkProject(
             [parsedModule('q = filter (u => true) (table "users")')],
             { requireQuery: false },
         );
-        expect(coreUse.diagnostics).toEqual([]);
-        expect(coreUse.value.kind).toBe('query');
+        const coreMessages = coreUse.diagnostics.map(d => d.message).join('\n');
+        expect(coreMessages).toContain("unknown identifier 'filter'");
+        expect(coreMessages).toContain("unknown identifier 'table'");
 
-        // Prelude-derived helpers (not builtins) disappear without the prelude.
+        // Library-derived helpers disappear with it too.
         const helperUse = checkProject(
-            [parsedModule('q = is_nothing')],
+            [parsedModule('q = isNothing')],
             { requireQuery: false },
         );
-        expect(helperUse.diagnostics.map(d => d.message).join('\n')).toContain("unknown identifier 'is_nothing'");
+        expect(helperUse.diagnostics.map(d => d.message).join('\n')).toContain("unknown identifier 'isNothing'");
     });
 });
 
@@ -231,7 +350,7 @@ describe('Maybe namespace', () => {
         const maybe = env.get('Maybe');
         expect(maybe?.kind).toBe('module');
         if (!maybe || maybe.kind !== 'module') return;
-        for (const name of ['just', 'nothing', 'is_null', 'from_maybe']) {
+        for (const name of ['just', 'nothing', 'isNull', 'fromMaybe']) {
             expect(env.has(name)).toBe(true);
             expect(env.get(name)).not.toBe(maybe.exports.get(name));
         }

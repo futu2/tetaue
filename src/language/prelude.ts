@@ -1,164 +1,269 @@
 /******************************************************************************
- * The standard library, written in tetaue.
+ * The base library — tetaue's `base`.
  *
- * These definitions deliberately contain no SQL-specific implementation. The
- * TypeScript runtime only supplies the small primitive core; everything here
- * is parsed, inferred, and evaluated through the normal module pipeline.
+ * The library is ordinary tetaue in `base/`: one file per module, exactly
+ * like Haskell's `base`. This file is only the *loader*: it parses those
+ * modules with the caller's language services, resolves their relative
+ * imports (`base/prelude.tetaue` re-exports `./data/function.tetaue`, ...),
+ * and hands the resulting module tree to the checker.
+ *
+ *   Prelude          the auto-imported surface (a thin aggregator)
+ *   Sql              the public SQL surface + the scalar layer
+ *   data/function    pure combinators (id, const, flip, compose, ...)
+ *   data/maybe       helpers over SQL NULL
+ *
+ * The sources are embedded as strings (`base-sources.ts`) so the
+ * CLI, the LSP server, and the standalone executables all carry the library
+ * without an asset directory; the files under `base/` remain the source of
+ * truth and are what gets edited.
+ *
+ * Two rules make the PICTURE complete:
+ *
+ *   - a BASE module is the only kind of module that sees the primitive core
+ *     unqualified (BUILTINS + the operator intrinsics + `sql_dialect`);
+ *   - every OTHER module sees exactly what it imports — `base/prelude` is
+ *     auto-imported, so the familiar names stay unqualified by default,
+ *     while `sql_func` and friends remain private to the library.
  ******************************************************************************/
 import type { TetaueServices } from './tetaue-module.js';
 import type { Model } from './generated/ast.js';
-import type { ProjectModule } from './imports.js';
+import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
+import { parseStringLiteral } from './strings.js';
+import { BASE_MODULE_SOURCES } from './base-sources.js';
 
-/** Source for the built-in standard library module. */
-export const STANDARD_PRELUDE_SOURCE = [
-'# no prelude',
-'# The standard library is intentionally ordinary tetaue code. SQL',
-'# primitives and scalar types are native builtin names; only reusable',
-'# functional definitions live here.',
-'',
-`export _>>>_ = f => g => x => g (f x)
-export _<<<_ = f => g => x => f (g x)
-export _*_ = op_multiply
-export _/_ = op_divide
-export _+_ = op_add
-export _-_ = op_subtract
-export _<>_ = op_merge
-export _==_ = op_equal
-export _!=_ = op_not_equal
-export _<_ = op_less_than
-export _<=_ = op_less_than_or_equal
-export _>_ = op_greater_than
-export _>=_ = op_greater_than_or_equal
-export _&&_ = op_and
-export _||_ = op_or
-export _?_ = x => d => from_maybe d x
-export _&_ = x => f => f x
-export _$_ = f => x => f x
-export _<$>_ = fmap
-export _<$_ = replaceWith
-export _<*>_ = ap
-export _<*_ = applyLeft
-export _*>_ = applyRight
-export _<|>_ = orElse
-export _>>=_ = bind
-export _>>_ = then
+/** Prefix that marks a base-library module path (`base/prelude.tetaue`). */
+export const BASE_PREFIX = 'base/';
 
-export id = x => x
-export const = x => y => x
-export flip = f => x => y => f y x
-
-# Derived Maybe helpers belong here rather than in the SQL core.
-export is_nothing = is_null
-export is_just = x => not (is_null x)
-export is_not_null = is_just
-
-# Scalar SQL functions with no per-dialect variance are ordinary prelude
-# definitions over the sql_func primitive, not core builtins. The precise
-# annotation keeps their type exact (length is int, not a fresh variable).
-export toUpper: string -> string = x => sql_func "UPPER" [x]
-export toLower: string -> string = x => sql_func "LOWER" [x]
-export length: string -> int = x => sql_func "LENGTH" [x]
-export trim: string -> string = x => sql_func "TRIM" [x]
-
-# More monomorphic scalar lowerings. replace has no per-dialect variance;
-# div (integral division) and left_substring/right_substring vary by
-# dialect and branch on the hidden sql_dialect value.
-export replace: string -> string -> string -> string = s => f => r => sql_func "REPLACE" [s, f, r]
-export div: int -> int -> int = a => b => case sql_dialect.name {
-    "mysql" => sql_infix "DIV" a b,
-    "hive"  => sql_infix "DIV" a b,
-    _       => sql_infix "/" a b,
-}
-export left_substring: string -> int -> string = s => n => case sql_dialect.name {
-    "sqlite" => sql_func "SUBSTR" [s, 1, n],
-    _        => sql_func "LEFT" [s, n],
-}
-export right_substring: string -> int -> string = s => n => case sql_dialect.name {
-    "sqlite" => sql_func "SUBSTR" [s, (-n)],
-    _        => sql_func "RIGHT" [s, n],
+/** True when a module URI refers to the base library. */
+export function isBaseUri(uri: string | undefined): boolean {
+    if (!uri) return false;
+    return uri.startsWith(BASE_PREFIX) || uri.startsWith(`tetaue:${BASE_PREFIX}`);
 }
 
-# mod renders MOD(a, b) in every dialect; like is a binary operator in SQL.
-export mod: int -> int -> int = a => b => sql_func "MOD" [a, b]
-export like: string -> string -> bool = x => p => sql_infix "LIKE" x p
+/** The Prelude's canonical URI; the module every other module auto-imports. */
+export const PRELUDE_URI = `${BASE_PREFIX}prelude.tetaue`;
 
-# ceil is spelled differently on sqlite; the shared body keeps that branch in
-# ONE place instead of repeating it per overload. It is private (unexported),
-# so it never becomes part of the prelude's public surface.
-ceil_impl = x => case sql_dialect.name {
-    "sqlite" => sql_func "CEILING" [x],
-    _        => sql_func "CEIL" [x],
+/** Source text of a base module path, or undefined when there is no such module. */
+export function baseModuleSource(spec: string): string | undefined {
+    const trimmed = spec.replace(/^\.\//, '');
+    return BASE_MODULE_SOURCES[trimmed] ?? BASE_MODULE_SOURCES[`${BASE_PREFIX}${trimmed}`];
 }
 
-# Numeric math unaries are OVERLOADED, one definition per numeric type —
-# this is what replaces the compiler-owned Num class: the argument's type
-# selects the definition (abs u.age takes the int one, abs u.balance the
-# float one), and a non-numeric argument matches no definition at all.
-# The lowering is a plain function call in every dialect.
-export abs: int -> int = x => sql_func "ABS" [x]
-export abs: float -> float = x => sql_func "ABS" [x]
-export abs: decimal -> decimal = x => sql_func "ABS" [x]
-
-export ceil: int -> int = x => ceil_impl x
-export ceil: float -> float = x => ceil_impl x
-export ceil: decimal -> decimal = x => ceil_impl x
-
-export floor: int -> int = x => sql_func "FLOOR" [x]
-export floor: float -> float = x => sql_func "FLOOR" [x]
-export floor: decimal -> decimal = x => sql_func "FLOOR" [x]
-
-export sqrt: float -> float = x => sql_func "SQRT" [x]
-export sqrt: decimal -> decimal = x => sql_func "SQRT" [x]
-
-export pow: int -> int -> int = x => y => sql_func "POW" [x, y]
-export pow: float -> float -> float = x => y => sql_func "POW" [x, y]
-export pow: decimal -> decimal -> decimal = x => y => sql_func "POW" [x, y]
-
-
-
-# position varies per dialect in BOTH the function name and the argument
-# order, so its lowering branches on the hidden sql_dialect value. The
-# argument-reordered form (POSITION(needle IN value)) is expressed with the
-# sql_infix primitive.
-export position: string -> string -> int = x => n => case sql_dialect.name {
-    "postgresql" => sql_func "POSITION" [sql_infix "IN" n x],
-    "trino"      => sql_func "POSITION" [sql_infix "IN" n x],
-    "mysql"      => sql_func "LOCATE" [n, x],
-    _            => sql_func "INSTR" [x, n],
+/** Every base module path, in generated (depth-first, sorted) order. */
+export function baseModulePaths(): readonly string[] {
+    // The generated table repeats each module under its accepted spellings;
+    // the canonical set is the ones without the `base/` prefix and `.tetaue`.
+    return Object.keys(BASE_MODULE_SOURCES).filter(
+        path => !path.startsWith(BASE_PREFIX) && path.endsWith('.tetaue'),
+    );
 }
-`.trimStart(),
-].join('\n');
 
-// A service container owns the parser/value-converter configuration used to
-// construct AST nodes. Cache only within that container so callers can safely
-// create independent language instances in tests, embedded tools, or workers.
-const preludeCache = new WeakMap<object, ProjectModule>();
+interface BaseCache {
+    readonly modules: readonly ProjectModule[];
+    readonly byUri: ReadonlyMap<string, ProjectModule>;
+    /** Resolved intra-library import edges, keyed by module identity. */
+    readonly importsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    /** Resolved intra-library re-export edges, keyed by module identity. */
+    readonly exportsByModule: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]>;
+}
 
-/** Parse the embedded standard library using the caller's language services. */
-export function standardPrelude(services: TetaueServices): ProjectModule {
-    const cached = preludeCache.get(services);
+// A service container owns the parser configuration used to construct AST
+// nodes. Cache only within that container so callers can safely create
+// independent language instances in tests, embedded tools, or workers.
+const baseCache = new WeakMap<object, BaseCache>();
+
+/** Resolve a base-module import specifier (`"./data/maybe.tetaue"`) to its URI. */
+function resolveBaseUri(spec: string): string {
+    // The grammar stores STRING terminals with their quotes (the value
+    // converter keeps them raw so the interpreter controls unescaping).
+    const bare = parseStringLiteral(spec).replace(/^\.\//, '');
+    return `${BASE_PREFIX}${bare}`;
+}
+
+/**
+ * Parse every base module with the caller's services and resolve the imports
+ * and re-exports BETWEEN them (no filesystem: the sources are embedded). The
+ * result is a module tree in dependency order — a module always follows
+ * everything it imports — with the same edge maps a user project produces,
+ * so the checker treats the library exactly like any other project.
+ */
+function baseLibrary(services: TetaueServices): BaseCache {
+    const cached = baseCache.get(services);
     if (cached) return cached;
 
-    const result = services.parser.LangiumParser.parse(STANDARD_PRELUDE_SOURCE);
-    const parseErrors = [
-        ...result.lexerErrors.map(e => e.message),
-        ...result.parserErrors.map(e => e.message),
-    ];
-    if (!result.value || parseErrors.length > 0) {
-        throw new Error(`invalid embedded prelude: ${parseErrors.join('; ') || 'no parse result'}`);
+    const byUri = new Map<string, ProjectModule>();
+    for (const path of baseModulePaths()) {
+        const uri = `${BASE_PREFIX}${path}`;
+        const text = BASE_MODULE_SOURCES[path]!;
+        const result = services.parser.LangiumParser.parse(text);
+        const parseErrors = [
+            ...result.lexerErrors.map(e => e.message),
+            ...result.parserErrors.map(e => e.message),
+        ];
+        if (!result.value || parseErrors.length > 0) {
+            throw new Error(`invalid base module '${uri}': ${parseErrors.join('; ') || 'no parse result'}`);
+        }
+        byUri.set(uri, { model: result.value as Model, uri, imports: [] });
     }
-    const prelude = {
-        model: result.value as Model,
-        uri: 'tetaue:prelude',
-        imports: [],
+
+    // Resolve the library's own edges: `import "./data/function.tetaue" as fn`
+    // and `export { a } from "./sql.tetaue"`.
+    const importsByModule = new Map<ProjectModule, ResolvedImportEdge[]>();
+    const exportsByModule = new Map<ProjectModule, ResolvedExportEdge[]>();
+    for (const module of byUri.values()) {
+        const edges: ResolvedImportEdge[] = [];
+        for (const imp of module.model.imports) {
+            const target = byUri.get(resolveBaseUri(imp.path));
+            if (target) edges.push({ alias: imp.alias, target, importNode: imp });
+        }
+        if (edges.length > 0) importsByModule.set(module, edges);
+
+        const reexports: ResolvedExportEdge[] = [];
+        for (const exp of module.model.exports) {
+            const target = byUri.get(resolveBaseUri(exp.path));
+            if (target) reexports.push({ target, exportNode: exp });
+        }
+        if (reexports.length > 0) exportsByModule.set(module, reexports);
+    }
+
+    // Depth-first over the embedded imports, emitting dependencies first so
+    // the checker sees a target's exports before the module that uses them.
+    const ordered: ProjectModule[] = [];
+    const done = new Set<string>();
+    const visit = (uri: string, path: readonly string[]): void => {
+        if (done.has(uri) || path.includes(uri)) return;
+        const module = byUri.get(uri);
+        if (!module) return;
+        for (const edge of importsByModule.get(module) ?? []) {
+            visit(edge.target.uri!, [...path, uri]);
+        }
+        for (const edge of exportsByModule.get(module) ?? []) {
+            visit(edge.target.uri!, [...path, uri]);
+        }
+        done.add(uri);
+        ordered.push(module);
     };
-    preludeCache.set(services, prelude);
+    for (const path of baseModulePaths()) visit(`${BASE_PREFIX}${path}`, []);
+
+    // Publish the edges on the modules themselves as well. `checkProject`
+    // reads the explicit maps, but the one-sided entry points
+    // (`analyzeProject`, `inferProject`) and any caller that only holds a
+    // module object read `module.imports`/`module.exports` — so filling
+    // both means a base module is never partially wired, whichever API
+    // is used.
+    for (const [module, edges] of importsByModule) {
+        (module as { imports?: readonly ResolvedImportEdge[] }).imports = edges;
+    }
+    for (const [module, edges] of exportsByModule) {
+        (module as { exports?: readonly ResolvedExportEdge[] }).exports = edges;
+    }
+
+    const cache: BaseCache = { modules: ordered, byUri, importsByModule, exportsByModule };
+    baseCache.set(services, cache);
+    return cache;
+}
+
+/**
+ * Every base module in dependency order. The checker evaluates these with the
+ * primitive environment seeded and records their exports, so the Prelude can
+ * re-export the library the way an ordinary module re-exports another.
+ */
+export function baseLibraryModules(services: TetaueServices): readonly ProjectModule[] {
+    return baseLibrary(services).modules;
+}
+
+/** Resolved intra-library import edges (for `checkProject`'s module tree). */
+export function baseLibraryImports(services: TetaueServices): ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]> {
+    return baseLibrary(services).importsByModule;
+}
+
+/** Resolved intra-library re-export edges (for `checkProject`'s module tree). */
+export function baseLibraryExports(services: TetaueServices): ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]> {
+    return baseLibrary(services).exportsByModule;
+}
+
+/**
+ * The base-library modules a `prelude` depends on, in dependency order, the
+ * prelude LAST. Used by the one-sided entry points (`analyzeProject`,
+ * `inferProject`), which receive the Prelude module alone and must still
+ * evaluate the library modules it re-exports from.
+ *
+ * The walk follows `imports`/`exports` edges, which `baseLibrary` publishes
+ * on the modules themselves, so any caller holding a prelude module gets the
+ * full closure without a second API to thread.
+ */
+export function baseClosureFor(prelude: ProjectModule): readonly ProjectModule[] {
+    const order: ProjectModule[] = [];
+    const seen = new Set<ProjectModule>();
+    const visit = (module: ProjectModule): void => {
+        if (seen.has(module)) return;
+        seen.add(module);
+        for (const edge of module.imports ?? []) visit(edge.target);
+        for (const edge of module.exports ?? []) visit(edge.target);
+        order.push(module);
+    };
+    visit(prelude);
+    // The prelude must come last: it re-exports the modules walked above.
+    const rest = order.filter(m => m !== prelude);
+    return [...rest, prelude];
+}
+
+/**
+ * The base library as `checkProject` options: the modules in dependency
+ * order, their internal import/re-export edges, and the Prelude every other
+ * module auto-imports. One call so no caller can wire half of it and get a
+ * library without its own imports resolved.
+ */
+export function baseLibraryOptions(services: TetaueServices): {
+    baseModules: readonly ProjectModule[];
+    baseImportsByModule: ReadonlyMap<ProjectModule, readonly ResolvedImportEdge[]>;
+    baseExportsByModule: ReadonlyMap<ProjectModule, readonly ResolvedExportEdge[]>;
+    prelude: ProjectModule;
+} {
+    return {
+        baseModules: baseLibraryModules(services),
+        baseImportsByModule: baseLibraryImports(services),
+        baseExportsByModule: baseLibraryExports(services),
+        prelude: standardPrelude(services),
+    };
+}
+
+/**
+ * The Prelude module — what every module auto-imports. Exposed as a single
+ * module for callers that only need "the standard surface" (the CLI's
+ * diagnostics anchoring, completion, the interpreter's flat injection).
+ */
+export function standardPrelude(services: TetaueServices): ProjectModule {
+    const prelude = baseLibrary(services).byUri.get(PRELUDE_URI);
+    if (!prelude) throw new Error(`the base library has no '${PRELUDE_URI}' module`);
     return prelude;
 }
 
-/** Public names supplied by the source prelude rather than the primitive core. */
+/**
+ * Public names supplied by the source Prelude rather than the primitive core.
+ * Re-exports are included (the Prelude is an aggregator, so most of its
+ * surface arrives that way), which is why this walks the re-export list.
+ */
 export function standardPreludeNames(services: TetaueServices): readonly string[] {
-    return standardPrelude(services).model.bindings
-        .filter(binding => binding.export)
-        .map(binding => binding.name);
+    const { byUri } = baseLibrary(services);
+    const names = new Set<string>();
+    const collect = (module: ProjectModule, seen: ReadonlySet<string>): void => {
+        for (const binding of module.model.bindings) {
+            if (binding.export) names.add(binding.name);
+        }
+        const uri = module.uri ?? '';
+        if (seen.has(uri)) return;
+        const nextSeen = new Set(seen).add(uri);
+        for (const exp of module.model.exports) {
+            const target = byUri.get(resolveBaseUri(exp.path));
+            if (!target) continue;
+            if (exp.names.length === 0) {
+                collect(target, nextSeen);
+            } else {
+                for (const item of exp.names) names.add(item.renamed ?? item.name);
+            }
+        }
+    };
+    collect(standardPrelude(services), new Set());
+    return [...names];
 }

@@ -31,7 +31,7 @@ import type { ProjectTree } from '../compile.js';
 import { collectModuleTree } from '../imports.js';
 import type { ProjectModule } from '../imports.js';
 import { CST_DROP_BYTES, createModuleLoader } from '../module-cache.js';
-import { standardPrelude } from '../prelude.js';
+import { baseLibraryOptions } from '../prelude.js';
 import { createImportResolver } from '../resolve.js';
 import type { TetaueServices } from '../tetaue-module.js';
 import type { Model } from '../generated/ast.js';
@@ -130,7 +130,7 @@ export function checkedProjectFor(
         requireQuery: false,
         importsByModule: tree.importsByModule,
         reexportsByModule: tree.exportsByModule,
-        prelude: standardPrelude(services),
+        ...baseLibraryOptions(services),
     });
     cache.set(rootUri, { signature, checked });
     evictOldest();

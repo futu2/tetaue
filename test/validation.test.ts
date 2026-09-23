@@ -229,8 +229,8 @@ describe('semantic errors', () => {
         expect(errors(`${USERS}\nq = users & filter (u => not u.age)`).join('\n')).toContain('not expects a boolean expression');
     });
 
-    test('is_in type mismatch', () => {
-        expect(errors(`${USERS}\nq = users & filter (u => is_in u.age ["a", "b"])`).join('\n')).toContain('must match type int');
+    test('isIn type mismatch', () => {
+        expect(errors(`${USERS}\nq = users & filter (u => isIn u.age ["a", "b"])`).join('\n')).toContain('must match type int');
     });
 
     test('coalesce type mismatch', () => {

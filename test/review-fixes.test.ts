@@ -227,20 +227,20 @@ describe('aggregation edges (review fixes)', () => {
             q = orders
                 & fold (o => { user_id = group o.user_id, total = sum o.total })
                 & joinInner users (o => u => o.user_id == u.id) (o => u => { user_id = o.user_id, id = u.id })
-                & filter (r => is_in r.id [1, 2])
+                & filter (r => isIn r.id [1, 2])
         `);
         expect(sql).toContain('WHERE users.id IN (1, 2)');
         expect(sql).not.toContain('HAVING');
     });
 
-    test('join-after-fold with the merge merger and an is_in filter (lpbirthday pattern)', () => {
+    test('join-after-fold with the merge merger and an isIn filter (lpbirthday pattern)', () => {
         const sql = render(`
             orders: query { user_id: int, total: int } = table "orders"
             users: query { id: int, name: string } = table "users"
             totals = orders & fold (o => { user_id = group o.user_id, total = sum o.total })
             q = totals
                 & joinLeft users (this.user_id == that.id) merge
-                & filter (r => is_in r.user_id [1, 2])
+                & filter (r => isIn r.user_id [1, 2])
         `);
         expect(sql).toBe([
             'WITH totals AS (',

@@ -7,6 +7,7 @@ import { Inferencer } from '../src/language/inference.js';
 import { checkProject } from '../src/language/checker.js';
 import { renderQuery, DIALECTS } from '../src/language/render.js';
 import type { Model } from '../src/language/generated/ast.js';
+import { checkWithLowerings } from './helpers.js';
 
 const services = createTetaueServices(NodeFileSystem).tetaue;
 
@@ -27,6 +28,23 @@ function checked(source: string, dialect: string) {
 
 function render(source: string, dialect: string): string {
     const result = checked(source, dialect);
+    expect(result.diagnostics.map(d => d.message)).toEqual([]);
+    expect(result.value.kind).toBe('query');
+    if (result.value.kind !== 'query') return '';
+    const rendered = renderQuery(result.value.query, DIALECTS[dialect as keyof typeof DIALECTS]!, 'compact');
+    if (!rendered.ok) throw new Error(rendered.diagnostics.map(d => d.message).join(' | '));
+    return rendered.sql;
+}
+
+/**
+ * Render a module checked AS PART OF THE BASE LIBRARY.
+ *
+ * `sql_func`/`sql_infix`/`sql_bare`/`sql_dialect` are the library's private
+ * lowering vocabulary — a user module cannot reach them — so the tests that
+ * exercise per-dialect lowering say so, exactly like `base/sql.tetaue` does.
+ */
+function renderBase(source: string, dialect: string): string {
+    const result = checkWithLowerings(source, { dialect });
     expect(result.diagnostics.map(d => d.message)).toEqual([]);
     expect(result.value.kind).toBe('query');
     if (result.value.kind !== 'query') return '';
@@ -64,10 +82,10 @@ describe('sql_dialect', () => {
             }
             main = users & map (u => { p = position u.name "a" })
         `;
-        expect(render(src, 'mysql')).toContain(`LOCATE('a', name)`);
-        expect(render(src, 'sqlite')).toContain(`INSTR(name, 'a')`);
-        expect(render(src, 'trino')).toContain(`POSITION('a', name)`);
-        expect(render(src, 'postgresql')).toContain(`POSITION('a', name)`);
+        expect(renderBase(src, 'mysql')).toContain(`LOCATE('a', name)`);
+        expect(renderBase(src, 'sqlite')).toContain(`INSTR(name, 'a')`);
+        expect(renderBase(src, 'trino')).toContain(`POSITION('a', name)`);
+        expect(renderBase(src, 'postgresql')).toContain(`POSITION('a', name)`);
     });
 
     test('case with a literal condition short-circuits instead of emitting SQL CASE', () => {
@@ -78,15 +96,15 @@ describe('sql_dialect', () => {
             }
             main = users & map (u => { l = label })
         `;
-        expect(render(src, 'mysql')).toContain(`'mysql-db'`);
-        expect(render(src, 'sqlite')).toContain(`'other'`);
-        expect(render(src, 'mysql')).not.toContain('CASE');
-        expect(render(src, 'sqlite')).not.toContain('CASE');
+        expect(renderBase(src, 'mysql')).toContain(`'mysql-db'`);
+        expect(renderBase(src, 'sqlite')).toContain(`'other'`);
+        expect(renderBase(src, 'mysql')).not.toContain('CASE');
+        expect(renderBase(src, 'sqlite')).not.toContain('CASE');
     });
 
     test('sql_func emits an uninterpreted call node', () => {
         const src = USERS + `main = users & map (u => { n = sql_func "UPPER" [u.name] })`;
-        expect(render(src, 'trino')).toContain(`UPPER(name)`);
+        expect(renderBase(src, 'trino')).toContain(`UPPER(name)`);
     });
 
     test('sql_bare emits an unquoted SQL word, unlike a string literal', () => {
@@ -101,8 +119,8 @@ describe('sql_dialect', () => {
             events: query { happened_at: date } = table "events"
             main = events & map (e => { y = sql_func "EXTRACT" [((sql_infix) "FROM") ((sql_bare) "YEAR") e.happened_at] })
         `;
-        expect(render(src, 'postgresql')).toContain(`EXTRACT(YEAR FROM happened_at)`);
-        expect(render(src, 'postgresql')).not.toContain(`'YEAR'`);
-        expect(render(src, 'postgresql')).not.toContain(`"YEAR"`);
+        expect(renderBase(src, 'postgresql')).toContain(`EXTRACT(YEAR FROM happened_at)`);
+        expect(renderBase(src, 'postgresql')).not.toContain(`'YEAR'`);
+        expect(renderBase(src, 'postgresql')).not.toContain(`"YEAR"`);
     });
 });

@@ -52,7 +52,7 @@ describe('pure query optimization', () => {
     test('normalizes negated null predicates', () => {
         const query = queryOf(`
             users: query { name: (maybe string) } = table "users"
-            q = users & filter (u => not (is_null u.name))
+            q = users & filter (u => not (isNull u.name))
         `);
 
         const rendered = renderQuery(query, DIALECTS.postgresql!, 'compact');

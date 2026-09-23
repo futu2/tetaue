@@ -8,7 +8,7 @@
  * interpreter cannot drift apart.
  ******************************************************************************/
 import { describe, expect, test } from 'bun:test';
-import { BUILTIN_ALIASES, BUILTIN_NAMES, BUILTIN_SPECS, builtinModeOf } from '../src/language/catalog.js';
+import { BUILTIN_ALIASES, BUILTIN_NAMES, BUILTIN_SPECS, builtinModeOf, type BuiltinSpec } from '../src/language/catalog.js';
 import { BUILTINS } from '../src/language/interpreter.js';
 
 describe('builtin catalog', () => {
@@ -64,7 +64,7 @@ describe('builtin catalog', () => {
         const u = new TypeUniverse();
         expect(spec.get('sum')!.scheme(u).type).toMatchObject({ kind: 'fun', to: { kind: 'maybe' } });
         expect(spec.get('group')!.scheme(u).type).toMatchObject({ kind: 'fun' });
-        for (const [name, mode] of [['sum', 'agg'], ['count', 'agg'], ['group', 'group'], ['row_number', 'window'], ['lag', 'window']] as const) {
+        for (const [name, mode] of [['sum', 'agg'], ['count', 'agg'], ['group', 'group'], ['rowNumber', 'window'], ['lag', 'window']] as const) {
             expect(builtinModeOf(name)).toBe(mode);
         }
         expect(builtinModeOf('lead')).toBe('window');   // via the lag alias
@@ -76,24 +76,89 @@ describe('builtin catalog', () => {
         }
     });
 
-    test('the date family threads one calendar variable through its argument and result', async () => {
+    test('every builtin whose SQL word is not the upper-cased name declares sqlName', () => {
+        // tetaue names are camelCase, so the renderer cannot recover the SQL
+        // word by upper-casing. A spec that needs a different word MUST carry
+        // it, or the renderer emits a name no dialect has (`rowNumber` would
+        // render `ROWNUMBER()`). This is the guard that keeps a new builtin
+        // from silently regressing to that.
+        // `BUILTIN_SPECS` is `as const` (so `BuiltinName` stays a precise
+        // union), which hides the OPTIONAL `lower`/`sqlName` on entries that
+        // omit them; widen to the declared interface for this read.
+        const specs: readonly BuiltinSpec[] = BUILTIN_SPECS;
+        const spec = new Map(specs.map(s => [s.name, s]));
+        const expected: Record<string, string> = {
+            countDistinct: 'COUNT',
+            inQuery: 'IN',
+            isIn: 'IN',
+            nullIf: 'NULLIF',
+            rowNumber: 'ROW_NUMBER',
+            denseRank: 'DENSE_RANK',
+            percentRank: 'PERCENT_RANK',
+        };
+        for (const [name, sqlName] of Object.entries(expected)) {
+            expect(spec.get(name)?.sqlName, name).toBe(sqlName);
+        }
+        // The converse, stated as the property the renderer actually needs:
+        // every name that can reach the default `NAME(args)` path must resolve
+        // to a SQL word. The reachable set is the builtins the evaluator turns
+        // into `call` nodes under their own name (`rowNumber`, `nullIf`,
+        // `dateAdd`, ...); query steps and dedicated IR nodes (`currentDate`,
+        // `joinLateral`) never become a function word, so they are not in it.
+        // The date family is no longer in the catalog: every date/time
+        // function is a definition in `base/sql/time.tetaue` (see the test
+        // below), so it reaches the renderer as a `fragment`/`call` the
+        // library built rather than as a builtin name.
+        const CALL_NODE_NAMES = [
+            'cast', 'coalesce', 'concat', 'denseRank', 'fromMaybe',
+            'nullIf', 'ntile', 'percentRank', 'rank', 'round', 'rowNumber',
+            'substring', 'tryCast',
+        ] as const;
+        for (const name of CALL_NODE_NAMES) {
+            const s = spec.get(name);
+            expect(s, `${name} must be a catalog spec`).toBeDefined();
+            // Either it declares the word, or owns a special lowering (the
+            // date family, which never reaches the fallback), or the name has
+            // no interior capital — so upper-casing it IS the SQL word
+            // (`rank` -> RANK, `coalesce` -> COALESCE). Never a made-up
+            // `ROWNUMBER`.
+            const handled = s!.lower !== undefined
+                || s!.sqlName !== undefined
+                || !/[a-z][A-Z]/.test(name);
+            expect(
+                handled,
+                `${name} renders through NAME(args) but neither declares a sqlName nor upper-cases to its SQL word`,
+            ).toBe(true);
+        }
+    });
+
+    test('the date family lives in the base library, not the primitive catalog', async () => {
+        // The whole date/time FUNCTION family is defined in
+        // `base/sql/time.tetaue` over the lowering vocabulary, so its
+        // signatures are the exported bindings' inferred types — and none of
+        // it is a primitive. Only the constants (`date`, `timestamp`,
+        // `currentDate`, `currentTimestamp`) stay in the catalog, because they
+        // map to their own IR nodes and no lowering can express them.
         const { TypeUniverse } = await import('../src/language/types.js');
-        const spec = new Map(BUILTIN_SPECS.map(s => [s.name, s]));
+        const spec = new Map<string, BuiltinSpec>(BUILTIN_SPECS.map(s => [s.name, s]));
         const u = new TypeUniverse();
-        // There is no DateTime class to state: the calendar type is an
-        // ordinary variable now, and `postCheckArg` is what rejects a
-        // non-calendar concrete primitive (see tests/dates.test.ts).
-        expect(u.pretty(spec.get('year')!.scheme(u).type)).toBe('t -> int');
-        expect(u.pretty(spec.get('extract')!.scheme(u).type)).toBe('t -> string -> int');
-        // date_trunc preserves its input's date-ness (t in, t out).
-        expect(u.pretty(spec.get('date_trunc')!.scheme(u).type)).toBe('t -> string -> t');
-        expect(u.pretty(spec.get('date_format')!.scheme(u).type)).toBe('t -> string -> string');
-        expect(u.pretty(spec.get('to_unixtime')!.scheme(u).type)).toBe('t -> int');
-        // date_diff keeps two independent variables (no type pollution).
-        expect(u.pretty(spec.get('date_diff')!.scheme(u).type)).toBe('t -> string -> a -> int');
-        // date_add's amount is an independent variable, so a
-        // partially-applied `date_add current_date "day"` stays polymorphic
-        // in the amount and the numeric check happens per argument.
-        expect(u.pretty(spec.get('date_add')!.scheme(u).type)).toBe('t -> string -> a -> t');
+        expect(u.pretty(spec.get('currentDate')!.scheme(u).type)).toBe('date');
+        expect(u.pretty(spec.get('currentTimestamp')!.scheme(u).type)).toBe('timestamp');
+        for (const name of ['year', 'extract', 'dateTrunc', 'dateFormat', 'toUnixtime', 'dateAdd', 'dateDiff']) {
+            expect(spec.has(name), `${name} must NOT be a catalog spec`).toBe(false);
+        }
+        const { baseLibraryModuleTypes } = await import('./helpers.ts');
+        const types = baseLibraryModuleTypes('base/sql/time.tetaue');
+        // The calendar type is an ordinary variable: it threads through from
+        // the argument to the result, which is what makes
+        // `dateTrunc o.created_at "month"` a timestamp and
+        // `dateTrunc o.order_date "month"` a date (see tests/dates.test.ts).
+        expect(types.get('year')).toEqual(['a -> int']);
+        expect(types.get('extract')).toEqual(['a -> string -> int']);
+        expect(types.get('dateTrunc')).toEqual(['a -> string -> a']);
+        expect(types.get('dateFormat')).toEqual(['a -> string -> string']);
+        expect(types.get('toUnixtime')).toEqual(['a -> int']);
+        expect(types.get('dateDiff')).toEqual(['a -> string -> b -> int']);
+        expect(types.get('dateAdd')).toEqual(['a -> string -> int -> a']);
     });
 });

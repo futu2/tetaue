@@ -7,8 +7,8 @@
 # There is no implicit `T` -> `(maybe T)` conversion: `null` has type
 # `forall a. (maybe a)`, and it only unifies with other maybe values.
 #
-#   is_nothing u.nickname         → nickname IS NULL
-#   from_maybe "" u.nickname      → COALESCE(nickname, '')
+#   isNothing u.nickname         → nickname IS NULL
+#   fromMaybe "" u.nickname      → COALESCE(nickname, '')
 #   coalesce u.nickname u.email   → COALESCE(nickname, email)
 
 users: query {
@@ -19,13 +19,13 @@ users: query {
 } = table "users"
 
 active = (users
-    & filter (u => is_just u.email && is_nothing u.nickname)
+    & filter (u => isJust u.email && isNothing u.nickname)
     & map (u => {
         id = u.id,
-        email = toLower (from_maybe "" u.email),
+        email = toLower (fromMaybe "" u.email),
         contact = coalesce u.nickname u.email,
-        email_upper = toUpper (from_maybe "" u.email),
-        email_len = length (from_maybe "" u.email),
+        email_upper = toUpper (fromMaybe "" u.email),
+        email_len = length (fromMaybe "" u.email),
     })
     & distinct) : query {
         id: int,

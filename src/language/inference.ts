@@ -32,7 +32,8 @@ import {
 } from './types.js';
 import type { NumberLiteral, UnaryExpression } from './generated/ast.js';
 import type { ProjectModule, ResolvedExportEdge, ResolvedImportEdge } from './imports.js';
-import { PRELUDE_NAMESPACES } from './prelude-namespaces.js';
+import { CORE_NAMESPACE, PRELUDE_NAMESPACES } from './prelude-namespaces.js';
+import { baseClosureFor } from './prelude.js';
 import { moduleOf } from './imports.js';
 import { resolveImportScope } from './project-scope.js';
 import { parseStringLiteral } from './strings.js';
@@ -80,7 +81,7 @@ function isJoinBuiltinName(name: string | null): name is JoinBuiltinName {
 }
 
 /** Date/time builtins whose value arguments must be date or timestamp. */
-const DATE_VALUE_ARGUMENTS = new Set(['extract', 'year', 'month', 'day', 'day_of_week', 'hour', 'minute', 'second', 'date_add', 'date_diff', 'date_trunc', 'date_format', 'to_unixtime']);
+const DATE_VALUE_ARGUMENTS = new Set(['extract', 'year', 'month', 'day', 'dayOfWeek', 'hour', 'minute', 'second', 'dateAdd', 'dateDiff', 'dateTrunc', 'dateFormat', 'toUnixtime']);
 
 type CastType = (typeof CAST_TYPES)[number];
 
@@ -139,7 +140,7 @@ function isBareMempty(v: Expr): boolean {
 }
 
 /** The set-operation primitives whose SQL form needs known schemas. */
-const SET_OP_BUILTINS: ReadonlySet<string> = new Set(['union', 'union_all', 'intersect', 'except']);
+const SET_OP_BUILTINS: ReadonlySet<string> = new Set(['union', 'unionAll', 'intersect', 'except']);
 
 /**
  * Scope-collision message helpers — worded identically to the interpreter's
@@ -158,6 +159,14 @@ export class Inferencer {
      */
     preludeEnv = new Map<string, Scheme>();
     /**
+     * The PRIMITIVE environment: the builtin schemes, the operator
+     * intrinsics, `sql_dialect`, and the reserved `core` namespace — and
+     * nothing else. It is what a BASE module starts from. `preludeEnv` grows
+     * to include the base library's exports as they are inferred, and is what
+     * every OTHER module starts from.
+     */
+    primitiveEnv = new Map<string, Scheme>();
+    /**
      * The prelude's built-in namespaces (currently just `list.*`), seeded in
      * `prelude()` and cloned into every module as the starting `modules` map
      * (so prelude namespaces are always in scope, like the flat prelude).
@@ -169,6 +178,13 @@ export class Inferencer {
      * exempting a user's own definition of the same name.
      */
     preludeNames = new Set<string>();
+    /**
+     * Which modules are base modules (see `prelude.ts`). Base modules start
+     * from the primitive core; every other module starts from the Prelude's
+     * exports instead, so the library's building blocks never leak. Set by
+     * `checkProject`; unset means "not a base module".
+     */
+    isBaseModule: ((module: ProjectModule) => boolean) | undefined;
     /**
      * Overloaded names: every definition of a name that has more than one.
      * A module may define `abs` three times (`int`, `float`, `decimal`); the
@@ -312,7 +328,7 @@ export class Inferencer {
 
     /**
      * Build the primitive environment from the builtin catalog plus the hidden
-     * operator intrinsics consumed by `prelude.tetaue`. The SQL mode of an
+     * operator intrinsics consumed by the base library. The SQL mode of an
      * aggregate / group key / window function is a property of its NAME
      * (`BUILTIN_MODES`), checked from the entry's syntax at the fold/map/over
      * call sites, and the list-argument builtins take one list argument, so
@@ -356,13 +372,22 @@ export class Inferencer {
             vars: [],
             type: builtinOf('sql_dialect', sqlDialectType),
         });
-        // The primitive environment is cloned into every module (see beginModule).
+        // The primitive environment is what a BASE module starts from; the
+        // Prelude environment starts identical and GROWS with the library's
+        // exports as they are inferred (see beginModule / inferProject).
+        this.primitiveEnv = new Map(this.env);
         this.preludeEnv = new Map(this.env);
         // The built-in prelude namespaces (`list.*`, `maybe.*`): maps of each
         // pure combinator's scheme, so `list.map` / `maybe.isJust` resolve
         // like a qualified import (see beginModule, which starts each module
         // from the prelude namespaces).
         this.preludeNamespaces = new Map<string, Map<string, Scheme>>();
+        // The reserved `core` namespace mirrors the interpreter's: every
+        // primitive under a qualified name, so a base module can alias one
+        // (`export table = core.table`) without a self-recursive binding.
+        // Because it is seeded into BASE modules only, a user module can
+        // never reach a primitive through it.
+        this.preludeNamespaces.set(CORE_NAMESPACE, new Map(this.env));
         for (const [alias, namespace] of Object.entries(PRELUDE_NAMESPACES)) {
             const schemes = new Map<string, Scheme>();
             for (const [publicName, builtinName] of Object.entries(namespace)) {
@@ -430,7 +455,15 @@ export class Inferencer {
     ): void {
         this.prelude();
         const exportsByModule = new Map<ProjectModule, Map<string, Scheme>>();
-        const allModules = prelude ? [prelude, ...modules] : [...modules];
+        // Base modules are inferred first, from the primitive core; every
+        // user module starts from the Prelude's exports instead.
+        const baseModules = prelude ? baseClosureFor(prelude) : [];
+        const baseSet: ReadonlySet<ProjectModule> = new Set(baseModules);
+        this.isBaseModule = module => baseSet.has(module);
+        // Drop base modules a caller also passed in `modules` (an explicit
+        // `import "base/..."` reaches them): they are already covered by
+        // `baseModules`, with the primitive environment.
+        const allModules = [...baseModules, ...modules.filter(m => !baseSet.has(m))];
         for (const module of allModules) {
             const exported = this.inferModule(
                 module,
@@ -439,7 +472,7 @@ export class Inferencer {
                 reexportsByModule.get(module) ?? module.exports ?? [],
             );
             exportsByModule.set(module, exported);
-            if (module === prelude) {
+            if (module === prelude || baseSet.has(module)) {
                 this.preludeNames = new Set([...this.preludeNames, ...exported.keys()]);
                 this.preludeEnv = new Map([...this.preludeEnv, ...exported]);
             }
@@ -465,13 +498,21 @@ export class Inferencer {
         // prelude wholesale rather than extending it.
         this.overloads = new Map();
         this.moduleOwnNames = new Set();
-        const isNoPrelude = module.noPrelude === true;
-        if (!isNoPrelude) {
-            this.env = new Map(this.preludeEnv);
+        // A BASE module starts from the PRIMITIVE core and nothing else. Every
+        // OTHER module starts from the Prelude's exports (primitive core plus
+        // the base library's public surface), which is the auto-import — so
+        // `sql_func` never reaches user code while `table` does. A `# no
+        // prelude` module starts empty and gets only what it imports.
+        const isBase = this.isBaseModule?.(module) === true;
+        if (isBase) {
+            this.env = new Map(this.primitiveEnv);
             this.modules = new Map([...this.preludeNamespaces].map(([alias, ns]) => [alias, new Map(ns)]));
-        } else {
+        } else if (module.noPrelude === true) {
             this.env = new Map();
             this.modules = new Map();
+        } else {
+            this.env = new Map(this.preludeEnv);
+            this.modules = new Map([...this.preludeNamespaces].map(([alias, ns]) => [alias, new Map(ns)]));
         }
         const imported = resolveImportScope(module, imports, exportsByModule);
         for (const d of imported.diagnostics) this.diag(d.node, d.message);
@@ -961,18 +1002,24 @@ export class Inferencer {
                 if (item === null) {
                     item = t;
                 } else {
-                    // Check compatibility WITHOUT binding the first element's
-                    // type: heterogeneous lists are tolerated here (is_in and
-                    // the list-argument builtins check elements themselves),
-                    // but unification must not pin column variables to a later
+                    // Compatibility check that BINDS NOTHING on either side: a
+                    // heterogeneous list is tolerated here (isIn and the
+                    // list-argument builtins check elements themselves), and
+                    // the check must not pin a column variable to a later
                     // element's type — `[u.balance, 2]` must not pin balance
-                    // to int. Skolemizing makes the check read-only.
+                    // to int, and `[asc u.name, desc u.age]` must not pin one
+                    // column to the other's type. Skolemizing the accumulated
+                    // item AND rolling the attempt back keeps the check
+                    // read-only while still letting two references to the SAME
+                    // field (`[u.name, u.name]`) verify as compatible.
                     const sk = this.u.skolemize(item);
+                    const snapshot = this.u.snapshotForTrial();
                     try {
                         this.u.unify(item, t);
                     } catch {
                         /* heterogeneous lists are checked downstream (§11) */
                     } finally {
+                        this.u.restoreTrial(snapshot);
                         sk.restore();
                     }
                 }
@@ -1325,7 +1372,7 @@ export class Inferencer {
      * literals an integer literal now unifies as a variable with a `maybe`
      * column, which would otherwise silently allow `r.id + 1` on a nullable
      * LEFT-JOIN side and render `b.id + 1` (NULL arithmetic). Explicitly
-     * guard so nullable columns must be unwrapped (from_maybe / coalesce).
+     * guard so nullable columns must be unwrapped (fromMaybe / coalesce).
      */
     private rejectModeOperand(
         node: AstNode,
@@ -1339,11 +1386,11 @@ export class Inferencer {
         const ka = kind(lt);
         const kb = kind(rt);
         if (ka === 'maybe' || kb === 'maybe') {
-            this.diag(node, `'${op}' requires non-null numeric operands — use from_maybe or coalesce to unwrap, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+            this.diag(node, `'${op}' requires non-null numeric operands — use fromMaybe or coalesce to unwrap, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
             return true;
         }
         // Pipeline modes are not plain scalars and must not be silently
-        // absorbed by a numeric literal variable (`row_number + 1`). The mode
+        // absorbed by a numeric literal variable (`rowNumber + 1`). The mode
         // belongs to the operand's SYNTAX (its head builtin), not its type, so
         // it is read from the operand expressions.
         const modeOperand = (n: AstNode | undefined): boolean => this.entryModeOf(n) !== null;
@@ -1364,7 +1411,7 @@ export class Inferencer {
     ): Type {
         if (op === '==' || op === '!=' || op === '<' || op === '<=' || op === '>' || op === '>=') {
             // Aggregates/window values cannot be compared as plain scalars; a
-            // polymorphic literal would otherwise absorb the mode (`row_number
+            // polymorphic literal would otherwise absorb the mode (`rowNumber
             // == 1`, `sum t == 1`). Nullable `maybe` is handled below (== null).
             // The mode comes from the operand's syntax, like the arithmetic
             // guard above.
@@ -1384,7 +1431,7 @@ export class Inferencer {
                     const rl = this.u.peel(lt);
                     const rr = this.u.peel(rt);
                     if (rl.kind === 'maybe' || rr.kind === 'maybe') {
-                        this.diag(node, `comparison expects non-null values — use is_null/is_not_null or from_maybe, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
+                        this.diag(node, `comparison expects non-null values — use isNull/isNotNull or fromMaybe, got ${this.u.pretty(lt)} and ${this.u.pretty(rt)}`);
                         return prim('bool');
                     }
                 }
@@ -1650,8 +1697,8 @@ export class Inferencer {
             return this.inferJoin(e, env, funcName, JOIN_BUILTINS[funcName]);
         }
         if (funcName === 'scalar' && e.arguments.length === 1) return this.inferScalar(e, env);
-        if ((funcName === 'in_query' || funcName === 'not_in_query') && e.arguments.length === 2) return this.inferInQuery(e, env);
-        if ((funcName === 'is_true' || funcName === 'is_false' || funcName === 'is_unknown') && e.arguments.length === 1) {
+        if ((funcName === 'inQuery' || funcName === 'notInQuery') && e.arguments.length === 2) return this.inferInQuery(e, env);
+        if ((funcName === 'isTrue' || funcName === 'isFalse' || funcName === 'isUnknown') && e.arguments.length === 1) {
             return this.inferTruthPredicate(e, env, funcName);
         }
         if (funcName === 'fold' && e.arguments.length === 1) return this.inferFold(e, env);
@@ -1704,6 +1751,10 @@ export class Inferencer {
         }
         if (funcName === 'over') return this.inferOver(e, env);
         if (funcName === 'cast' && e.arguments.length === 2) return this.inferCast(e, env, funcName);
+        // `tryCast` types exactly like `cast` — the result IS the target
+        // type; only the failure behaviour differs, and its nullability is
+        // not expressible in the annotation, so the target type stands.
+        if (funcName === 'tryCast' && e.arguments.length === 2) return this.inferCast(e, env, funcName);
         if (funcName === 'mempty') return this.inferMempty(e, env);
         let f = this.u.peel(rawF);
         const argTypes: Type[] = [];
@@ -1800,7 +1851,7 @@ export class Inferencer {
             if (funcName) this.postCheckArg(funcName, i, argExpr, argType, e);
             f = result;
         }
-        if (funcName === 'is_in' || funcName === 'is_not_in') {
+        if (funcName === 'isIn' || funcName === 'isNotIn') {
             this.checkInList(e, env, argTypes);
         }
         if (funcName && LIST_BUILTINS.has(funcName) && e.arguments.length > 0) {
@@ -2141,7 +2192,7 @@ export class Inferencer {
     /**
      * `over fn { partition = [...], order = [...] }` — the wrapped value
      * must be in aggregate mode or window-only mode. The result is the
-     * wrapped payload type, so `over (row_number) {...} : int`.
+     * wrapped payload type, so `over (rowNumber) {...} : int`.
      */
     private inferOver(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
         if (e.arguments.length === 0) return this.inferExpr(e.func, env);
@@ -2163,8 +2214,8 @@ export class Inferencer {
         return first;
     }
 
-    /** `cast x "int"` — the result type is the target. */
-    private inferCast(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, name: 'cast'): Type {
+    /** `cast x "int"` / `tryCast x "int"` — the result type is the target. */
+    private inferCast(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, name: 'cast' | 'tryCast'): Type {
         this.inferArg(e.arguments[0]!, env);
         const targetExpr = e.arguments[1]!;
         if (isStringLiteral(targetExpr)) {
@@ -2328,13 +2379,13 @@ export class Inferencer {
         //
         // A still-open variable must be BOUND, not merely accepted: when the
         // argument's type is not yet known (the row-polymorphic lambda in
-        // `filter (u => is_unknown u.id)`, or `f = is_true` before its argument
+        // `filter (u => isUnknown u.id)`, or `f = isTrue` before its argument
         // settles) the old marker propagated `bool?` into the enclosing
         // expression, and that propagation is what later produced the error at
         // the application site. Binding reproduces it: the variable resolves to
         // `bool?`, so a row field annotated `int` no longer matches.
         const r = this.u.peel(argType);
-        // An unresolved argument (`filter (u => is_unknown u.id)` sees `u.id` as
+        // An unresolved argument (`filter (u => isUnknown u.id)` sees `u.id` as
         // a row-field variable) is left alone: the column is deliberately kept
         // at its declared type. The old `truth` marker unified itself INTO that
         // variable, which is what leaked `bool?` into the enclosing row and
@@ -2358,27 +2409,27 @@ export class Inferencer {
         return false;
     }
 
-    /** `in_query x q` / `not_in_query x q` — IN (SELECT ...). */
+    /** `inQuery x q` / `notInQuery x q` — IN (SELECT ...). */
     private inferInQuery(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
         const valueT = this.inferArg(e.arguments[0]!, env);
         const queryT = this.inferArg(e.arguments[1]!, env);
         const r = this.u.peel(queryT);
         if (r.kind !== 'query') {
-            this.diag(e, `${e.func && isApplication(e.func) && e.func.arguments.length === 0 && isIdentifier(e.func.func) ? e.func.func.name : 'in_query'} expects a query as its second argument, got type ${this.u.pretty(queryT)}`);
+            this.diag(e, `${e.func && isApplication(e.func) && e.func.arguments.length === 0 && isIdentifier(e.func.func) ? e.func.func.name : 'inQuery'} expects a query as its second argument, got type ${this.u.pretty(queryT)}`);
             return this.u.fresh();
         }
         const row = this.u.peel(r.row);
         if (row.kind !== 'row') return prim('bool'); // interpreter reports the shape
         const fields = [...this.u.resolveRow(row).fields];
         if (fields.length !== 1) {
-            this.diag(e, `in_query subquery must return exactly one column, got ${fields.length}`);
+            this.diag(e, `inQuery subquery must return exactly one column, got ${fields.length}`);
             return prim('bool');
         }
         try {
             this.u.unify(valueT, fields[0]![1]);
         } catch (err) {
             if (err instanceof UnifyError) {
-                this.diag(e, `in_query requires matching types, got ${this.u.pretty(valueT)} and ${this.u.pretty(fields[0]![1])}`);
+                this.diag(e, `inQuery requires matching types, got ${this.u.pretty(valueT)} and ${this.u.pretty(fields[0]![1])}`);
             } else {
                 throw err;
             }
@@ -2711,7 +2762,7 @@ export class Inferencer {
      * The SQL mode of a projection entry, recovered from its SYNTAX.
      *
      * An entry is an aggregate / group key / window function because of the
-     * builtin it applies — `count u.id`, `group u.id`, `row_number` — so the
+     * builtin it applies — `count u.id`, `group u.id`, `rowNumber` — so the
      * mode is a lookup on the head name (following aliases, so `lead` matches
      * its `lag` target), not a tag carried in the entry's field type. A
      * non-builtin expression (a literal, a plain column, an arithmetic
@@ -2719,7 +2770,7 @@ export class Inferencer {
      */
     private entryModeOf(node: AstNode | undefined): SqlMode | null {
         let e = node as Expr | undefined;
-        // `row_number` (a nullary builtin) is a bare Identifier wrapped in a
+        // `rowNumber` (a nullary builtin) is a bare Identifier wrapped in a
         // zero-argument Application; `sum u.x` is an Application with a func.
         // Unwrap the wrappers and read the head identifier either way.
         while (e && isApplication(e) && e.arguments.length === 0) e = e.func as Expr;
@@ -2799,7 +2850,7 @@ export class Inferencer {
     }
 
     /**
-     * Set operations (`union`/`intersect`/`except`/`union_all`) match columns
+     * Set operations (`union`/`intersect`/`except`/`unionAll`) match columns
      * POSITIONALLY in SQL, while tetaue rows are unordered records — so the
      * renderer projects an explicit shared column order and rejects operands
      * whose schema is not fully known. Report that here, at the set call,
@@ -3104,7 +3155,7 @@ export class Inferencer {
                 else this.diag(node, `${name} takes exactly three arguments: the right query, the 'on' function, and the merger function`);
                 break;
             case 'over':
-                this.diag(node, `over expects a window function (row_number, rank, sum, lag, ...), got ${p(argType)}`);
+                this.diag(node, `over expects a window function (rowNumber, rank, sum, lag, ...), got ${p(argType)}`);
                 break;
             case 'take':
                 this.diag(node, `take expects a non-negative integer literal`);
@@ -3187,17 +3238,17 @@ export class Inferencer {
             }
             return;
         }
-        if (name === 'date_add' && index === 2) {
+        if (name === 'dateAdd' && index === 2) {
             if (r.kind === 'prim' && !isNumericPrim(r)) {
-                this.diag(node, `date_add expects a numeric amount, got type ${this.u.pretty(argType)}`);
+                this.diag(node, `dateAdd expects a numeric amount, got type ${this.u.pretty(argType)}`);
             }
             return;
         }
-        if (name === 'date_diff' && index === 2) {
+        if (name === 'dateDiff' && index === 2) {
             // Same as index 0: the DateTime constraint handles prims; only
             // numeric literals need the explicit rejection here.
             if (isNumericLiteralVar(r)) {
-                this.diag(node, `date_diff expects a date or timestamp expression, got type ${this.u.pretty(argType)}`);
+                this.diag(node, `dateDiff expects a date or timestamp expression, got type ${this.u.pretty(argType)}`);
             }
             return;
         }
@@ -3213,7 +3264,7 @@ export class Inferencer {
             }
             return;
         }
-        if ((name === 'sum_where' || name === 'avg_where') && index === 1) {
+        if ((name === 'sumWhere' || name === 'avgWhere') && index === 1) {
             if (r.kind === 'prim' && !isNumericPrim(r)) {
                 this.diag(node, `${name} expects a numeric expression, got type ${this.u.pretty(argType)}`);
             }
@@ -3296,7 +3347,7 @@ export class Inferencer {
         return false;
     }
 
-    /** is_in's second argument must be a list of the first argument's type. */
+    /** isIn's second argument must be a list of the first argument's type. */
     private checkInList(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, argTypes: Type[]): void {
         if (e.arguments.length < 2) return;
         const first = argTypes[0];
@@ -3308,7 +3359,7 @@ export class Inferencer {
                 this.u.unify(first, itemType);
             } catch (err) {
                 if (err instanceof UnifyError) {
-                    this.diag(item, `is_in list items must match type ${this.u.pretty(first)}, got ${this.u.pretty(itemType)}`);
+                    this.diag(item, `isIn list items must match type ${this.u.pretty(first)}, got ${this.u.pretty(itemType)}`);
                 } else {
                     throw err;
                 }

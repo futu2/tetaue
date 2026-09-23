@@ -17,7 +17,15 @@ export { createImportResolver, resolveImport } from './resolve.js';
 export type { ResolvedImport } from './resolve.js';
 export { checkProject } from './checker.js';
 export type { CheckProjectOptions, CheckProjectResult } from './checker.js';
-export { standardPrelude, standardPreludeNames, STANDARD_PRELUDE_SOURCE } from './prelude.js';
+export {
+    standardPrelude,
+    standardPreludeNames,
+    baseLibraryModules,
+    baseModuleSource,
+    isBaseUri,
+    BASE_PREFIX,
+    PRELUDE_URI,
+} from './prelude.js';
 export { BINARY_OPERATORS, isBinaryOperator, sectionName, sectionSpelling } from './operators.js';
 export type { BinaryOperator } from './operators.js';
 export { renderQuery, renderQueryWithCtes, DIALECTS, isDialect } from './render.js';

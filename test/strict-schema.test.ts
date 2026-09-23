@@ -112,11 +112,11 @@ main = users & map (u => { id = u.id, v = scalar (table "other" & map (o => { y 
     });
 
     test('a nested subquery over a dynamic table is already rejected by arity, not strict mode', () => {
-        // `scalar`/`in_query` need exactly one column; a dynamic table offers
+        // `scalar`/`inQuery` need exactly one column; a dynamic table offers
         // none, so the arity check fires first and strict mode never sees it.
         expect(messagesOf(`# strict
 users: query { id: int } = table "users"
-main = users & filter (u => in_query u.id (table "other"))`).join('\n'))
+main = users & filter (u => inQuery u.id (table "other"))`).join('\n'))
             .toContain('must return exactly one column');
     });
 
