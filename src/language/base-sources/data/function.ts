@@ -1,0 +1,23 @@
+/******************************************************************************
+ * GENERATED — do not edit. Run `bun run base:generate` instead.
+ * The files under `base/` are the source of truth.
+ ******************************************************************************/
+/** `base/data/function.tetaue` */
+export const DATA_FUNCTION = `# Data.Function — the combinators that need no SQL at all.
+#
+# These are ordinary lambdas: the pure layer of the base library. Keeping
+# them in their own module is what lets the Prelude stay a thin aggregator
+# and lets a program import the whole Prelude without pulling in SQL.
+
+export id = x => x
+export const = x => y => x
+export flip = f => x => y => f y x
+
+# Composition (Control.Semigroupoid, PureScript-style): \`<<<\` is
+# right-to-left like Haskell \`.\`, \`>>>\` is its flip.
+export compose = f => g => x => g (f x)
+export composeBack = f => g => x => f (g x)
+
+# Point-free application, so \`f $ x\` reads like Haskell's \`$\`.
+export apply = f => x => f x
+`;

@@ -1,177 +1,22 @@
 /******************************************************************************
  * tetaue SQL renderer — normalizes a Query value, then lowers it to SQL.
  *
- * Dialects are capability-driven (like teta's backend): identifier quoting,
- * boolean literals and function-name mappings are resolved at render time.
+ * Dialect definitions live in `render/dialects.ts`; this file owns expression,
+ * query-plan, and final SQL rendering.
  ******************************************************************************/
 import { querySchema } from '../core/ir.js';
 import type { JoinKind, Query, SetOp, SqlNode } from '../core/ir.js';
-import {
-    BUILTIN_ALIASES, BUILTIN_SPECS,
-    type BuiltinName, type BuiltinSpec, type LowerCtx, type Lowering,
-} from './builtin.js';
 import { optimizeQuery } from './optimize.js';
 import { checkDialectCapabilities } from './capabilities.js';
+import { DIALECTS, isDialect, quoteQualifiedName, type DialectSpec, type RenderFormat } from './render/dialects.js';
+import { defaultSqlName, loweringFor } from './render/lowerings.js';
 
-export interface DialectSpec {
-    name: string;
-    /**
-     * Quote an identifier ONLY when required: it is not a plain word
-     * (`[A-Za-z_][A-Za-z0-9_]*`) or it collides with a reserved keyword.
-     * `users`, `id`, `name` render bare; `order`, `user`, `weird name` are quoted.
-     */
-    quoteIdentifier: (name: string) => string;
-    boolLiteral: (b: boolean) => string;
-    /** Render a string literal (dialects differ in backslash handling). */
-    stringLiteral: (value: string) => string;
-    /** canonical builtin name → SQL function name */
-    functions: Partial<Record<BuiltinName, string>>;
-    /** Join kinds the dialect can render natively (default: all four). */
-    joinKinds?: readonly JoinKind[];
-    /** Set operations the dialect can render natively (default: all four). */
-    setOps?: readonly SetOp[];
-    /**
-     * How to render OFFSET without LIMIT: 'standard' (OFFSET n alone),
-     * 'mysql' (enormous LIMIT), 'sqlite' (LIMIT -1 OFFSET n), or
-     * 'none' (no native OFFSET support — Hive).
-     */
-    offset?: 'standard' | 'mysql' | 'sqlite' | 'none';
-    /** WITH RECURSIVE support (default: true; Hive does not support it). */
-    recursive?: boolean;
-    /** LATERAL derived-table support (default: true; SQLite/Trino/Hive lack the standard form). */
-    lateral?: boolean;
-}
-
-/**
- * Reserved keywords that need quoting when used as identifiers — a
- * conservative union across the supported dialects. Over-quoting is always
- * valid SQL; under-quoting produces broken statements, so err on the side of
- * quoting anything reserved in ANY dialect. Matched case-insensitively.
- */
-const RESERVED_KEYWORDS = new Set([
-    'add', 'all', 'alter', 'and', 'any', 'as', 'asc', 'between', 'by', 'case',
-    'check', 'collate', 'column', 'constraint', 'create', 'cross', 'current',
-    'database', 'date', 'default', 'delete', 'desc', 'distinct', 'drop', 'else',
-    'end', 'except', 'exists', 'false', 'fetch', 'for', 'foreign', 'from', 'full',
-    'grant', 'group', 'having', 'in', 'index', 'inner', 'insert', 'intersect',
-    'interval', 'into', 'is', 'join', 'key', 'lateral', 'left', 'like', 'limit',
-    'natural', 'not', 'null', 'offset', 'on', 'or', 'order', 'outer', 'over',
-    'partition', 'primary', 'references', 'revoke', 'right', 'row', 'rows',
-    'select', 'set', 'table', 'then', 'time', 'to', 'true', 'union', 'unique',
-    'update', 'user', 'using', 'value', 'values', 'view', 'when', 'where',
-    'window', 'with', 'year',
-]);
-
-const SIMPLE_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/** Quote `name` with `quote` only when it is not a plain word or is reserved. */
-function quoteOnlyIfNeeded(name: string, quote: (n: string) => string): string {
-    return SIMPLE_IDENT.test(name) && !RESERVED_KEYWORDS.has(name.toLowerCase()) ? name : quote(name);
-}
-
-/**
- * Quote a possibly schema-qualified name (`public.orders`,
- * `catalog.schema.table`) by quoting each dot-separated part separately,
- * e.g. `"public"."orders"`. Quoting the whole string (`"public.orders"`)
- * would name a single identifier containing a dot — not a qualified table.
- * A plain single-part name is passed through `quoteIdentifier` unchanged.
- */
-function quoteQualifiedName(name: string, dialect: DialectSpec): string {
-    return name.split('.').map(part => dialect.quoteIdentifier(part)).join('.');
-}
-
-function quoteDoubleQuoted(value: string): string {
-    return `"${value.replace(/"/g, '""')}"`;
-}
-
-function quoteBacktickQuoted(value: string): string {
-    return `\`${value.replace(/`/g, '``')}\``;
-}
-
-function quoteSingleQuoted(value: string): string {
-    return `'${value.replace(/'/g, "''")}'`;
-}
-
-function quoteMysql(value: string): string {
-    // MySQL treats backslash as an escape character inside string literals.
-    return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
-}
-
-export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
-    sqlite: {
-        name: 'sqlite',
-        offset: 'sqlite',
-        lateral: false,
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
-        boolLiteral: b => (b ? '1' : '0'),
-        stringLiteral: quoteSingleQuoted,
-        functions: {
-            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            array: 'JSON_GROUP_ARRAY', // sqlite has no array type — a JSON array is the closest list
-        },
-    },
-    postgresql: {
-        name: 'postgresql',
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
-        boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
-        stringLiteral: quoteSingleQuoted,
-        functions: {
-            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            array: 'ARRAY_AGG',
-        },
-    },
-    mysql: {
-        name: 'mysql',
-        // MySQL has no FULL OUTER JOIN; users must emulate it (union of
-        // left join and anti-join) in the source language.
-        joinKinds: ['inner', 'left', 'right'],
-        offset: 'mysql',
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteBacktickQuoted),
-        boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
-        stringLiteral: quoteMysql,
-        functions: {
-            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            array: 'JSON_ARRAYAGG',
-        },
-    },
-    trino: {
-        name: 'trino',
-        lateral: false,
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteDoubleQuoted),
-        boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
-        stringLiteral: quoteSingleQuoted,
-        functions: {
-            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            array: 'ARRAY_AGG',
-        },
-    },
-    hive: {
-        name: 'hive',
-        offset: 'none',
-        recursive: false,
-        lateral: false,
-        // Hive supports UNION [ALL], but not INTERSECT/EXCEPT.
-        setOps: ['UNION', 'UNION ALL'],
-        quoteIdentifier: name => quoteOnlyIfNeeded(name, quoteBacktickQuoted),
-        boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
-        stringLiteral: quoteMysql,
-        functions: {
-            count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
-            array: 'COLLECT_LIST',
-        },
-    },
-};
-
-export type RenderFormat = 'pretty' | 'compact';
-
-export function isDialect(name: string): name is keyof typeof DIALECTS {
-    return name in DIALECTS;
-}
+export { DIALECTS, isDialect } from './render/dialects.js';
+export type { DialectSpec, RenderFormat } from './render/dialects.js';
 
 const JOIN_SQL: Record<JoinKind, string> = {
     inner: 'INNER JOIN', left: 'LEFT JOIN', right: 'RIGHT JOIN', full: 'FULL JOIN',
 };
-
 /** Indent width for the pretty layout (pg_format-style 4 spaces). */
 const INDENT = '    ';
 
@@ -502,105 +347,8 @@ export function renderExpr(node: SqlNode, ctx: RenderCtx, parentPrec = 0): strin
     }
 }
 
-// --- date & time lowering --------------------------------------------------
-// The general SQL date/time function set (teta's spec §4): every function has
-// one tetaue name and a per-dialect lowering — direct, mapped, or fallback.
-// Formats (`dateFormat`/`dateParse`) are dialect-native: pass the format
-// string the target database expects (e.g. Trino/MySQL `%Y-%m-%d`,
-// PostgreSQL `YYYY-MM-DD`, Hive `yyyy-MM-dd`).
-// ---------------------------------------------------------------------------
-
-/** Canonical builtin names that lower to dialect-specific date/time SQL. */
-
-const DATE_UNIT_SQL: Record<string, string> = {
-    year: 'YEAR', month: 'MONTH', week: 'WEEK', day: 'DAY',
-    hour: 'HOUR', minute: 'MINUTE', second: 'SECOND',
-};
-
-/** Fixed duration used by dialects whose date-diff primitive is day-based. */
-function unitSeconds(unit: string): number {
-    return {
-        year: 365 * 24 * 60 * 60,
-        month: 30 * 24 * 60 * 60,
-        week: 7 * 24 * 60 * 60,
-        day: 24 * 60 * 60,
-        hour: 60 * 60,
-        minute: 60,
-        second: 1,
-    }[unit] ?? 86400;
-}
-
-/**
- * Dialect-specific render for a `call` node, or `null` to fall through to the
- * plain `NAME(args)` renderer. Covers the general SQL function set (teta's
- * spec): date/time functions plus the scalar functions whose lowering is not a
- * plain same-name call (sqlite fallbacks, binary forms and casts).
- */
-/**
- * Special SQL lowerings, keyed by name AS IT APPEARS IN THE IR. Derived from
- * the builtin registry instead of a hand-kept set, so "is this a special
- * call?" and "how does it lower?" can no longer drift apart.
- *
- * Aliases are registered under their OWN spelling: the evaluator resolves
- * aliases for argument-index purposes but keeps the written name in the call
- * node (`rpad` stays `rpad`), so an alias of a special builtin must be
- * reachable by name — and its lowering must read `ctx.name` when the two
- * differ in meaning (lpad/rpad, greatest/least).
- */
-const LOWERINGS: ReadonlyMap<string, Lowering> = (() => {
-    const map = new Map<string, Lowering>();
-    // `BUILTIN_SPECS` is `as const` (so `BuiltinName` stays a precise union),
-    // which hides the OPTIONAL `lower` on entries that omit it. Widen to the
-    // declared interface for this read; the declaration is still checked.
-    const specs: readonly BuiltinSpec[] = BUILTIN_SPECS;
-    for (const spec of specs) {
-        if (spec.lower) map.set(spec.name, spec.lower);
-    }
-    for (const [alias, target] of Object.entries(BUILTIN_ALIASES)) {
-        const lower = map.get(target);
-        if (lower) map.set(alias, lower);
-    }
-    return map;
-})();
-
-/**
- * The SQL word for a builtin whose tetaue name is not the SQL name in upper
- * case (`rowNumber` -> `ROW_NUMBER`, `currentDate` -> `CURRENT_DATE`,
- * `isNull` -> `IS NULL`), derived from the specs' `sqlName`.
- *
- * Names absent from the map fall back to `name.toUpperCase()`, which is
- * correct for the SQL-identical builtins (`sum`, `count`, `rank`) — and for
- * any name that is not a builtin at all (the `sql_func "UPPER" [...]` escape
- * hatch, whose written name IS the SQL word).
- *
- * Aliases are registered under their own spelling for the same reason as
- * `LOWERINGS`: the evaluator keeps the WRITTEN name in the call node.
- */
-const SQL_NAMES: ReadonlyMap<string, string> = (() => {
-    const map = new Map<string, string>();
-    const specs: readonly BuiltinSpec[] = BUILTIN_SPECS;
-    for (const spec of specs) {
-        if (spec.sqlName) map.set(spec.name, spec.sqlName);
-    }
-    for (const [alias, target] of Object.entries(BUILTIN_ALIASES)) {
-        const sqlName = map.get(target);
-        if (sqlName) map.set(alias, sqlName);
-    }
-    return map;
-})();
-
-/** The SQL word for a call/flip `name`, or null when the upper-cased name is it. */
-function sqlNameOf(name: string): string | null {
-    return SQL_NAMES.get(name) ?? null;
-}
-
-/** The default `NAME(args)` function word for a tetaue builtin name. */
-function defaultSqlName(name: string, dialect: DialectSpec): string {
-    return dialect.functions[name as BuiltinName] ?? sqlNameOf(name) ?? name.toUpperCase();
-}
-
 function renderCall(node: Extract<SqlNode, { kind: 'call' }>, ctx: RenderCtx): string | null {
-    const lower = LOWERINGS.get(node.name);
+    const lower = loweringFor(node.name);
     if (!lower) return null; // no special form: the default NAME(...) path
 
     const d = ctx.dialect;

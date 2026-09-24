@@ -1,0 +1,76 @@
+/******************************************************************************
+ * GENERATED — do not edit. Run `bun run base:generate` instead.
+ * The files under `base/` are the source of truth.
+ ******************************************************************************/
+/** `base/prelude.tetaue` */
+export const PRELUDE = `# The tetaue Prelude — auto-imported into every module that does not opt out
+# with \`# no prelude\`.
+#
+# Like Haskell's \`Prelude\`, this module is a thin AGGREGATOR: the definitions
+# live in ordinary base modules, and the Prelude re-exports the ones every
+# program is expected to have in scope unqualified. Nothing is defined here
+# beyond the handful of names that have no natural home elsewhere.
+#
+# The module is ordinary tetaue. It is parsed, inferred, and evaluated by the
+# same pass as user code, so a local binding or an explicit import can shadow
+# any of its names normally.
+#
+# NOTE: base modules are the only modules that see the primitive core
+# unqualified. A user module reaches these names through this Prelude (or an
+# explicit \`import "base/..."\`), never from a hidden global environment.
+
+# A re-export adds names to THIS module's PUBLIC SURFACE but does not bind
+# them locally, so the operator definitions below need a real import as well:
+# \`import ... as sql\` gives the Prelude its own access to the same module.
+import "./sql.tetaue" as sql
+import "./sql.tetaue"
+import "./sql/time.tetaue" as time
+import "./data/function.tetaue" as fn
+
+export * from "./data/function.tetaue"
+export * from "./data/maybe.tetaue"
+export * from "./sql.tetaue"
+export * from "./sql/time.tetaue"
+
+# ---------------------------------------------------------------------------
+# Operators
+#
+# Infix PARSING and PRECEDENCE live in the grammar; the MEANING of an infix
+# symbol is an ordinary curried binding named by surrounding it with
+# underscores. Both \`1 + 2\` and \`_+_ 1 2\` resolve \`_+_\` from the current
+# scope, so a local or imported operator binding overrides the default
+# without touching the grammar or the evaluator.
+#
+# SQL-aware operators alias the library-internal primitives; pure operators
+# are ordinary lambdas.
+# ---------------------------------------------------------------------------
+
+export _*_ = sql.sql_multiply
+export _/_ = sql.sql_divide
+export _+_ = sql.sql_add
+export _-_ = sql.sql_subtract
+export _<>_: string -> string -> string = x => y => concat [x, y]
+export _<>_ = sql.sql_merge
+export _==_ = sql.sql_equal
+export _!=_ = sql.sql_not_equal
+export _<_ = sql.sql_less_than
+export _<=_ = sql.sql_less_than_or_equal
+export _>_ = sql.sql_greater_than
+export _>=_ = sql.sql_greater_than_or_equal
+export _&&_ = sql.sql_and
+export _||_ = sql.sql_or
+
+export _>>>_ = fn.compose
+export _<<<_ = fn.composeBack
+export _?_ = x => d => fromMaybe d x
+export _&_ = x => f => f x
+export _$_ = fn.apply
+export _<$>_ = fmap
+export _<$_ = replaceWith
+export _<*>_ = ap
+export _<*_ = applyLeft
+export _*>_ = applyRight
+export _<|>_ = orElse
+export _>>=_ = bind
+export _>>_ = then
+`;

@@ -11,6 +11,9 @@
  * `lsp` command starts the same server on the requested transport.
  ******************************************************************************/
 import { readFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { URI } from 'langium';
 import { NodeFileSystem } from 'langium/node';
 import { startLanguageServer } from 'langium/lsp';
@@ -111,9 +114,41 @@ export function startTetaueServer(): void {
         return { ok: false, message };
     });
 
+    setTimeout(() => {
+        void tetaue.parser.LangiumParser;
+    }, 25);
     startLanguageServer(shared);
 }
 
-if (import.meta.main) {
-    startTetaueServer();
+function startWithBunRuntime(): boolean {
+    const versions = process.versions as Record<string, string | undefined>;
+    if (versions.bun !== undefined || process.env.TETAUE_LSP_BUN === '1') {
+        return false;
+    }
+    const bun = process.env.TETAUE_BUN ?? 'bun';
+    const probe = spawnSync(bun, ['--version'], { stdio: 'ignore' });
+    if (probe.error || probe.status !== 0) {
+        return false;
+    }
+    const child = spawn(bun, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+        env: { ...process.env, TETAUE_LSP_BUN: '1' },
+        stdio: 'inherit',
+    });
+    child.once('error', error => {
+        console.error(`could not start Bun language server: ${error.message}`);
+        process.exitCode = 1;
+    });
+    child.once('exit', (code, signal) => {
+        process.exitCode = signal === null ? code ?? 1 : 1;
+    });
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+        process.once(signal, () => child.kill(signal));
+    }
+    return true;
+}
+
+if (process.argv[1] && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1])) {
+    if (!startWithBunRuntime()) {
+        startTetaueServer();
+    }
 }

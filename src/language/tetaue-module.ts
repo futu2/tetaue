@@ -18,13 +18,16 @@
 import {
     Cancellation, inject, DefaultDocumentBuilder, DefaultValueConverter, DefaultWorkspaceManager, GrammarAST,
     isOperationCancelled,
-    type CstNode, type LangiumDocument, type LangiumSharedCoreServices, type URI, type ValueType, type WorkspaceLock,
+    URI, type CstNode, type LangiumDocument, type LangiumSharedCoreServices, type ValueType, type WorkspaceLock,
 } from 'langium';
 import {
-    createDefaultModule, createDefaultSharedModule,
+    AllSemanticTokenModifiers, AllSemanticTokenTypes, createDefaultModule, createDefaultSharedModule,
+    DefaultLanguageServer,
+    DefaultDocumentUpdateHandler,
     type DefaultSharedModuleContext, type LangiumServices, type LangiumSharedServices,
 } from 'langium/lsp';
-import type { InitializedParams } from 'vscode-languageserver';
+import type { InitializeParams, InitializeResult, InitializedParams, TextDocumentChangeEvent } from 'vscode-languageserver';
+import { TextDocumentSyncKind } from 'vscode-languageserver-protocol';
 import { TetaueGeneratedModule, TetaueGeneratedSharedModule } from './generated/module.js';
 import { registerValidationChecks } from './tetaue-validator.js';
 import { TetaueHoverProvider } from './lsp/hover.js';
@@ -47,6 +50,55 @@ class TetaueWorkspaceManager extends DefaultWorkspaceManager {
         await this.mutex.write(() => {
             this._ready.resolve();
         });
+    }
+}
+
+class TetaueLanguageServer extends DefaultLanguageServer {
+    override async initialize(params: InitializeParams): Promise<InitializeResult> {
+        this.fireInitializeOnDefaultServices(params);
+        this.onInitializeEmitter.fire(params);
+        this.onInitializeEmitter.dispose();
+        return {
+            capabilities: {
+                workspace: {
+                    workspaceFolders: { supported: true },
+                },
+                textDocumentSync: {
+                    change: TextDocumentSyncKind.Incremental,
+                    openClose: true,
+                },
+                completionProvider: { triggerCharacters: ['.'] },
+                documentSymbolProvider: true,
+                definitionProvider: true,
+                documentFormattingProvider: true,
+                documentRangeFormattingProvider: true,
+                foldingRangeProvider: true,
+                hoverProvider: true,
+                renameProvider: { prepareProvider: true },
+                semanticTokensProvider: {
+                    legend: {
+                        tokenTypes: Object.keys(AllSemanticTokenTypes),
+                        tokenModifiers: Object.keys(AllSemanticTokenModifiers),
+                    },
+                    full: { delta: false },
+                    range: true,
+                },
+            },
+        };
+    }
+}
+
+class TetaueDocumentUpdateHandler extends DefaultDocumentUpdateHandler {
+    didOpenDocument(change: TextDocumentChangeEvent<{ uri: string }>): void {
+        this.fireDocumentUpdate([URI.parse(change.document.uri)], []);
+    }
+
+    didChangeContent(change: TextDocumentChangeEvent<{ uri: string }>): void {
+        this.fireDocumentUpdate([URI.parse(change.document.uri)], []);
+    }
+
+    didCloseDocument(change: TextDocumentChangeEvent<{ uri: string }>): void {
+        this.fireDocumentUpdate([], [URI.parse(change.document.uri)]);
     }
 }
 
@@ -189,6 +241,10 @@ const TetaueSharedModule = {
     workspace: {
         WorkspaceManager: (services: LangiumSharedServices) => new TetaueWorkspaceManager(services),
         DocumentBuilder: (services: LangiumSharedCoreServices) => new TetaueDocumentBuilder(services),
+    },
+    lsp: {
+        LanguageServer: (services: LangiumSharedServices) => new TetaueLanguageServer(services),
+        DocumentUpdateHandler: (services: LangiumSharedServices) => new TetaueDocumentUpdateHandler(services),
     },
 };
 

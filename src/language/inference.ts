@@ -703,7 +703,13 @@ export class Inferencer {
                 t = ann;
             }
         }
-        this.nodeTypes.set(b, t);
+        const aliasedBuiltin = this.directBuiltinName(bindingValue, this.env);
+        if (aliasedBuiltin && t.kind !== 'builtin') {
+            t = builtinOf(aliasedBuiltin, t);
+            this.nodeTypes.set(b, t);
+        } else {
+            this.nodeTypes.set(b, t);
+        }
         const envTypes = [...this.env.values()].map(s => s.type);
         const scheme = this.u.generalize(envTypes, t);
         // A second definition of the same name in one module is an OVERLOAD,
@@ -910,6 +916,17 @@ export class Inferencer {
 
     /** Point at the argument that fits no definition of an overloaded name. */
     private reportOverloadMismatch(use: PendingOverload, chosen: number): void {
+        if ((use.name === 'isTrue' || use.name === 'isFalse' || use.name === 'isUnknown')
+            && use.argTypes.length > 0) {
+            const actual = this.u.peel(use.argTypes[0]!);
+            const inner = actual.kind === 'maybe' ? this.u.peel(actual.of) : null;
+            const boolean = actual.kind === 'prim' && actual.name === 'bool'
+                || inner?.kind === 'prim' && inner.name === 'bool';
+            if (actual.kind !== 'var' && !boolean) {
+                this.diag(use.e, `${use.name} expects a boolean or nullable boolean expression, got type ${this.u.pretty(use.argTypes[0]!)}`);
+                return;
+            }
+        }
         if (use.name === 'coalesce' && use.argTypes.length >= 2) {
             const first = this.u.peel(use.argTypes[0]!);
             const second = this.u.peel(use.argTypes[1]!);
@@ -1457,6 +1474,7 @@ export class Inferencer {
         }
         const operatorSet = this.u.resolve(operator);
         if (operatorSet.kind === 'overload') {
+            if (op === '<>') return this.inferBinaryTypes(op, lt, rt, e, e.left, e.right);
             const result = this.u.fresh();
             this.deferredOverloads.push({
                 name: op,
@@ -1603,7 +1621,8 @@ export class Inferencer {
             const bareIdentifier = isIdentifier(unwrapZeroArg(leftNode));
             const concreteNonSemigroup = (t: Type): boolean => {
                 const peeled = this.u.peel(t);
-                return peeled.kind === 'prim' && peeled.name !== 'string';
+                return peeled.kind === 'prim' && peeled.name !== 'string'
+                    || peeled.kind === 'var' && this.u.isLiteral(peeled);
             };
             if ((bareIdentifier && concreteNonSemigroup(right))
                 || (isIdentifier(unwrapZeroArg(rightNode)) && concreteNonSemigroup(left))) {

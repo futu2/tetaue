@@ -141,7 +141,7 @@ describe('string functions', () => {
         const src = `${USERS}\nq = users & map (u => { l = lpad u.name 8 "0", r = rpad u.name 8 "0" })`;
         expect(render(src, 'trino')).toContain(`LPAD(name, 8, '0') AS l`);
         expect(render(src, 'trino')).toContain(`RPAD(name, 8, '0') AS r`);
-        expect(render(src, 'sqlite')).toContain("SUBSTR(REPLACE(PRINTF('%*s', 8, ''), ' ', '0'), 1, 8 - LENGTH(name)) || name AS l");
+        expect(render(src, 'sqlite')).toContain("ELSE SUBSTR(REPLACE(PRINTF('%*s', 8, ''), ' ', '0'), 1, 8 - LENGTH(name)) || name END AS l");
         expect(render(src, 'sqlite')).toContain("ELSE name || SUBSTR(REPLACE(PRINTF('%*s', 8, ''), ' ', '0'), 1, 8 - LENGTH(name)) END AS r");
     });
 

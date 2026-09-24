@@ -244,13 +244,27 @@ function foldableStringValue(v: Value): string | null {
     const direct = stringValue(v);
     if (direct !== null) return direct;
     const node = exprNode(v);
-    if (node?.kind !== 'call' || node.name !== 'concat') return null;
-    let out = '';
-    for (const arg of node.args) {
-        if (arg.kind !== 'lit' || typeof arg.value !== 'string') return null;
-        out += arg.value;
-    }
-    return out;
+    if (!node) return null;
+    const foldNode = (current: SqlNode): string | null => {
+        if (current.kind === 'lit' && typeof current.value === 'string') return current.value;
+        if (current.kind === 'fragment' && current.template === '{} || {}') {
+            const left = foldNode(current.args[0]!);
+            const right = foldNode(current.args[1]!);
+            return left === null || right === null ? null : left + right;
+        }
+        if (current.kind === 'call' && current.name === 'fromMaybe' && current.args.length === 2) {
+            return foldNode(current.args[0]!);
+        }
+        if (current.kind !== 'call' || current.name.toLowerCase() !== 'concat') return null;
+        let out = '';
+        for (const arg of current.args) {
+            const part = foldNode(arg);
+            if (part === null) return null;
+            out += part;
+        }
+        return out;
+    };
+    return foldNode(node);
 }
 
 /** Evaluate a list-of-strings argument (`pick ["id", "name"]`), or diagnose. */
@@ -1697,7 +1711,9 @@ function evalCaseHir(h: Extract<Hir, { kind: 'case' }>, ctx: Ctx): Value {
         // literal bool), so pick the branch NOW instead of emitting SQL.
         if (cond.kind === 'lit') {
             if (cond.value === true) {
-                return value;
+                if (branches.length === 0) return value;
+                elseValue = valueNode(b.at, value);
+                break;
             }
             continue; // false branch: skip it entirely
         }

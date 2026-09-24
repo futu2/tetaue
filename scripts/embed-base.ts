@@ -2,8 +2,9 @@
  * Embed the base library into TypeScript.
  *
  * The base library is ordinary tetaue living in `base/` — the single source
- * of truth. This script reads every `base/**\/*.tetaue` file and writes
- * `src/language/base-sources.ts`, a module of string constants.
+ * of truth. This script reads every `base/**\/*.tetaue` file and writes one
+ * string-constant module per source under `src/language/base-sources/`, plus
+ * an index at `src/language/base-sources.ts`.
  *
  * WHY EMBED AT ALL — `bun build --compile` produces a single-file executable
  * with no asset directory beside it, so the CLI, the LSP server, and the
@@ -16,12 +17,13 @@
  * a change to a `base/*.tetaue` file shows up as exactly the corresponding
  * string change.
  ******************************************************************************/
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 
 const ROOT = resolve(new URL('.', import.meta.url).pathname, '..');
 const BASE_DIR = join(ROOT, 'base');
-const OUT_FILE = join(ROOT, 'src/language/base-sources.ts');
+const OUT_DIR = join(ROOT, 'src/language/base-sources');
+const OUT_INDEX = join(ROOT, 'src/language/base-sources.ts');
 
 /**
  * Names are a HARD contract: a base module's path is lowercase (directories
@@ -69,24 +71,33 @@ const entries = modules.map(modulePath => {
     return { modulePath, name: constantName(modulePath), source };
 });
 
-const lines: string[] = [
+const generatedHeader = [
     '/******************************************************************************',
     ' * GENERATED — do not edit. Run `bun run base:generate` instead.',
-    ' *',
-    ' * The base library sources, embedded so the CLI, the LSP server, and the',
-    ' * standalone executables all carry the library without an asset directory.',
     ' * The files under `base/` are the source of truth.',
     ' ******************************************************************************/',
     '',
-];
+].join('\n');
 
+rmSync(OUT_DIR, { recursive: true, force: true });
+mkdirSync(OUT_DIR, { recursive: true });
 for (const { modulePath, name, source } of entries) {
-    lines.push(`/** \`base/${modulePath}\` */`);
-    lines.push(`export const ${name} = \`${literal(source)}\`;`);
-    lines.push('');
+    const output = join(OUT_DIR, modulePath.replace(/\.tetaue$/, '.ts'));
+    mkdirSync(dirname(output), { recursive: true });
+    writeFileSync(output, `${generatedHeader}/** \`base/${modulePath}\` */\nexport const ${name} = \`${literal(source)}\`;\n`);
 }
 
-lines.push('/** Every base module: canonical import path -> its source text. */');
+const lines: string[] = [
+    '/******************************************************************************',
+    ' * GENERATED — do not edit. Run `bun run base:generate` instead.',
+    ' * Embedded base-library sources, indexed by their accepted module paths.',
+    ' ******************************************************************************/',
+    '',
+];
+for (const { modulePath, name } of entries) {
+    lines.push(`import { ${name} } from './base-sources/${modulePath.replace(/\.tetaue$/, '.js')}';`);
+}
+lines.push('', '/** Every base module: canonical import path -> its source text. */');
 lines.push('export const BASE_MODULE_SOURCES: Readonly<Record<string, string>> = {');
 for (const { modulePath, name } of entries) {
     lines.push(`    ${JSON.stringify(modulePath)}: ${name},`);
@@ -98,5 +109,5 @@ lines.push('};');
 lines.push('');
 
 mkdirSync(join(ROOT, 'src/language'), { recursive: true });
-writeFileSync(OUT_FILE, lines.join('\n'));
-console.log(`base: embedded ${entries.length} module(s) into ${OUT_FILE}`);
+writeFileSync(OUT_INDEX, lines.join('\n'));
+console.log(`base: embedded ${entries.length} module(s) into ${OUT_DIR}`);

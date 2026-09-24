@@ -1,0 +1,18 @@
+/******************************************************************************
+ * GENERATED — do not edit. Run `bun run base:generate` instead.
+ * The files under `base/` are the source of truth.
+ ******************************************************************************/
+/** `base/data/maybe.tetaue` */
+export const DATA_MAYBE = `# Data.Maybe — helpers over SQL NULL.
+#
+# \`(maybe T)\` is the language's Maybe: a value that may be SQL NULL. These
+# are the derived predicates and eliminators the Prelude exposes unqualified
+# (\`isNothing\`, \`isJust\`, \`fromMaybe\`). The constructors and eliminator come
+# from the SQL surface; the derived predicates are ordinary base definitions.
+
+import "../sql.tetaue" as sql
+
+export isNothing: a -> bool = sql.isNull
+export isJust = sql.maybeIsJust
+export isNotNull: a -> bool = x => not ((sql.isNull) x)
+`;
