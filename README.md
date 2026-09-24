@@ -51,7 +51,7 @@ LIMIT 10
 ```sh
 bun install
 bun run build              # langium:generate + base:generate
-bun test                   # run the test suite
+bun test                    # run the test suite serially (memory-safe)
 bun run src/cli.ts render examples/report.tetaue --dialect sqlite
 ```
 
@@ -991,8 +991,8 @@ builds the typed SQL IR and returns exact-deduped diagnostics — so `check` and
 - user-declared type classes and instances (container operations are currently
   closed over maybe values, lists, and queries; numeric operations are
   per-type overloading, not a `Num` class)
-- richer `base/`: more of the scalar surface moved out of the
-  TypeScript core, and further `Data.*` modules
+- richer `base/`: further `Data.*` modules and more pure library combinators;
+  the scalar SQL surface already lives in `base/sql.tetaue`
 - query cardinality types for scalar and singleton subqueries
 - more pure optimizer rewrites: projection pruning and safe predicate
   pushdown (named intermediates already render as `WITH` CTEs, so subqueries

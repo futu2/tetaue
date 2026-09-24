@@ -3,8 +3,9 @@
 Status: **implemented** — the dialect is seeded as a first-class value, the
 prelude branches on it at analysis time, and the scalar family (`toUpper`/`toLower`/
 `length`/`trim`/`replace`/`mod`/`like`/`div`/`leftSubstring`/`rightSubstring`/
-`abs`/`ceil`/`floor`/`sqrt`/`pow`/`position`) has migrated out of the TS core
-into `base/sql.tetaue`.
+`abs`/`ceil`/`floor`/`sqrt`/`pow`/`position`/`concat`/`greatest`/`least`/
+`round`/`substring`/`lpad`/`rpad`/`coalesce`/`nullIf`/`isNull`/`isTrue`/
+`isFalse`/`isUnknown`) has migrated out of the TS core into `base/sql.tetaue`.
 
 Goal: make per-dialect SQL lowering a property of a **first-class `sql_dialect`
 value** that `base/sql.tetaue` can read, instead of a large bespoke dispatch
@@ -59,6 +60,12 @@ not leak" direction), while dialect differences stay a *library* concern.
   }
   ```
   The renderer's `SPECIAL_CALLS` entry and `case 'position'` are gone.
+- `concat`, `greatest`, `least`, `round`, `substring`, `lpad`, `rpad`,
+  `coalesce`, `nullIf`, and the SQL truth/null predicates are ordinary base
+  definitions. Their signatures provide static contracts; `sql_func`,
+  `sql_fragment`, `list.fold`, and `sql_is_null` are the only lowering/core
+  vocabulary they use. SQLite concat and padding are composed from `||`,
+  `PRINTF`, `REPLACE`, and `SUBSTR` in the library itself.
 
 - `reverse` stays a core builtin: sqlite lowers it to a **scalar recursive
   CTE**, which is query-shape, not a scalar call — `sql_func`/`sql_infix`
@@ -233,29 +240,20 @@ table, and it is now ordinary tetaue:
 The `renderCall` switch is gone with it: `LOWERINGS`/`SQL_NAMES` are now derived
 from the specs alone, and `render.ts` keeps only the query-shaped lowering.
 
-## Still in the TS core: the remaining scalar family
+## Scalar surface now in base
 
-- **Variadic-list** (`concat`, `greatest`, `least`). `greatest`/`least` rely
-  on bespoke inference diagnostics (`greatest requires matching types, got
-  float and string` — asserted in `test/functions.test.ts`) that a prelude
-  `[t] -> t` annotation cannot reproduce, plus sqlite's scalar
-  `MAX(a, b, ...)`/`MIN(a, b, ...)` lowering. `concat` needs sqlite's
-  per-element `COALESCE(x, '')` fold — a list-to-binary-operator mapping the
-  prelude has no primitive for.
-- **Heterogeneous / optional-argument** (`round x n`, `substring x s (just l)`,
-  `lpad`/`rpad`). These are curried position by position with `maybe`-typed
-  optional positions; the prelude has no `maybe`-branching lowering for the
-  SQLite `SUBSTR`/`PRINTF` compositions.
-- **Type-directed** (`cast`, `fromMaybe`). These resolve at type level, not
-  name level, and stay core.
-- `reverse` (sqlite scalar recursive CTE) is query-shape, already documented
-  above.
+The remaining scalar family is now ordinary code in `base/sql.tetaue`:
+`concat`, `greatest`, `least`, `round`, `substring`, `lpad`, `rpad`,
+`coalesce`, `nullIf`, and the SQL truth/null predicates. The definitions use
+the generic `sql_func`/`sql_fragment` vocabulary, `list.fold` for SQLite's
+NULL-safe concat, and `sql_is_null` for literal-aware optional-argument
+dispatch. The inference pass supplies the general homogeneous-list check;
+there is no function-specific primitive catalog entry.
 
-Migration resumes when the prelude gains new lowering vocabulary — e.g. a
-`sql_call` form that covers SQLite format strings, a list-fold over SQL
-arguments (for `concat`), or annotation-carried diagnostics (for
-`greatest`/`least`). Those are deliberate language additions, not mechanical
-moves.
+`cast`, `fromMaybe`, and the query-shape operations remain core because they
+produce type-directed or relational IR. `reverse` also remains core because
+SQLite lowers it to a scalar recursive CTE, which is query-shape rather than a
+plain SQL call.
 
 ## What stays in the TS core (the irreducible relational machinery)
 

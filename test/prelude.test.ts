@@ -284,15 +284,16 @@ describe('list namespace', () => {
         const list = env.get('list');
         expect(list?.kind).toBe('module');
         if (!list || list.kind !== 'module') return;
-        // The unqualified query steps and scalar builtins stay in place —
-        // `map`/`filter`/`take`/`drop`/`reverse`/`concat`/`sum` remain the
-        // relational/SQL words — and the namespace adds the pure list
-        // spellings without replacing them. (`length` moved from a core
-        // builtin to a prelude export; it is covered below.)
-        for (const name of ['map', 'filter', 'take', 'drop', 'reverse', 'concat', 'sum']) {
+        // The unqualified query steps remain in the primitive core, while
+        // migrated scalar helpers such as `concat` are ordinary Prelude
+        // exports. The namespace adds pure list spellings without replacing
+        // the query vocabulary.
+        for (const name of ['map', 'filter', 'take', 'drop', 'reverse', 'sum']) {
             expect(env.has(name)).toBe(true);
             expect(env.get(name)).not.toBe(list.exports.get(name));
         }
+        expect(env.has('concat')).toBe(false);
+        expect(standardPreludeNames(services)).toContain('concat');
         // And every list.* public spelling resolves through the namespace.
         const listNamespace = PRELUDE_NAMESPACES.list ?? {};
         for (const publicName of Object.keys(listNamespace)) {
@@ -326,7 +327,7 @@ describe('list namespace', () => {
 });
 
 describe('Maybe namespace', () => {
-    test('every Maybe.* member maps to a real backend builtin', () => {
+    test('the core Maybe namespace contains only core operations', () => {
         const env = createPreludeEnv();
         const maybe = env.get('Maybe');
         expect(maybe?.kind).toBe('module');
@@ -345,15 +346,17 @@ describe('Maybe namespace', () => {
         expect(checked('main = (Maybe.fromMaybe) 0 nothing', { requireQuery: false }).diagnostics).toEqual([]);
     });
 
-    test('Maybe.* coexists with the unqualified maybe builtins', () => {
+    test('base-defined Maybe helpers extend the core namespace', () => {
         const env = createPreludeEnv();
         const maybe = env.get('Maybe');
         expect(maybe?.kind).toBe('module');
         if (!maybe || maybe.kind !== 'module') return;
-        for (const name of ['just', 'nothing', 'isNull', 'fromMaybe']) {
+        for (const name of ['just', 'nothing', 'fromMaybe']) {
             expect(env.has(name)).toBe(true);
             expect(env.get(name)).not.toBe(maybe.exports.get(name));
         }
+        expect(env.has('isNull')).toBe(false);
+        expect(standardPreludeNames(services)).toEqual(expect.arrayContaining(['isJust', 'isNothing', 'isNotNull']));
     });
 
     test('Maybe.* works in a query predicate', () => {

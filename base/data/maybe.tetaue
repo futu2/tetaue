@@ -2,9 +2,11 @@
 #
 # `(maybe T)` is the language's Maybe: a value that may be SQL NULL. These
 # are the derived predicates and eliminators the Prelude exposes unqualified
-# (`isNothing`, `isJust`, `fromMaybe`); the constructors and the
-# `Maybe.*` namespace spellings come from the core.
+# (`isNothing`, `isJust`, `fromMaybe`). The constructors and eliminator come
+# from the SQL surface; the derived predicates are ordinary base definitions.
 
-export isNothing = isNull
-export isJust = x => not (isNull x)
-export isNotNull = isJust
+import "../sql.tetaue" as sql
+
+export isNothing: a -> bool = sql.isNull
+export isJust = sql.maybeIsJust
+export isNotNull: a -> bool = x => not ((sql.isNull) x)

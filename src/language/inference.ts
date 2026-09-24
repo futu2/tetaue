@@ -43,7 +43,7 @@ import {
 } from './binding-analysis.js';
 import { implicitParamName, labelName } from './strings.js';
 import { BUILTIN_ALIASES, BUILTIN_SPECS } from './catalog.js';
-import { CAST_TYPES, LIST_ARITY, CORE_TYPE_NAMES, builtinModeOf, type CoreTypeName, type SqlMode } from './builtin.js';
+import { CAST_TYPES, CORE_TYPE_NAMES, builtinModeOf, type CoreTypeName, type SqlMode } from './builtin.js';
 import {
     INTRINSIC_OPERATORS, isBinaryOperator, isIntrinsicOperator, operatorIntrinsicName,
     sectionName, sectionSpelling, type BinaryOperator, type IntrinsicOperator,
@@ -63,9 +63,6 @@ export interface InferDiagnostic {
     node: AstNode | undefined;
     message: string;
 }
-
-/** Builtins whose application takes ALL arguments at once (no currying). */
-const LIST_BUILTINS = new Set(['concat', 'greatest', 'least']);
 
 const JOIN_BUILTINS = {
     joinInner: 'inner',
@@ -277,25 +274,30 @@ export class Inferencer {
             const r = strip(t);
             return r.kind === 'prim' ? r.name : this.u.pretty(t, true);
         };
-        for (const check of this.deferred.slice(deferredMark)) {
-            const a = strip(check.a);
-            const b = strip(check.b);
-            const compatible = a.kind === 'prim' && b.kind === 'prim'
-                && ((isNumericPrim(a) && isNumericPrim(b)) || a.name === b.name);
-            if (a.kind === 'prim' && b.kind === 'prim' && !compatible) {
-                this.diag(check.node, `${check.message}, got ${nameOf(check.a)} and ${nameOf(check.b)}`);
+        const flushTypeChecks = (): void => {
+            for (const check of this.deferred.slice(deferredMark)) {
+                const a = strip(check.a);
+                const b = strip(check.b);
+                const compatible = a.kind === 'prim' && b.kind === 'prim'
+                    && ((isNumericPrim(a) && isNumericPrim(b)) || a.name === b.name);
+                if (a.kind === 'prim' && b.kind === 'prim' && !compatible) {
+                    this.diag(check.node, `${check.message}, got ${nameOf(check.a)} and ${nameOf(check.b)}`);
+                }
             }
-        }
-        this.deferred = this.deferred.slice(0, deferredMark);
+            this.deferred = this.deferred.slice(0, deferredMark);
+        };
+        flushTypeChecks();
+        // Overload resolution may discover a list contract only after its
+        // argument's row variables have settled. Drain those checks too; a
+        // scoped binding flush must not discard work created by the resolver.
+        this.resolveOverloads(overloadMark);
+        flushTypeChecks();
         // `mempty` instance resolution: the use site has unified the type by
         // now (annotation, `<>` operand, list-argument element check, ...).
         for (const use of this.pendingMempty) {
             this.checkMemptyResolved(use);
         }
         this.pendingMempty = [];
-        // Overload picks come LAST: they need the very rows this flush just
-        // settled (a numeric wrapper argument is resolved by the loop above).
-        this.resolveOverloads(overloadMark);
     }
 
     /** Validate one resolved `mempty` use against the closed Monoid instances. */
@@ -331,9 +333,9 @@ export class Inferencer {
      * operator intrinsics consumed by the base library. The SQL mode of an
      * aggregate / group key / window function is a property of its NAME
      * (`BUILTIN_MODES`), checked from the entry's syntax at the fold/map/over
-     * call sites, and the list-argument builtins take one list argument, so
-     * plain fold entries and non-order sort lambdas are STATIC type errors,
-     * not runtime checks.
+     * call sites. Scalar contracts are ordinary base-library signatures; plain
+     * fold entries and non-order sort lambdas are STATIC type errors, not
+     * runtime checks.
      */
     prelude(dialect?: DialectView): void {
         for (const spec of BUILTIN_SPECS) {
@@ -481,6 +483,14 @@ export class Inferencer {
             if (isBase(module)) {
                 this.preludeNames = new Set([...this.preludeNames, ...exported.keys()]);
                 this.preludeEnv = new Map([...this.preludeEnv, ...exported]);
+                if (module === prelude) {
+                    const maybe = new Map<string, Scheme>();
+                    for (const name of ['just', 'nothing', 'isJust', 'isNothing', 'fromMaybe']) {
+                        const scheme = exported.get(name);
+                        if (scheme) maybe.set(name, scheme);
+                    }
+                    this.preludeNamespaces.set('Maybe', maybe);
+                }
             }
         }
         this.flushDeferred();
@@ -739,6 +749,15 @@ export class Inferencer {
         const set = this.overloads.get(name) ?? this.overloadsFromEnv(env, name);
         if (!set || set.length < 2) return null;
         const argTypes = e.arguments.map(a => this.inferArg(a, env));
+        return this.queueOverload(name, e, set, argTypes);
+    }
+
+    private queueOverload(
+        name: string,
+        e: import('./generated/ast.js').Application,
+        set: readonly Scheme[],
+        argTypes: Type[],
+    ): Type {
         const result = this.u.fresh();
         this.deferredOverloads.push({ name, set, e, argTypes, result });
         return result;
@@ -787,13 +806,17 @@ export class Inferencer {
         // alternatives with the same result shape are the same choice —
         // `abs : int -> int` and `abs : float -> float` are not ambiguous just
         // because both accept a still-polymorphic argument.
-        const byResult = new Map<string, number>();
+        const byResult = new Map<string, { index: number; score: number }>();
         for (const i of winners) {
             const snapshot = this.u.snapshotForTrial();
             try {
-                const applied = this.trialApply(this.u.instantiate(use.set[i]!), use.argTypes)!;
+                const candidate = this.u.instantiate(use.set[i]!);
+                const score = this.overloadSpecificity(candidate, use.argTypes);
+                const applied = this.trialApply(candidate, use.argTypes)!;
                 const key = this.u.pretty(applied, true);
-                if (!byResult.has(key)) byResult.set(key, i);
+                if (!byResult.has(key)) {
+                    byResult.set(key, { index: i, score });
+                }
             } catch {
                 // ruled out above
             } finally {
@@ -801,22 +824,100 @@ export class Inferencer {
             }
         }
         if (byResult.size > 1) {
-            this.diag(use.e, `'${use.name}' is ambiguous here — it matches ${byResult.size} definitions (${[...byResult.keys()].join(' | ')}); annotate the argument to pick one`);
+            const candidates = [...byResult.entries()];
+            const bestScore = Math.max(...candidates.map(([, candidate]) => candidate.score));
+            const best = candidates.filter(([, candidate]) => candidate.score === bestScore);
+            if (best.length > 1) {
+                this.diag(use.e, `'${use.name}' is ambiguous here — it matches ${byResult.size} definitions (${[...byResult.keys()].join(' | ')}); annotate the argument to pick one`);
+                return;
+            }
+            const chosen = use.set[best[0]![1].index]!;
+            try {
+                this.u.unify(use.result, this.applyOverload(chosen, use.argTypes));
+                this.checkOverloadListArguments(use, chosen);
+            } catch (err) {
+                if (err instanceof UnifyError) this.reportOverloadMismatch(use, best[0]![1].index);
+                else throw err;
+            }
             return;
         }
         // Commit the surviving choice on the live universe and tie it to the
         // result variable this application already handed back.
-        const chosen = use.set[[...byResult.values()][0]!]!;
+        const chosenIndex = [...byResult.values()][0]!.index;
+        const chosen = use.set[chosenIndex]!;
         try {
             this.u.unify(use.result, this.applyOverload(chosen, use.argTypes));
+            this.checkOverloadListArguments(use, chosen);
         } catch (err) {
-            if (err instanceof UnifyError) this.reportOverloadMismatch(use, [...byResult.values()][0]!);
+            if (err instanceof UnifyError) this.reportOverloadMismatch(use, chosenIndex);
             else throw err;
+        }
+    }
+
+    private overloadSpecificity(candidate: Type, argTypes: readonly Type[]): number {
+        let current = candidate;
+        let score = 0;
+        for (const argType of argTypes) {
+            const shape = this.u.peel(current);
+            if (shape.kind !== 'fun') break;
+            score += this.typeSpecificity(shape.from, argType);
+            current = shape.to;
+        }
+        return score;
+    }
+
+    private typeSpecificity(expected: Type, actual: Type): number {
+        const e = this.u.peel(expected);
+        const a = this.u.peel(actual);
+        if (a.kind === 'var') return 0;
+        switch (e.kind) {
+            case 'var': return 0;
+            case 'prim':
+                return a.kind === 'prim' && a.name === e.name ? 3
+                    : a.kind === 'prim' && isNumericPrim(a) && isNumericPrim(e) ? 1
+                        : -100;
+            case 'list': return a.kind === 'list' ? 2 + this.typeSpecificity(e.of, a.of) : -100;
+            case 'maybe': return a.kind === 'maybe' ? 2 + this.typeSpecificity(e.of, a.of) : -100;
+            case 'fun': return a.kind === 'fun' ? 1 : -100;
+            case 'query': return a.kind === 'query' ? 1 : -100;
+            case 'row': return a.kind === 'row' ? 1 : -100;
+            default: return 0;
+        }
+    }
+
+    /** Check literal list elements after an overloaded function is selected. */
+    private checkOverloadListArguments(use: PendingOverload, scheme: Scheme): void {
+        let candidate = this.u.instantiate(scheme);
+        for (let i = 0; i < use.argTypes.length; i++) {
+            const shape = this.u.peel(candidate);
+            if (shape.kind !== 'fun') return;
+            const parameter = shape.from;
+            const snapshot = this.u.snapshotForTrial();
+            try {
+                this.u.unify(parameter, use.argTypes[i]!);
+                this.checkHomogeneousListArgument(use.name, use.e.arguments[i]!, parameter, use.argTypes[i]!);
+            } catch {
+                // The overload was already committed above. A failed
+                // speculative check here only means this parameter was not a
+                // list-shaped argument; the ordinary overload diagnostic owns
+                // all actual application mismatches.
+            } finally {
+                this.u.restoreTrial(snapshot);
+            }
+            candidate = shape.to;
         }
     }
 
     /** Point at the argument that fits no definition of an overloaded name. */
     private reportOverloadMismatch(use: PendingOverload, chosen: number): void {
+        if (use.name === 'coalesce' && use.argTypes.length >= 2) {
+            const first = this.u.peel(use.argTypes[0]!);
+            const second = this.u.peel(use.argTypes[1]!);
+            if (first.kind === 'prim' && second.kind === 'prim' && first.name !== second.name) {
+                this.diag(use.e, `coalesce requires matching types, got ${first.name} and ${second.name}`);
+                return;
+            }
+        }
         const scheme = use.set[chosen]!;
         const expected = this.u.instantiate(scheme);
         let f = expected;
@@ -1354,6 +1455,18 @@ export class Inferencer {
             this.diag(e, `operator '${op}' is not defined`);
             return this.u.fresh();
         }
+        const operatorSet = this.u.resolve(operator);
+        if (operatorSet.kind === 'overload') {
+            const result = this.u.fresh();
+            this.deferredOverloads.push({
+                name: op,
+                set: operatorSet.alternatives.map(type => ({ vars: [], type })),
+                e: e as unknown as import('./generated/ast.js').Application,
+                argTypes: [lt, rt],
+                result,
+            });
+            return result;
+        }
         const intrinsic = this.taggedOperator(operator);
         if (intrinsic) {
             return this.inferBinaryTypes(intrinsic, lt, rt, e, e.left, e.right);
@@ -1663,6 +1776,14 @@ export class Inferencer {
             const pending = this.beginOverload(e.func.name, e, env);
             if (pending) return pending;
         }
+        const qualifiedOverload = this.u.resolve(rawF);
+        if (qualifiedOverload.kind === 'overload') {
+            const set = qualifiedOverload.alternatives.map(type => ({ vars: [], type }));
+            if (set.length > 1) {
+                const argTypes = e.arguments.map(a => this.inferArg(a, env));
+                return this.queueOverload(funcName ?? 'overloaded function', e, set, argTypes);
+            }
+        }
         // `param "name"` — all occurrences of the same parameter name share
         // one named type hole, so conflicting uses cannot both type-check and
         // then collapse onto one SQL bind placeholder at render time.
@@ -1704,16 +1825,12 @@ export class Inferencer {
         }
         if (funcName === 'scalar' && e.arguments.length === 1) return this.inferScalar(e, env);
         if ((funcName === 'inQuery' || funcName === 'notInQuery') && e.arguments.length === 2) return this.inferInQuery(e, env);
-        if ((funcName === 'isTrue' || funcName === 'isFalse' || funcName === 'isUnknown') && e.arguments.length === 1) {
-            return this.inferTruthPredicate(e, env, funcName);
-        }
         if (funcName === 'fold' && e.arguments.length === 1) return this.inferFold(e, env);
         if (funcName === 'map' && e.arguments.length === 1) return this.inferMap(e, env);
         if (funcName === 'select' && e.arguments.length === 1) return this.inferSelect(e, env);
         // `merge` — the result row is the union of both rows (the right
         // record wins on overlapping fields), which the generic fun-type
         // application path cannot express; compute the union directly.
-        if (funcName === 'coalesce' && e.arguments.length === 1) return this.inferCoalesceList(e, env);
         if (funcName === 'fmap' && e.arguments.length === 2) return this.inferFmap(e, env);
         if (funcName === 'replaceWith' && e.arguments.length === 2) {
             const left = this.inferArg(e.arguments[0]!, env);
@@ -1855,43 +1972,18 @@ export class Inferencer {
             // step leaves earlier types intact, so the checks still see what
             // they need.
             if (funcName) this.postCheckArg(funcName, i, argExpr, argType, e);
+            if (!failed && funcName) {
+                this.checkHomogeneousListArgument(funcName, argExpr, param, argType);
+            }
             f = result;
         }
         if (funcName === 'isIn' || funcName === 'isNotIn') {
             this.checkInList(e, env, argTypes);
         }
-        if (funcName && LIST_BUILTINS.has(funcName) && e.arguments.length > 0) {
-            this.checkListBuiltin(funcName, e, env);
-        }
         if (funcName && SET_OP_BUILTINS.has(funcName)) {
             this.checkSetOpOperand(funcName, e, env);
         }
         return f;
-    }
-
-    private inferCoalesceList(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
-        const listExpr = e.arguments[0]!;
-        if (!isListLiteral(listExpr)) return this.u.fresh(); // interpreter reports the shape
-        const elements = listExpr.elements;
-        if (elements.length < 2) {
-            this.diag(listExpr, `coalesce expects at least two expressions, e.g. coalesce [u.nickname, u.email]`);
-            return this.u.fresh();
-        }
-        const inner = this.u.fresh();
-        const expected = maybeOf(inner);
-        for (const item of elements) {
-            const t = this.inferArg(item, env);
-            try {
-                this.u.unify(expected, t);
-            } catch (err) {
-                if (err instanceof UnifyError) {
-                    this.diag(item, `coalesce requires matching nullable (maybe T) types, got ${this.u.pretty(t)}`);
-                } else {
-                    throw err;
-                }
-            }
-        }
-        return expected;
     }
 
     /**
@@ -2375,46 +2467,6 @@ export class Inferencer {
         return maybeOf(fields[0]![1]);
     }
 
-    /** SQL three-valued logic predicates accept bool, maybe bool, or NULL. */
-    private inferTruthPredicate(e: import('./generated/ast.js').Application, env: Map<string, Scheme>, name: string): Type {
-        const arg = e.arguments[0]!;
-        const argType = this.inferArg(arg, env);
-        // A SQL predicate is a non-null bool or a nullable bool. This is a
-        // direct acceptance test on the argument rather than a marker type to
-        // unify against.
-        //
-        // A still-open variable must be BOUND, not merely accepted: when the
-        // argument's type is not yet known (the row-polymorphic lambda in
-        // `filter (u => isUnknown u.id)`, or `f = isTrue` before its argument
-        // settles) the old marker propagated `bool?` into the enclosing
-        // expression, and that propagation is what later produced the error at
-        // the application site. Binding reproduces it: the variable resolves to
-        // `bool?`, so a row field annotated `int` no longer matches.
-        const r = this.u.peel(argType);
-        // An unresolved argument (`filter (u => isUnknown u.id)` sees `u.id` as
-        // a row-field variable) is left alone: the column is deliberately kept
-        // at its declared type. The old `truth` marker unified itself INTO that
-        // variable, which is what leaked `bool?` into the enclosing row and
-        // made a plain `bool` column stop matching. The interpreter checks the
-        // concrete type at evaluation (see `truthPredicateBuiltin`), so the
-        // static pass does not need to pre-commit.
-        if (r.kind !== 'var' && !this.isTruthAccepting(r)) {
-            this.diag(e, `${name} expects a boolean or nullable boolean expression, got type ${this.u.pretty(argType)}`);
-        }
-        return prim('bool');
-    }
-
-    /** Whether a resolved type is a SQL predicate: `bool` or `maybe bool`. */
-    private isTruthAccepting(t: Type): boolean {
-        const r = this.u.peel(t);
-        if (r.kind === 'prim') return r.name === 'bool';
-        if (r.kind === 'maybe') {
-            const inner = this.u.peel(r.of);
-            return inner.kind === 'var' || (inner.kind === 'prim' && inner.name === 'bool');
-        }
-        return false;
-    }
-
     /** `inQuery x q` / `notInQuery x q` — IN (SELECT ...). */
     private inferInQuery(e: import('./generated/ast.js').Application, env: Map<string, Scheme>): Type {
         const valueT = this.inferArg(e.arguments[0]!, env);
@@ -2810,52 +2862,6 @@ export class Inferencer {
     }
 
     /**
-     * List-argument builtins (`concat [a, b]`, `greatest [a, b]`, ...): the
-     * scheme types the FIRST element; this checks every element's static kind
-     * and the arity, mirroring the interpreter's runtime checks with matching
-     * messages (so the merged diagnostics dedupe). The heterogeneous/optional
-     * builtins (round, substring, lpad/rpad, lag/lead) are curried — a list
-     * cannot type `[string, int, ...]` — so they are never checked here.
-     */
-    private checkListBuiltin(name: string, e: import('./generated/ast.js').Application, env: Map<string, Scheme>): void {
-        const listExpr = e.arguments[0];
-        if (!listExpr || !isListLiteral(listExpr)) return;
-        const elements = listExpr.elements;
-        const [min, max] = LIST_ARITY[name] ?? [0, Infinity];
-        if (elements.length < min || elements.length > max) {
-            this.diag(listExpr, `${name} expects ${min}${max === Infinity ? ' or more' : ` to ${max}`} arguments, got ${elements.length}`);
-        }
-        switch (name) {
-            case 'concat': {
-                for (let i = 0; i < elements.length; i++) {
-                    const t = this.inferExpr(elements[i]!, env);
-                    try {
-                        this.u.unify(prim('string'), t);
-                    } catch (err) {
-                        if (err instanceof UnifyError) {
-                            this.diag(elements[i]!, `concat expects string expressions, got type ${this.u.pretty(t)}`);
-                        } else {
-                            throw err;
-                        }
-                    }
-                }
-                break;
-            }
-            case 'greatest': case 'least': {
-                let base: Type | null = null;
-                for (let i = 0; i < elements.length; i++) {
-                    const t = this.inferExpr(elements[i]!, env);
-                    if (base !== null) {
-                        this.defer(listExpr, base, t, `${name} requires matching types`);
-                    }
-                    base = t;
-                }
-                break;
-            }
-        }
-    }
-
-    /**
      * Set operations (`union`/`intersect`/`except`/`unionAll`) match columns
      * POSITIONALLY in SQL, while tetaue rows are unordered records — so the
      * renderer projects an explicit shared column order and rejects operands
@@ -3179,31 +3185,6 @@ export class Inferencer {
             case 'abs': case 'sum': case 'avg':
                 this.diag(node, `${name} expects a numeric expression, got type ${p(argType)}`);
                 break;
-            case 'coalesce':
-                this.diag(node, `coalesce requires matching types, got ${p(param ?? argType)} and ${p(argType)}`);
-                break;
-            // Curried heterogeneous/optional builtins — messages mirror the
-            // interpreter's (interpreter.ts `roundBuiltin` et al.) so the
-            // merged diagnostics dedupe. Optional positions carry their
-            // `maybe` contract with no type suffix: both passes say exactly
-            // the same words.
-            case 'round':
-                if (index === 0) this.diag(node, `round expects a numeric expression, got type ${p(argType)}`);
-                else if (index === 1) this.diag(node, `round expects a numeric scale, got type ${p(argType)}`);
-                else this.diag(node, `round takes exactly two arguments, e.g. round u.x 0`);
-                break;
-            case 'substring':
-                if (index === 0) this.diag(node, `substring expects a string expression, got type ${p(argType)}`);
-                else if (index === 1) this.diag(node, `substring expects a numeric start position, got type ${p(argType)}`);
-                else if (index === 2) this.diag(node, `substring expects its optional length as maybe int, e.g. substring u.name 1 nothing or substring u.name 1 (just 3)`);
-                else this.diag(node, `substring takes exactly three arguments, e.g. substring u.name 1 nothing`);
-                break;
-            case 'lpad': case 'rpad':
-                if (index === 0) this.diag(node, `${name} expects a string expression, got type ${p(argType)}`);
-                else if (index === 1) this.diag(node, `${name} expects a numeric length, got type ${p(argType)}`);
-                else if (index === 2) this.diag(node, `${name} expects a string padding, got type ${p(argType)}`);
-                else this.diag(node, `${name} takes exactly three arguments, e.g. ${name} u.code 8 "0"`);
-                break;
             case 'lag': case 'lead':
                 if (index === 1) this.diag(node, `${name} expects a numeric offset, got type ${p(argType)}`);
                 else if (index === 2) this.diag(node, `${name} expects its default to match the value type, e.g. ${name} u.salary 1 (just 0)`);
@@ -3259,8 +3240,7 @@ export class Inferencer {
             return;
         }
         if ((name === 'sum' || name === 'avg' || name === 'abs'
-            || name === 'ceil' || name === 'floor' || name === 'sqrt'
-            || name === 'round') && index === 0) {
+            || name === 'ceil' || name === 'floor' || name === 'sqrt') && index === 0) {
             // Without a `Num` class the argument is an ordinary variable, so
             // the numeric requirement is checked here once a concrete
             // primitive is known: `abs u.name` must be a static error, while
@@ -3369,6 +3349,53 @@ export class Inferencer {
                 } else {
                     throw err;
                 }
+            }
+        }
+    }
+
+    /**
+     * The list literal inferencer deliberately starts with its first element
+     * so numeric literals can adapt to a column (`[u.amount, 1]`). Once a
+     * function says that the list is homogeneous, check the remaining
+     * literal elements against that function parameter instead of allowing a
+     * later incompatible element to disappear into the permissive list pass.
+     * Generic SQL argument builders are intentionally excluded: their list is
+     * an untyped argument bag, not a homogeneous data structure.
+     */
+    private checkHomogeneousListArgument(name: string | null, argExpr: Expr, parameter: Type, argType: Type): void {
+        if (!name || name === 'sql_func' || name === 'sql_fragment' || name === 'isIn' || name === 'isNotIn') return;
+        if (!isListLiteral(argExpr)) return;
+        const expected = this.u.peel(parameter);
+        if (expected.kind !== 'list') return;
+        const expectedItem = expected.of;
+        const firstItem = argExpr.elements[0];
+        const firstType = firstItem ? (this.nodeTypes.get(firstItem) ?? argType) : argType;
+        for (const item of argExpr.elements.slice(1)) {
+            const itemType = this.nodeTypes.get(item) ?? this.u.fresh();
+            if (name === 'coalesce') {
+                const snapshot = this.u.snapshotForTrial();
+                try {
+                    this.u.unify(expectedItem, itemType);
+                } catch (err) {
+                    if (err instanceof UnifyError) {
+                        this.diag(item, `coalesce requires matching nullable (maybe T) types, got ${this.u.pretty(itemType, true)}`);
+                    } else {
+                        throw err;
+                    }
+                } finally {
+                    this.u.restoreTrial(snapshot);
+                }
+                continue;
+            }
+            // The first item can still be an open row-field variable while a
+            // projection is being inferred. Defer the comparison until the
+            // surrounding query schema has unified those variables.
+            if (name === 'concat') {
+                this.defer(item, firstType, itemType, 'concat expects string expressions');
+            } else if (name === 'greatest' || name === 'least') {
+                this.defer(item, firstType, itemType, `${name} requires matching types`);
+            } else {
+                this.defer(item, expectedItem, itemType, `${name} requires homogeneous list elements`);
             }
         }
     }

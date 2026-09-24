@@ -2,9 +2,10 @@
 
 The general SQL function set follows teta's
 [LANGUAGE_SPEC](https://github.com/futu2/teta/blob/master/doc/LANGUAGE_SPEC.md):
-one tetaue name per operation and a **per-dialect lowering** chosen at render
-time (direct, mapped, or fallback). The interpreter validates arguments; the
-inference pass types them; `render.ts` owns the SQL.
+one tetaue name per operation and a **per-dialect lowering** chosen during
+base-library evaluation (direct, mapped, or fallback). `base/sql.tetaue` owns
+the scalar definitions; the TypeScript core supplies only the generic SQL
+builders and query-shape operations.
 
 Status legend (matching teta's): **Direct** = emitted as-is, **Mapped** =
 renamed, **Fallback** = rewritten to an equivalent expression. Every scalar
@@ -28,11 +29,9 @@ defaults to ' '), `lag u.salary 2 nothing` (offset defaults to 1).
 
 All of these are ordinary curried functions: they compose with `<<<`/`>>>`,
 bind as values (`f = greatest`, `f = lpad u.code 8`), and partial-apply like
-everything else (there is no variadic special case in the evaluator). The
-interpreter validates the argument kinds at runtime; the inference pass types
-every position and checks the arity (`argError` / `postCheckArg` in
-`inference.ts`), with messages matching the interpreter's so the merged
-diagnostics dedupe.
+everything else. Their type annotations and ordinary base expressions provide
+the contracts; list literal homogeneity is checked by the general inference
+pass, while base uses `sql_error` for compile-time arity failures.
 
 A bare reference (`f = greatest`) is the function value, not a call.
 
@@ -125,7 +124,9 @@ Semantics and typing:
 
 The Haskell `base` vocabulary for the less-common, pure operations lives in
 **built-in namespaces**, kept strictly separate from the unqualified
-relational/SQL vocabulary so the two never collide. Qualified access needs
+relational/SQL vocabulary so the two never collide. The `Maybe` constructors
+and eliminator are core namespace members; its SQL predicates are ordinary
+definitions in `base/data/maybe.tetaue`. Qualified access needs
 parens when applied (the same rule as `filter (p.adult)`):
 
 ```
@@ -198,12 +199,15 @@ PostgreSQL, `yyyy-MM-dd` Hive).
 | `round x n` (scale required; 0 = no rounding) | `ROUND(x, n)` | Direct | Direct | Direct | Direct |
 | `greatest x y ...` / `least ...` | `GREATEST(...)` / `LEAST(...)` | Direct | Direct | Direct (MAX/MIN aliases) | Direct |
 
-`greatest`/`least` require all arguments to share a comparable type (strict
-numerics: int and float do not mix, like everywhere else in the language).
+`greatest`/`least` require all arguments to share a comparable type; numeric
+representations remain comparable (`int`, `float`, and `decimal`) just as they
+are in the runtime SQL comparison rules.
 
 ## Strings
 
-`trim`, `toUpper`, `toLower`, `length`, and `position` are now ordinary
+`trim`, `toUpper`, `toLower`, `length`, `position`, `concat`, `greatest`,
+`least`, `round`, `substring`, `lpad`, `rpad`, `coalesce`, `nullIf`, and the
+truth/null predicates are now ordinary
 `base/sql.tetaue` definitions over the `sql_func`/`sql_infix` primitives (see
 the `sql_dialect` mechanism in [sql-dialect.md](sql-dialect.md)) — only
 `reverse` remains a core builtin because sqlite lowers it to a scalar

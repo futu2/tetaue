@@ -102,8 +102,14 @@ const baseCache = new WeakMap<object, BaseCache>();
 function resolveBaseUri(spec: string): string {
     // The grammar stores STRING terminals with their quotes (the value
     // converter keeps them raw so the interpreter controls unescaping).
-    const bare = parseStringLiteral(spec).replace(/^\.\//, '');
-    return `${BASE_PREFIX}${bare}`;
+    const raw = parseStringLiteral(spec).replace(/^\.\//, '').replace(/^base\//, '');
+    const parts: string[] = [];
+    for (const part of raw.split('/')) {
+        if (part === '' || part === '.') continue;
+        if (part === '..') parts.pop();
+        else parts.push(part);
+    }
+    return `${BASE_PREFIX}${parts.join('/')}`;
 }
 
 /**

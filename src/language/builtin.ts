@@ -18,25 +18,11 @@
  * computing on aggregate results works; the fold/map mode checks in
  * inference.ts inspect the raw field types.
  *
- * Argument-passing for many-argument builtins:
- *   - The genuinely variadic, homogeneous builtins (concat, greatest, least)
- *     take a SINGLE list argument — `concat [u.first, u.last]` — which is the
- *     sound pure-functional encoding of variadic application: a homogeneous
- *     `[string]` / `[t]` list types exactly what they consume. The
- *     interpreter validates element kinds/arity at runtime; inference checks
- *     each element's static kind (checkListBuiltin).
- *   - Builtins with heterogeneous arguments (round, substring, lpad, rpad,
- *     lag, lead) are ordinary curried functions whose types state every
- *     position exactly. An argument is `maybe`-typed only when OMITTING it
- *     changes the meaning (`substring`'s length: `substring u.name 1 nothing`
- *     means to the end; `lag`'s default is NULL, i.e. `nothing`). An argument
- *     that is optional merely because SQL has a DEFAULT VALUE for it is
- *     required instead, so the caller writes the default explicitly:
- *     `round u.balance 0` (scale defaults to 0 in SQL), `lpad u.code 8 "0"`
- *     (pad defaults to ' '), `lag u.salary 1 nothing` (offset defaults to 1).
- *     A list of heterogeneous arguments would be unsound — one element type
- *     cannot express `[string, int, ...]` — so these builtins never take a
- *     list.
+ * The scalar and string helpers intentionally do not appear here. They are
+ * ordinary overloaded/curried definitions in `base/sql.tetaue`; this table
+ * keeps only primitives whose evaluator must understand query shape or an
+ * IR node that a generic SQL call cannot express. `lag`/`lead` remain core
+ * because they are window nodes and their legality depends on `over`.
  ******************************************************************************/
 import {
     type PrimName, type Scheme, type Type, type TypeUniverse, type VarKind,
@@ -265,8 +251,6 @@ export const BUILTIN_SPECS = [
     // --- scalar functions ------------------------------------------------
     // `toUpper`, `toLower`, `length`, `trim` live in base/sql.tetaue; `abs`,
     // `ceil`, `floor`, `sqrt` live there too (Num-constrained, sql_func).
-    { name: 'coalesce', category: 'scalar', doc: 'COALESCE', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))) },
-
     // --- date & time -----------------------------------------------------
     // Only the CONSTANTS stay core: they map to their own IR nodes
     // (`date-literal`, `current-date`, ...), which no lowering can express.
@@ -318,6 +302,8 @@ export const BUILTIN_SPECS = [
         const a = u.fresh('flex', 'a');
         return poly(u, [tVar], b => fun(p('string'), fun(listOf(a), b)));
     } },
+    { name: 'sql_is_null', category: 'logic', doc: 'sql_is_null x — primitive NULL predicate for the base library', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))) },
+    { name: 'sql_same_type', category: 'logic', doc: 'sql_same_type x y — compile-time SQL type comparison for the base library', scheme: u => poly(u, [tVar], t => fun(t, fun(t, p('bool')))) },
     // `sql_infix op left right` emits an uninterpreted infix SQL expression
     // (`left op right`, e.g. `sql_infix "IN" n x` -> `n IN x`). The result
     // type is left open (`c`) — a comparison is bool, `div` is int, etc. —
@@ -434,13 +420,6 @@ export const BUILTIN_SPECS = [
     { name: 'just', category: 'scalar', doc: 'just x — lift a non-null SQL value into maybe', scheme: u => poly(u, [tVar], t => fun(t, maybeOf(t))) },
     { name: 'nothing', category: 'constant', doc: 'nothing — SQL NULL as maybe', scheme: u => poly(u, [tVar], t => maybeOf(t)) },
     { name: 'fromMaybe', category: 'scalar', doc: 'fromMaybe default maybe_value — COALESCE', scheme: u => poly(u, [tVar], t => fun(t, fun(maybeOf(t), t))), lower: ({ arg }) => `COALESCE(${arg(0)}, ${arg(1)})` },
-    { name: 'nullIf', category: 'scalar', doc: 'NULLIF', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), fun(maybeOf(t), maybeOf(t)))), sqlName: 'NULLIF' },
-    { name: 'isNull', category: 'logic', doc: 'IS NULL', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
-    { name: 'maybeIsJust', category: 'logic', doc: 'maybe.isJust x — not (isNull x); the Data.Maybe isJust', scheme: u => poly(u, [tVar], t => fun(maybeOf(t), p('bool'))) },
-    { name: 'isTrue', category: 'logic', doc: 'SQL three-valued logic: IS TRUE', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS TRUE` },
-    { name: 'isFalse', category: 'logic', doc: 'SQL three-valued logic: IS FALSE', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS FALSE` },
-    { name: 'isUnknown', category: 'logic', doc: 'SQL three-valued logic: IS UNKNOWN / NULL', scheme: u => poly(u, [tVar], t => fun(t, p('bool'))), lower: ({ arg }) => `${arg(0)} IS NULL` },
-
     // --- casts -----------------------------------------------------------
     { name: 'cast', category: 'cast', doc: 'cast x "int"', scheme: u => poly(u, [tVar], t => fun(t, fun(p('string'), u.fresh()))), lower: (ctx) => {
         // The cast target is a string literal naming a TYPE, not a value to
@@ -475,66 +454,7 @@ export const BUILTIN_SPECS = [
         return `CASE WHEN CAST(${casted} AS TEXT) = CAST(${value} AS TEXT) THEN ${casted} ELSE NULL END`;
     } },
 
-    // --- list-argument builtins (homogeneous variadic: the list types exactly
-    // what they consume — a sound pure-functional encoding of variadic application)
-    { name: 'concat', category: 'string', doc: 'concat [a, b, ...]', scheme: () => mono(fun(listOf(p('string')), p('string'))), lower: ({ dialect, arg, arity }) => {
-        const parts = Array.from({ length: arity }, (_, i) => arg(i));
-        if (dialect === 'sqlite') {
-            // SQLite has no CONCAT; || propagates NULL, so COALESCE each
-            // argument to the empty string to match CONCAT semantics.
-            return parts.map(p => `COALESCE(${p}, '')`).join(' || ');
-        }
-        return `CONCAT(${parts.join(', ')})`;
-    } },
-    { name: 'greatest', category: 'scalar', doc: 'greatest [a, b, ...]', scheme: u => poly(u, [tVar], t => fun(listOf(t), t)), lower: ({ name, dialect, arg, arity }) => {
-        if (dialect !== 'sqlite') return null; // GREATEST via the default path
-        // SQLite has scalar MAX/MIN with GREATEST/LEAST-like NULL semantics.
-        // `least` is an ALIAS for `greatest` and keeps its own spelling in the
-        // IR, so the direction is decided by the NAME rather than by assuming
-        // the entry's own spelling.
-        const fn = name === 'least' ? 'MIN' : 'MAX';
-        const parts = Array.from({ length: arity }, (_, i) => arg(i));
-        return `${fn}(${parts.join(', ')})`;
-    } },
-
-    // --- curried builtins with heterogeneous arguments -------------------
-    // Every position is curried with its exact type. An argument is
-    // `maybe`-typed only when omitting it changes the meaning; arguments
-    // whose SQL default value makes them "optional" are required instead.
-    { name: 'round', category: 'math', doc: 'round x scale — scale is required (0 rounds to integer)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('int'), t))) },
-    { name: 'substring', category: 'string', doc: 'substring s start (just length) — length optional (omitted = to the end)', scheme: () => mono(fun(p('string'), fun(p('int'), fun(maybeOf(p('int')), p('string'))))), lower: ({ dialect, arg, arity }) => {
-        // value, start, optional length
-        const name = dialect === 'sqlite' ? 'SUBSTR' : 'SUBSTRING';
-        const args = [arg(0), arg(1)];
-        if (arity > 2) args.push(arg(2));
-        return `${name}(${args.join(', ')})`;
-    } },
-    { name: 'lpad', category: 'string', doc: 'lpad s n pad — pad is required (SQL defaults to a space)', scheme: () => mono(fun(p('string'), fun(p('int'), fun(p('string'), p('string'))))), lower: (ctx) => {
-        const { name, dialect, arg, arity } = ctx;
-        // `rpad` is an alias for `lpad` but keeps its own spelling in the IR,
-        // so the direction is decided by the NAME, not by an assumed entry.
-        const fnName = name === 'rpad' ? 'RPAD' : 'LPAD';
-        const isLeft = name !== 'rpad';
-        if (dialect === 'sqlite') {
-            // SQLite has no LPAD/RPAD. printf() produces a run of spaces and
-            // replace() turns it into the requested pad string. CASE handles
-            // native LPAD/RPAD behaviour when the input is already too long.
-            const value = arg(0);
-            const width = arg(1);
-            const pad = arity > 2 ? arg(2) : ctx.stringLiteral(' ');
-            const fill = `REPLACE(PRINTF('%*s', ${width}, ''), ' ', ${pad})`;
-            const missing = `${width} - LENGTH(${value})`;
-            const truncated = `SUBSTR(${value}, 1, ${width})`;
-            const padded = `SUBSTR(${fill}, 1, ${missing})`;
-            return `CASE WHEN LENGTH(${value}) >= ${width} THEN ${truncated} ELSE ${isLeft ? `${padded} || ${value}` : `${value} || ${padded}`} END`;
-        }
-        if (arity === 2) {
-            // MySQL/Trino/Hive require the pad string; PostgreSQL defaults to a
-            // space. Make the default explicit for a uniform lowering.
-            return `${fnName}(${arg(0)}, ${arg(1)}, ' ')`;
-        }
-        return null;
-    } },
+    // --- window arguments ------------------------------------------------
     { name: 'lag', category: 'window', doc: 'lag x offset (just default) — offset required, default optional (NULL)', scheme: u => poly(u, [tVar], t => fun(t, fun(p('int'), fun(maybeOf(t), t)))) },
 
     // --- window functions ------------------------------------------------
@@ -599,8 +519,6 @@ export function builtinModeOf(name: string): SqlMode | null {
 
 export const BUILTIN_ALIASES = {
     isNotIn: 'isIn',
-    least: 'greatest',
-    rpad: 'lpad',
     lead: 'lag',
     notInQuery: 'inQuery',
 } as const;
@@ -614,15 +532,6 @@ export const BUILTIN_NAMES = [
     ...BUILTIN_SPECS.map(s => s.name),
     ...Object.keys(BUILTIN_ALIASES),
 ];
-
-// ---------------------------------------------------------------------------
-// Shared argument-shape metadata (used by both interpreter and inference)
-// ---------------------------------------------------------------------------
-
-/** Min/max element counts of the list-argument builtins (homogeneous variadic only). */
-export const LIST_ARITY = {
-    concat: [2, Infinity], greatest: [2, Infinity], least: [2, Infinity],
-} as Readonly<Record<string, readonly [number, number]>>;
 
 /** Target type names accepted by cast. */
 export const CAST_TYPES = ['int', 'float', 'decimal', 'string', 'bool', 'date', 'timestamp'] as const;

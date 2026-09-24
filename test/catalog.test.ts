@@ -37,11 +37,16 @@ describe('builtin catalog', () => {
         expect(onlyInterpreter, 'interpreter-only names (missing type scheme)').toEqual([]);
     });
 
-    test('the list-argument builtins are the catalog + interpreter list', () => {
-        const list = ['concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'lag', 'lead'];
-        for (const name of list) {
-            expect(BUILTIN_NAMES).toContain(name);
-            expect(Object.keys(BUILTINS)).toContain(name);
+    test('the scalar surface is ordinary base code, not primitive catalog code', async () => {
+        const moved = ['coalesce', 'concat', 'greatest', 'least', 'round', 'substring', 'lpad', 'rpad', 'nullIf', 'isTrue', 'isFalse', 'isUnknown'];
+        for (const name of moved) {
+            expect(BUILTIN_NAMES, `${name} must not be a primitive`).not.toContain(name);
+            expect(Object.keys(BUILTINS), `${name} must not have a runtime builtin`).not.toContain(name);
+        }
+        const { baseLibraryModuleTypes } = await import('./helpers.ts');
+        const sql = baseLibraryModuleTypes('base/sql.tetaue');
+        for (const name of moved) {
+            expect(sql.has(name), `${name} must be exported by base/sql.tetaue`).toBe(true);
         }
     });
 
@@ -91,7 +96,6 @@ describe('builtin catalog', () => {
             countDistinct: 'COUNT',
             inQuery: 'IN',
             isIn: 'IN',
-            nullIf: 'NULLIF',
             rowNumber: 'ROW_NUMBER',
             denseRank: 'DENSE_RANK',
             percentRank: 'PERCENT_RANK',
@@ -102,17 +106,16 @@ describe('builtin catalog', () => {
         // The converse, stated as the property the renderer actually needs:
         // every name that can reach the default `NAME(args)` path must resolve
         // to a SQL word. The reachable set is the builtins the evaluator turns
-        // into `call` nodes under their own name (`rowNumber`, `nullIf`,
-        // `dateAdd`, ...); query steps and dedicated IR nodes (`currentDate`,
+        // into `call` nodes under their own name (`rowNumber`, `dateAdd`,
+        // ...); query steps and dedicated IR nodes (`currentDate`,
         // `joinLateral`) never become a function word, so they are not in it.
         // The date family is no longer in the catalog: every date/time
         // function is a definition in `base/sql/time.tetaue` (see the test
         // below), so it reaches the renderer as a `fragment`/`call` the
         // library built rather than as a builtin name.
         const CALL_NODE_NAMES = [
-            'cast', 'coalesce', 'concat', 'denseRank', 'fromMaybe',
-            'nullIf', 'ntile', 'percentRank', 'rank', 'round', 'rowNumber',
-            'substring', 'tryCast',
+            'cast', 'denseRank', 'fromMaybe', 'ntile', 'percentRank', 'rank',
+            'rowNumber', 'tryCast',
         ] as const;
         for (const name of CALL_NODE_NAMES) {
             const s = spec.get(name);
@@ -120,7 +123,7 @@ describe('builtin catalog', () => {
             // Either it declares the word, or owns a special lowering (the
             // date family, which never reaches the fallback), or the name has
             // no interior capital — so upper-casing it IS the SQL word
-            // (`rank` -> RANK, `coalesce` -> COALESCE). Never a made-up
+            // (`rank` -> RANK). Never a made-up
             // `ROWNUMBER`.
             const handled = s!.lower !== undefined
                 || s!.sqlName !== undefined

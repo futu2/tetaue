@@ -22,7 +22,7 @@
     "build:cli": "bun build src/cli.ts --target=node --outfile=dist/cli.mjs --banner '#!/usr/bin/env node'",
     "prepack": "bun run build:cli",
     "check": "tsc --noEmit",
-    "test": "bun test",
+    "test": "bun test --max-concurrency=1",
     "render": "bun run src/cli.ts render",
     "check:examples": "bun run scripts/check-examples.ts",
     "validate:sqlite": "bun run scripts/validate-sqlite.ts",

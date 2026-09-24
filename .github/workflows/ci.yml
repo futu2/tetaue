@@ -25,7 +25,7 @@ jobs:
         run: bun run check
 
       - name: Test
-        run: bun test
+        run: bun test --max-concurrency=1
 
       - name: Check examples
         run: bun run check:examples

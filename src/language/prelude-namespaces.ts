@@ -3,9 +3,9 @@
  * in-memory operations that are NOT the hot relational path, kept out of the
  * unqualified (relational/SQL) namespace so the two never collide.
  *
- * Pure operations are ordinary core builtins (`list_map`, `list_fold`,
- * `maybeIsJust`, ...) whose public spelling is namespaced: `list.map`,
- * `list.fold`, `maybe.isJust`. This module is the single source of truth for
+ * Pure operations are ordinary core builtins (`list_map`, `list_fold`, ...)
+ * whose public spelling is namespaced: `list.map`, `list.fold`. This module is
+ * the single source of truth for
  * that mapping — both the interpreter (which seeds a namespace module VALUE
  * in every module's environment) and the inferencer (which seeds a namespace
  * of SCHEMES) derive their tables from here, so they can never drift.
@@ -36,19 +36,13 @@ export const LIST_NAMESPACE: Readonly<Record<string, string>> = {
 };
 
 /**
- * public `Maybe.*` name -> backend builtin name.
- * The Haskell Data.Maybe vocabulary over nullable SQL expressions. The alias
- * is capitalized `Maybe` (as in Haskell) because lowercase `maybe` is the
- * reserved type keyword and cannot follow a namespace dot. Most members are
- * the existing maybe builtins (`just`, `nothing`, `fromMaybe`, `isNull`);
- * `isJust` is a dedicated builtin (`maybeIsJust`) because it is
- * `not (isNull x)` — a composition that needs no new SQL primitive.
+ * Core `Maybe.*` name -> backend builtin name.
+ * The derived SQL predicates live in `base/data/maybe.tetaue`; only the
+ * constructors and eliminator remain available without the Prelude.
  */
 export const MAYBE_NAMESPACE: Readonly<Record<string, string>> = {
     just: 'just',
     nothing: 'nothing',
-    isJust: 'maybeIsJust',
-    isNothing: 'isNull',
     fromMaybe: 'fromMaybe',
 };
 

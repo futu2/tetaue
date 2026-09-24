@@ -1,7 +1,9 @@
 # tetaue architecture — the macroscope, and the case for splitting elaboration from typing
 
-Status: **proposal**. Nothing in this document is implemented yet. It is the
-review that motivates a redesign, the target structure, and a staged plan.
+Status: **partially implemented**. The scalar-core boundary and ordinary
+`base/*.tetaue` library described here are now in use. The later elaboration
+split remains a design proposal; sections that describe the old scalar
+dispatch are historical rather than current implementation requirements.
 
 Scope decision (the user's, recorded here so the plan can be judged against it):
 **separate elaboration/typechecking from IR building.** The only invariant
@@ -55,17 +57,18 @@ date / scalar / many-argument / curried-heterogeneous / window, then entry
 points. `interpreter.ts` alone contains 154 `ctx.diagnostics.push` sites, 80
 mentions of `schema`, 73 of `step`, and 69 of `SQL`.
 
-Adding one SQL function today means editing **four parallel tables**:
+Before the base migration, adding one SQL function meant editing **four
+parallel tables**:
 
 1. `builtin.ts` — the static scheme (`BUILTIN_SPECS`);
 2. `interpreter.ts` — the runtime implementation (`BUILTINS`);
 3. `render.ts` — the lowering (`DIALECTS.*.functions` + the render switch);
 4. `inference.ts` — *often*, a name-keyed special case.
 
-`test/catalog.test.ts` exists purely to pin (1) and (2) to each other: "a
-builtin can never exist on one side without the other, so the inference pass
-and the interpreter cannot drift apart." A test enforcing parity between two
-tables is the codebase telling us it wants one table.
+`test/catalog.test.ts` still pins the genuinely primitive (1)/(2) names to each
+other, but scalar wrappers now live in `base/sql.tetaue`; their signatures and
+lowerings are checked as ordinary library code instead of being added to the
+primitive catalog.
 
 The name-keyed special-case pattern in `inference.ts` is the same symptom:
 ~35 sites dispatch on `name === '…'` (`'table'`, `'merge'`, `'take'`,
@@ -102,23 +105,19 @@ next. That is the clearest evidence that a distinction is missing from the
 architecture: the type checker is being used as a side channel for the
 elaborator.
 
-### Fact C — the SQL boundary is mid-migration
+### Fact C — the SQL boundary is now in base
 
 `docs/design/sql-dialect.md` records a deliberate move: per-dialect lowering
 from a bespoke table inside `render.ts` to a first-class `sql_dialect` value
 that `base/sql.tetaue` branches on at analysis time, over the primitives
-`sql_func` / `sql_bare` / `sql_infix` / `sql_cast`. Fifteen scalar functions
-have migrated (`upper`, `lower`, `length`, `trim`, `replace`, `mod`, `like`,
-`div`, `leftSubstring`, `rightSubstring`, `abs`, `ceil`, `floor`, `sqrt`,
-`pow`, `position`).
+`sql_func` / `sql_bare` / `sql_infix` / `sql_cast` / `sql_fragment`. The scalar
+surface now lives in base, including `concat`, `greatest`, `least`, `round`,
+`substring`, padding, null/coalesce, and SQL truth predicates.
 
-`render.ts` still owns the rest:
+`render.ts` still owns the irreducible parts:
 
 - `CASE WHEN` folds for filtered aggregates and filtered arguments (lines
   411, 422) and `case` lowering (451);
-- `concat`'s NULL semantics — SQLite `||` propagates NULL, so each part is
-  wrapped in `COALESCE(…, '')` (519-521);
-- `substring` / `lpad` rewrites with `CASE WHEN LENGTH(...)` (560-570);
 - `CAST` target type names per dialect (590-597);
 - the `LIMIT`/`OFFSET` matrix — `standard`, `mysql`'s
   `LIMIT 18446744073709551615`, `sqlite`'s `LIMIT -1`, Hive's refusal
@@ -158,8 +157,8 @@ Wrong, in order of how much they cost:
    settle — a real constraint, expressed as a mutable pending list rather than
    as a constraint to solve.
 
-3. **Four tables for one function** (Fact A), and a test whose job is to keep
-   them in sync.
+3. **Four tables for one primitive function** (Fact A), and a test whose job
+   is to keep them in sync. Scalar wrappers no longer enter those tables.
 
 4. **Inference special-cases builtins by name string** — ~35 sites + 16
    dedicated `infer*` methods. Behaviour that belongs next to a builtin's

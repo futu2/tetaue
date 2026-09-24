@@ -30,7 +30,7 @@ import {
 } from './binding-analysis.js';
 export { missingBindingExpressionMessage, recursiveBindingMessage, topoOrderBindings };
 export type { Diagnostic, DialectView };
-import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, LIST_ARITY, type BuiltinName } from './builtin.js';
+import { BUILTIN_ALIASES, BUILTIN_SPECS, CAST_TYPES, type BuiltinName } from './builtin.js';
 import { CORE_NAMESPACE, PRELUDE_NAMESPACES } from './prelude-namespaces.js';
 import { baseClosureFor, baseModuleFor, baseModulesByPath } from './prelude.js';
 import { TypeUniverse } from './types.js';
@@ -57,16 +57,22 @@ import type {
 // Interpreter values
 // ---------------------------------------------------------------------------
 
+type ParamShape =
+    | 'any'
+    | { kind: 'scalar'; type: TypeOrNull }
+    | { kind: 'list' }
+    | { kind: 'maybe' };
+
 
 export type Value =
     | { kind: 'query'; query: Query; ast?: AstNode }
     | { kind: 'fn'; name: string; apply: (arg: Value, at: AstNode | undefined, ctx: Ctx) => Value; ast?: AstNode;
         /** Declared first-parameter SQL type, for overload selection. */
-        paramType?: TypeOrNull }
+        paramType?: TypeOrNull; paramShape?: ParamShape }
     | { kind: 'step'; name: string; apply: (q: Query, at: AstNode | undefined, ctx: Ctx) => Query | null; ast?: AstNode }
     | { kind: 'lambda'; params: string[]; body: Hir; closure: Map<string, Value>; ast?: AstNode;
         /** Declared first-parameter SQL type (`(x: float) => ...`), for overload selection. */
-        paramType?: TypeOrNull }
+        paramType?: TypeOrNull; paramShape?: ParamShape }
     /**
      * A first-class record value. Field access (`r.name`) works over records.
      * A row inside a lambda is a record whose schema comes from the pipeline
@@ -304,20 +310,6 @@ function listNumericFold(op: '+' | '*', start: number, type: SqlType, xs: { kind
     return acc;
 }
 
-/** SQL three-valued logic predicates; all return a non-null boolean. */
-function truthPredicateBuiltin(name: 'isTrue' | 'isFalse' | 'isUnknown'): () => Value {
-    return () => fn(name, (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node || (node.type !== 'bool' && node.type !== 'null' && node.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects a boolean or nullable boolean expression, got ${node ? `type ${typeName(node.type)}` : describe(arg)}` });
-            return ERROR;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], name, at ?? arg.ast, ctx)) return ERROR;
-        return mkExpr({ kind: 'call', name, args: [node], type: 'bool' }, at);
-    });
-}
-
-
 /** Nearest lambda whose body encloses `node`, for field-punning sugar. */
 function enclosingLambdaParamName(node: import('./generated/ast.js').MapEntry): string | null {
     let cur: AstNode | undefined = node;
@@ -540,13 +532,22 @@ function selectOverload(
     const argType = valueSqlType(arg);
     const scored: { value: Value; score: number }[] = [];
     for (const alternative of f.alternatives) {
-        const param = declaredParamType(alternative);
+        const param = declaredParamShape(alternative);
         if (param === null) continue; // not a function: the ordinary path reports it
-        if (param === 'any' || argType === 'unknown') {
+        if (param === 'any') {
             scored.push({ value: alternative, score: 0 });
-        } else if (param === argType) {
+        } else if (param.kind === 'list') {
+            if (arg.kind === 'list') scored.push({ value: alternative, score: 3 });
+        } else if (param.kind === 'maybe') {
+            // Runtime SQL nodes carry their scalar type, not the static
+            // nullable wrapper. Keep this candidate available, but let an
+            // exact scalar overload win when one exists.
+            scored.push({ value: alternative, score: 0 });
+        } else if (argType === 'unknown') {
+            if (arg.kind === 'expr') scored.push({ value: alternative, score: 0 });
+        } else if (param.type === argType) {
             scored.push({ value: alternative, score: 2 });
-        } else if (isNumeric(param) && isNumeric(argType)) {
+        } else if (isNumeric(param.type) && isNumeric(argType)) {
             scored.push({ value: alternative, score: 1 });
         }
     }
@@ -555,6 +556,16 @@ function selectOverload(
     const best = scored[0]!;
     const tied = scored.filter(s => s.score === best.score);
     if (tied.length > 1) {
+        const shape = (v: Value): string => {
+            const p = declaredParamShape(v);
+            return p === null || p === 'any' ? 'any' : p.kind;
+        };
+        const shapes = new Set(tied.map(s => shape(s.value)));
+        // Multiple source overloads may intentionally share a structural
+        // parameter shape (`concat [string]` and `concat [maybe string]`).
+        // Their result/lowering is chosen by declaration order at runtime;
+        // static inference still checks the more precise element contract.
+        if (shapes.size === 1) return tied[tied.length - 1]!.value;
         ctx.diagnostics.push({
             node: at ?? f.ast,
             message: `'${f.name}' is ambiguous for ${typeName(argType)} — annotate the argument to pick one of its ${f.alternatives.length} definitions`,
@@ -564,9 +575,12 @@ function selectOverload(
     return best.value;
 }
 
-/** The parameter type an alternative declares, or null when it is not a function. */
-function declaredParamType(v: Value): TypeOrNull | 'any' | null {
-    if (v.kind === 'fn' || v.kind === 'lambda') return v.paramType ?? 'any';
+/** The parameter shape an alternative declares, or null when it is not a function. */
+function declaredParamShape(v: Value): ParamShape | null {
+    if (v.kind === 'fn' || v.kind === 'lambda') {
+        if (v.paramShape) return v.paramShape;
+        return v.paramType ? { kind: 'scalar', type: v.paramType } : 'any';
+    }
     return null;
 }
 
@@ -874,6 +888,32 @@ function firstParamTypeOfAnnotation(t: import('./generated/ast.js').Type): TypeO
     }
     if (!isFunType(cur)) return null;
     return sqlTypeOfAnnotation(cur.left);
+}
+
+function parameterShapeOfAnnotation(t: import('./generated/ast.js').Type | undefined): ParamShape {
+    let cur = t;
+    for (;;) {
+        if (!cur) return 'any';
+        if (isTypeParen(cur)) { cur = cur.type; continue; }
+        if (isTypeAtom(cur)) {
+            if (cur.maybeType) return { kind: 'maybe' };
+            if (cur.base) { cur = cur.base; continue; }
+        }
+        if (isListType(cur)) return { kind: 'list' };
+        if (isTypeVar(cur) && (PRIM_TYPE_NAMES as readonly string[]).includes(cur.name)) {
+            return { kind: 'scalar', type: cur.name as TypeOrNull };
+        }
+        return 'any';
+    }
+}
+
+function firstParamShapeOfAnnotation(t: import('./generated/ast.js').Type): ParamShape {
+    let cur = t;
+    for (;;) {
+        if (isTypeParen(cur)) { cur = cur.type; continue; }
+        break;
+    }
+    return isFunType(cur) ? parameterShapeOfAnnotation(cur.left) : 'any';
 }
 
 /** Scalar primitives usable as an overload discriminator. */
@@ -1512,6 +1552,7 @@ function evalHirInner(h: Hir, ctx: Ctx): Value {
             // far. A parameter annotation (`(x: float) => ...`) is recorded as
             // an SQL type so an overload set can be selected at render time.
             const declared = sqlTypeOfAnnotation(h.paramTypes[0]);
+            const shape = parameterShapeOfAnnotation(h.paramTypes[0]);
             return {
                 kind: 'lambda',
                 params: [...h.params],
@@ -1519,6 +1560,7 @@ function evalHirInner(h: Hir, ctx: Ctx): Value {
                 closure: new Map(ctx.env),
                 ast: h.at,
                 ...(declared ? { paramType: declared } : {}),
+                ...(shape !== 'any' ? { paramShape: shape } : {}),
             };
         }
 
@@ -2438,61 +2480,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
     inQuery: inQueryBuiltin(false),
     notInQuery: inQueryBuiltin(true),
 
-    // --- string & scalar functions --------------------------------------
-    // `abs`/`ceil`/`floor`/`sqrt` live in base/sql.tetaue (Num-constrained
-    // sql_func definitions).
-    coalesce: () => fn('coalesce', (arg1, at1, ctx) => {
-        // Variadic list form: coalesce [a, b, c].
-        if (arg1.kind === 'list') {
-            if (arg1.items.length < 2) {
-                ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `coalesce expects at least two expressions, e.g. coalesce [u.nickname, u.email]` });
-                return ERROR;
-            }
-            const nodes: SqlNode[] = [];
-            let resultType: TypeOrNull = 'null';
-            for (const item of arg1.items) {
-                const node = exprNode(item);
-                if (!node) {
-                    ctx.diagnostics.push({ node: item.ast ?? at1, message: `coalesce list items must be expressions, got ${describe(item)}` });
-                    return ERROR;
-                }
-                if (node.kind === 'agg' || node.kind === 'group' || node.kind === 'order' || node.kind === 'window') {
-                    ctx.diagnostics.push({ node: item.ast ?? at1, message: `coalesce cannot wrap ${kindLabel(node.kind)}` });
-                    return ERROR;
-                }
-                if (resultType === 'null') resultType = node.type;
-                if (node.type !== 'null' && resultType !== 'null' && !comparable(resultType, node.type)) {
-                    ctx.diagnostics.push({ node: item.ast ?? at1, message: `coalesce requires matching types, got ${typeName(resultType)} and ${typeName(node.type)}` });
-                    return ERROR;
-                }
-                nodes.push(node);
-            }
-            return mkExpr({ kind: 'call', name: 'coalesce', args: nodes, type: resultType === 'null' ? 'string' : resultType as SqlType }, at1);
-        }
-        const node1 = exprNode(arg1);
-        if (!node1) {
-            ctx.diagnostics.push({ node: at1 ?? arg1.ast, message: `coalesce expects expressions, e.g. coalesce u.nickname u.name` });
-            return ERROR;
-        }
-        return fn('coalesce', (arg2, at2, ctx2) => {
-            const node2 = exprNode(arg2);
-            if (!node2) {
-                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `coalesce expects two expressions, got ${describe(arg2)}` });
-                return ERROR;
-            }
-            if (node1.kind === 'agg' || node2.kind === 'agg') {
-                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `coalesce cannot wrap aggregates` });
-                return ERROR;
-            }
-            const t = (node1.type === 'null') ? node2.type : node1.type;
-            if (node1.type !== 'null' && node2.type !== 'null' && !comparable(node1.type, node2.type)) {
-                ctx2.diagnostics.push({ node: at2 ?? arg2.ast, message: `coalesce requires matching types, got ${typeName(node1.type)} and ${typeName(node2.type)}` });
-                return ERROR;
-            }
-            return mkExpr({ kind: 'call', name: 'coalesce', args: [node1, node2], type: t === 'null' ? 'string' : t }, at2);
-        });
-    }),
-
     // --- date & time ---------------------------------------------------
     date: () => fn('date', (arg, at, ctx) => {
         const value = stringValue(arg);
@@ -2923,46 +2910,35 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         });
     }),
 
-    nullIf: () => fn('nullIf', (arg, at, ctx) => {
+    sql_is_null: () => fn('sql_is_null', (arg, at, ctx) => {
         const node = exprNode(arg);
         if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `nullIf expects expressions, e.g. nullIf u.nickname ""` });
+            ctx.diagnostics.push({ node: at ?? arg.ast, message: `sql_is_null expects an expression` });
             return ERROR;
         }
-        if (forbid(node, ['agg', 'group', 'order'], 'nullIf', at ?? arg.ast, ctx)) return ERROR;
-        return fn('nullIf', (otherArg, at2, ctx2) => {
-            const other = exprNode(otherArg);
-            if (!other || !comparable(node.type, other.type)) {
-                ctx2.diagnostics.push({ node: at2 ?? otherArg.ast, message: `nullIf requires matching types, got ${node.type === 'null' ? 'null' : typeName(node.type)} and ${other ? (other.type === 'null' ? 'null' : typeName(other.type)) : describe(otherArg)}` });
-                return ERROR;
-            }
-            if (forbid(other, ['agg', 'group', 'order'], 'nullIf', at2 ?? otherArg.ast, ctx2)) return ERROR;
-            const t = node.type === 'null' ? other.type : node.type;
-            return mkExpr({ kind: 'call', name: 'nullIf', args: [node, other], type: t === 'null' ? 'string' : t }, at2);
-        });
-    }),
-    isNull: () => fn('isNull', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `isNull expects an expression, e.g. isNull u.nickname` });
-            return ERROR;
+        if (forbid(node, ['agg', 'group', 'order'], 'sql_is_null', at ?? arg.ast, ctx)) return ERROR;
+        // Base-library definitions use this predicate for compile-time
+        // dispatch (`substring ... nothing` versus `substring ... (just n)`).
+        // Preserve SQL semantics for computed expressions, but expose the
+        // obvious literal facts so the branch can disappear before rendering.
+        if (node.kind === 'lit') {
+            return mkExpr(lit(node.value === null, 'bool'), at);
         }
-        if (forbid(node, ['agg', 'group', 'order'], 'isNull', at ?? arg.ast, ctx)) return ERROR;
         return mkExpr({ kind: 'is-null', expr: node, negated: false, type: 'bool' }, at);
     }),
-    maybeIsJust: () => fn('isJust', (arg, at, ctx) => {
-        const node = exprNode(arg);
-        if (!node) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `maybe.isJust expects an expression, e.g. maybe.isJust u.nickname` });
+
+    sql_same_type: () => fn('sql_same_type', (left, at, ctx) => fn('sql_same_type', (right, at2, ctx2) => {
+        const leftNode = exprNode(left);
+        const rightNode = exprNode(right);
+        if (!leftNode || !rightNode) {
+            ctx2.diagnostics.push({ node: at2 ?? at ?? left.ast, message: `sql_same_type expects two SQL expressions` });
             return ERROR;
         }
-        if (forbid(node, ['agg', 'group', 'order'], 'isJust', at ?? arg.ast, ctx)) return ERROR;
-        // not (x IS NULL) — Data.Maybe's isJust over nullable SQL values.
-        return mkExpr({ kind: 'is-null', expr: node, negated: true, type: 'bool' }, at);
-    }),
-    isTrue: truthPredicateBuiltin('isTrue'),
-    isFalse: truthPredicateBuiltin('isFalse'),
-    isUnknown: truthPredicateBuiltin('isUnknown'),
+        const same = leftNode.type === 'unknown' || rightNode.type === 'unknown'
+            || leftNode.type === rightNode.type
+            || isNumeric(leftNode.type) && isNumeric(rightNode.type);
+        return mkExpr(lit(same, 'bool'), at2 ?? at);
+    })),
 
     // --- type conversion --------------------------------------------------
     cast: castBuiltin('cast'),
@@ -3167,27 +3143,6 @@ export const BUILTINS: Readonly<Record<BuiltinName, () => Value>> = {
         return mkExpr(lit(`${value >= 0 ? '+' : ''}${value}`, 'string'));
     })),
 
-    // --- list-argument builtins (homogeneous variadic) -------------------
-    // concat [a, b], greatest [a, b], least [a, b] take a single list
-    // argument — the sound encoding for variadic functions with ONE element
-    // type. LIST_BUILTINS owns the element-kind and arity validation.
-    concat: listBuiltin('concat'),
-    greatest: listBuiltin('greatest'),
-    least: listBuiltin('least'),
-
-    // --- heterogeneous-argument builtins (curried) ------------------------
-    // round, substring, lpad/rpad, lag/lead have arguments of DIFFERENT
-    // types (a list cannot type them soundly), so they are ordinary curried
-    // functions. An argument is `maybe`-typed only when omitting it changes
-    // the meaning (substring's length = to the end, lag's default = NULL);
-    // args SQL merely defaults are required: `round u.x 0`,
-    // `substring u.name 1 (just 3)`, `lpad u.code 8 "0"`,
-    // `lag u.salary 1 nothing`.
-    round: roundBuiltin(),
-    substring: substringBuiltin(),
-    lpad: padBuiltin('lpad'),
-    rpad: padBuiltin('rpad'),
-
     // --- window functions ------------------------------------------------
     // Window-only functions must be wrapped in `over (...)` — a bare
     // `rowNumber` in a projection is an error (see validateWindowUses).
@@ -3358,222 +3313,7 @@ function castBuiltin(name: 'cast' | 'tryCast'): () => Value {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Many-argument builtins.
-//
-// concat, greatest, least are HOMOGENEOUS variadic functions: their list
-// argument (`concat [a, b]`) types exactly what they consume, which is the
-// sound pure-functional encoding. LIST_BUILTINS owns their element-kind and
-// arity validation.
-//
-// round, substring, lpad/rpad, lag/lead have heterogeneous arguments — a
-// list cannot express `[string, int, ...]` — so they are ordinary curried
-// functions typed position by position. Only the positions whose OMISSION
-// changes the meaning are `maybe` (substring's length = to the end, lag's
-// default = NULL); args SQL merely defaults are required. render.ts lowers
-// the resulting call nodes.
-// ---------------------------------------------------------------------------
-
-/** A list-argument builtin's env value: apply the one list argument. */
-function listBuiltin(name: string): () => Value {
-    return () => fn(name, (arg, at, ctx) => {
-        if (arg.kind !== 'list') {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects a list argument, e.g. ${listExample(name)}` });
-            return ERROR;
-        }
-        const spec = LIST_BUILTINS[name]!;
-        if (arg.items.length < spec.min || arg.items.length > spec.max) {
-            ctx.diagnostics.push({ node: at ?? arg.ast, message: `${name} expects ${spec.min}${spec.max === Infinity ? ' or more' : ` to ${spec.max}`} arguments, got ${arg.items.length}` });
-            return ERROR;
-        }
-        return spec.apply(arg.items, at, ctx);
-    });
-}
-
-function listExample(name: string): string {
-    switch (name) {
-        case 'concat': return 'concat [u.first, u.last]';
-        case 'greatest': return 'greatest [u.a, u.b]';
-        case 'least': return 'least [u.a, u.b]';
-    }
-    return `${name} [a, b]`;
-}
-
-/** All args must be expression nodes of the given kind — else diagnostic + null. */
-function exprArgs(
-    args: Value[],
-    what: string,
-    kind: 'numeric' | 'string' | 'date' | 'any',
-    at: AstNode | undefined,
-    ctx: Ctx,
-): SqlNode[] | null {
-    const nodes: SqlNode[] = [];
-    for (const a of args) {
-        // An unresolved `mempty` in an expression list resolves to the
-        // string identity (the concrete default instance).
-        const resolved = a.kind === 'mempty' ? mkExpr(lit('', 'string'), a.ast) : a;
-        const node = exprNode(resolved);
-        const ok = node !== null && (kind === 'any'
-            ? true
-            : kind === 'numeric'
-                ? isNumeric(node.type) || node.type === 'unknown'
-                : kind === 'string'
-                    ? node.type === 'string' || node.type === 'unknown'
-                    : dateLike(node));
-        if (!ok) {
-            const want = kind === 'numeric' ? 'numeric' : kind === 'string' ? 'string' : 'date or timestamp';
-            ctx.diagnostics.push({ node: at ?? a.ast, message: `${what} expects ${want} expressions, got ${node ? `type ${typeName(node.type)}` : describe(resolved)}` });
-            return null;
-        }
-        if (forbid(node, ['agg', 'group', 'order'], what, at ?? a.ast, ctx)) return null;
-        nodes.push(node);
-    }
-    return nodes;
-}
-
-const LIST_BUILTINS: Readonly<Record<string, { min: number; max: number; apply: (args: Value[], at: AstNode | undefined, ctx: Ctx) => Value }>> = {
-    concat: {
-        min: LIST_ARITY.concat![0], max: LIST_ARITY.concat![1],
-        apply: (args, at, ctx) => {
-            const nodes = exprArgs(args, 'concat', 'string', at, ctx);
-            if (nodes === null) return ERROR;
-            return mkExpr({ kind: 'call', name: 'concat', args: nodes, type: 'string' }, at);
-        },
-    },
-    greatest: {
-        min: LIST_ARITY.greatest![0], max: LIST_ARITY.greatest![1],
-        apply: (args, at, ctx) => listExtremum('greatest', args, at, ctx),
-    },
-    least: {
-        min: LIST_ARITY.least![0], max: LIST_ARITY.least![1],
-        apply: (args, at, ctx) => listExtremum('least', args, at, ctx),
-    },
-};
-
-/** greatest/least — all arguments must share a comparable type. */
-function listExtremum(name: 'greatest' | 'least', args: Value[], at: AstNode | undefined, ctx: Ctx): Value {
-    const nodes = exprArgs(args, name, 'any', at, ctx);
-    if (nodes === null) return ERROR;
-    const base = nodes[0]!;
-    for (let i = 1; i < nodes.length; i++) {
-        if (!comparable(base.type, nodes[i]!.type) || (isNumeric(base.type) !== isNumeric(nodes[i]!.type) && base.type !== 'unknown' && nodes[i]!.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at, message: `${name} requires matching types, got ${typeName(base.type)} and ${typeName(nodes[i]!.type)}` });
-            return ERROR;
-        }
-    }
-    const t = base.type === 'null' ? 'string' : base.type;
-    return mkExpr({ kind: 'call', name, args: nodes, type: t }, at);
-}
-
-// ---------------------------------------------------------------------------
-// Curried builtins with heterogeneous arguments.
-// round, substring, lpad/rpad, lag/lead are curried position by position.
-// A trailing argument is `maybe`-typed ONLY when omitting it changes the
-// meaning (substring's length = to the end; lag's default = NULL); arguments
-// that SQL merely gives a default value are REQUIRED, so the caller writes
-// the default explicitly. Every message below mirrors the corresponding
-// static diagnostic in inference.ts (argError / postCheckArg) so the merged
-// checker diagnostics dedupe to one.
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve a `maybe`-typed optional argument: `nothing` (a NULL literal)
- * omits the argument; any other expression supplies it. Returns 'omit',
- * the expression node, or null (a diagnostic was pushed).
- */
-function maybeOpt(v: Value, what: string, at: AstNode | undefined, ctx: Ctx): SqlNode | 'omit' | null {
-    const node = exprNode(v);
-    if (!node) {
-        ctx.diagnostics.push({ node: at ?? v.ast, message: `${what} expects its optional argument as maybe (nothing to omit, just x to supply), got ${describe(v)}` });
-        return null;
-    }
-    return node.type === 'null' ? 'omit' : node;
-}
-
-/** round x scale — the scale is required (SQL's ROUND(x) means scale 0). */
-function roundBuiltin(): () => Value {
-    return () => fn('round', (x, at, ctx) => {
-        const value = exprNode(x);
-        if (!value || (!isNumeric(value.type) && value.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? x.ast, message: `round expects a numeric expression, got ${value ? `type ${typeName(value.type)}` : describe(x)}` });
-            return ERROR;
-        }
-        if (forbid(value, ['agg', 'group', 'order'], 'round', at ?? x.ast, ctx)) return ERROR;
-        return fn('round', (scale, at2, ctx2) => {
-            const scaleNode = exprNode(scale);
-            if (!scaleNode || (!isNumeric(scaleNode.type) && scaleNode.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? scale.ast, message: `round expects a numeric scale, got ${scaleNode ? `type ${typeName(scaleNode.type)}` : describe(scale)}` });
-                return ERROR;
-            }
-            if (forbid(scaleNode, ['agg', 'group', 'order'], 'round', at2 ?? scale.ast, ctx2)) return ERROR;
-            return mkExpr({ kind: 'call', name: 'round', args: [value, scaleNode], type: value.type as SqlType }, at2);
-        });
-    });
-}
-
-/** substring s (maybe length) — start required, length optional (to the end). */
-function substringBuiltin(): () => Value {
-    return () => fn('substring', (s, at, ctx) => {
-        const value = exprNode(s);
-        if (!value || (value.type !== 'string' && value.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? s.ast, message: `substring expects a string expression, got ${value ? `type ${typeName(value.type)}` : describe(s)}` });
-            return ERROR;
-        }
-        if (forbid(value, ['agg', 'group', 'order'], 'substring', at ?? s.ast, ctx)) return ERROR;
-        return fn('substring', (start, at2, ctx2) => {
-            const startNode = exprNode(start);
-            if (!startNode || (!isNumeric(startNode.type) && startNode.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? start.ast, message: `substring expects a numeric start position, got ${startNode ? `type ${typeName(startNode.type)}` : describe(start)}` });
-                return ERROR;
-            }
-            if (forbid(startNode, ['agg', 'group', 'order'], 'substring', at2 ?? start.ast, ctx2)) return ERROR;
-            return fn('substring', (len, at3, ctx3) => {
-                const lenNode = maybeOpt(len, 'substring', at3, ctx3);
-                if (lenNode === null) return ERROR;
-                if (lenNode !== 'omit') {
-                    if (!isNumeric(lenNode.type) && lenNode.type !== 'unknown') {
-                        ctx3.diagnostics.push({ node: at3 ?? len.ast, message: `substring expects its optional length as maybe int, e.g. substring u.name 1 nothing or substring u.name 1 (just 3)` });
-                        return ERROR;
-                    }
-                    if (forbid(lenNode, ['agg', 'group', 'order'], 'substring', at3 ?? len.ast, ctx3)) return ERROR;
-                }
-                const args = lenNode === 'omit' ? [value, startNode] : [value, startNode, lenNode];
-                return mkExpr({ kind: 'call', name: 'substring', args, type: 'string' }, at3);
-            });
-        });
-    });
-}
-
-/** lpad/rpad — value, length, padding (required; SQL's default pad is a space). */
-function padBuiltin(name: 'lpad' | 'rpad'): () => Value {
-    return () => fn(name, (s, at, ctx) => {
-        const value = exprNode(s);
-        if (!value || (value.type !== 'string' && value.type !== 'unknown')) {
-            ctx.diagnostics.push({ node: at ?? s.ast, message: `${name} expects a string expression, got ${value ? `type ${typeName(value.type)}` : describe(s)}` });
-            return ERROR;
-        }
-        if (forbid(value, ['agg', 'group', 'order'], name, at ?? s.ast, ctx)) return ERROR;
-        return fn(name, (n, at2, ctx2) => {
-            const length = exprNode(n);
-            if (!length || (!isNumeric(length.type) && length.type !== 'unknown')) {
-                ctx2.diagnostics.push({ node: at2 ?? n.ast, message: `${name} expects a numeric length, got ${length ? `type ${typeName(length.type)}` : describe(n)}` });
-                return ERROR;
-            }
-            if (forbid(length, ['agg', 'group', 'order'], name, at2 ?? n.ast, ctx2)) return ERROR;
-            return fn(name, (pad, at3, ctx3) => {
-                const padNode = exprNode(pad);
-                if (!padNode || (padNode.type !== 'string' && padNode.type !== 'unknown')) {
-                    ctx3.diagnostics.push({ node: at3 ?? pad.ast, message: `${name} expects a string padding, got ${padNode ? `type ${typeName(padNode.type)}` : describe(pad)}` });
-                    return ERROR;
-                }
-                if (forbid(padNode, ['agg', 'group', 'order'], name, at3 ?? pad.ast, ctx3)) return ERROR;
-                return mkExpr({ kind: 'call', name, args: [value, length, padNode], type: 'string' }, at3);
-            });
-        });
-    });
-}
-
-/** lag/lead — value, offset (required; SQL's default is 1), optional default (NULL). */
+/** lag/lead — value, offset (required; default expression optional). */
 function lagLeadBuiltin(name: 'lag' | 'lead'): () => Value {
     return () => fn(name, (x, at, ctx) => {
         const value = exprNode(x);
@@ -3590,11 +3330,14 @@ function lagLeadBuiltin(name: 'lag' | 'lead'): () => Value {
             }
             if (forbid(offsetNode, ['agg', 'group', 'order', 'window'], name, at2 ?? offset.ast, ctx2)) return ERROR;
             return fn(name, (def, at3, ctx3) => {
-                const defNode = maybeOpt(def, name, at3, ctx3);
-                if (defNode === null) return ERROR;
-                if (defNode !== 'omit' && forbid(defNode, ['agg', 'group', 'order', 'window'], name, at3 ?? def.ast, ctx3)) return ERROR;
+                const defNode = exprNode(def);
+                if (!defNode) {
+                    ctx3.diagnostics.push({ node: at3 ?? def.ast, message: `${name} expects its default as an expression, e.g. ${name} u.salary 1 nothing` });
+                    return ERROR;
+                }
+                if (forbid(defNode, ['agg', 'group', 'order', 'window'], name, at3 ?? def.ast, ctx3)) return ERROR;
                 const nodes: SqlNode[] = [value, offsetNode];
-                if (defNode !== 'omit') nodes.push(defNode);
+                if (defNode.type !== 'null') nodes.push(defNode);
                 const t: SqlType = value.type === 'null' ? 'string' : value.type;
                 return mkExpr({ kind: 'call', name, args: nodes, type: t }, at3);
             });
@@ -4002,6 +3745,15 @@ export function createPreludeEnv(dialect?: DialectView): Map<string, Value> {
     return env;
 }
 
+export function maybeNamespaceFromBase(exports: ReadonlyMap<string, Value>): Value | null {
+    const selected = new Map<string, Value>();
+    for (const name of ['just', 'nothing', 'isJust', 'isNothing', 'fromMaybe']) {
+        const value = exports.get(name);
+        if (value) selected.set(name, value);
+    }
+    return selected.size > 0 ? { kind: 'module', name: 'Maybe', exports: selected } : null;
+}
+
 /**
  * Evaluate a project: the modules in import order (imports first, the root
  * module last). Each module is evaluated in its OWN scope — the prelude, its
@@ -4069,6 +3821,8 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
         // base module is skipped: it is built from the core, not from the
         // standard surface it helps define.
         if (!isBase && !isNoPrelude) {
+            const maybe = maybeNamespaceFromBase(standardValues);
+            if (maybe) env.set('Maybe', maybe);
             for (const [name, standardValue] of standardValues) {
                 if (!env.has(name)) env.set(name, standardValue);
             }
@@ -4107,7 +3861,7 @@ export function analyzeProject(modules: readonly ProjectModule[], options: Proje
             env = result.env;
             seen = result.seen;
             value = result.value;
-            if (binding.export) exports.set(binding.name, value);
+            if (binding.export) exports.set(binding.name, env.get(binding.name) ?? value);
         }
         // Cycle members keep their ERROR values; their binding value is the
         // module's entry only when it is the last binding.
@@ -4265,9 +4019,14 @@ export function checkBinding(binding: Binding, env: Map<string, Value>, moduleBi
     // A BINDING annotation is the other way to declare a parameter type
     // (`abs: float -> float = x => ...`). Overload selection reads it, so the
     // prelude can spell its alternatives exactly as inference sees them.
-    if (binding.type && v.kind === 'lambda' && v.paramType === undefined) {
+    if (binding.type && v.kind === 'lambda' && v.paramShape === undefined) {
         const declared = firstParamTypeOfAnnotation(binding.type);
-        if (declared) v = { ...v, paramType: declared };
+        const shape = firstParamShapeOfAnnotation(binding.type);
+        v = {
+            ...v,
+            ...(declared ? { paramType: declared } : {}),
+            ...(shape !== 'any' ? { paramShape: shape } : {}),
+        };
     }
     // A bare `mempty` with a binding annotation picks the instance from the
     // annotation (`x: [int] = mempty`) — same type-directed rule as

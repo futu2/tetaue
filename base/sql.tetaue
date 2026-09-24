@@ -170,15 +170,10 @@ export asTimestampOrNull: a -> timestamp = x => sql_try_cast x "timestamp"
 # ---------------------------------------------------------------------------
 # Aliases
 #
-# A second spelling for an operation whose lowered SQL differs by ARGUMENT
-# (not by definition): `rpad` is `lpad` spelled the other way, and its
-# lowering reads the written name to decide the direction. Kept as ordinary
-# aliases so both spellings resolve to one implementation.
+# Names whose core implementation is still shared keep their aliases here.
 # ---------------------------------------------------------------------------
 
 export isNotIn = core.isNotIn
-export least = core.least
-export rpad = core.rpad
 export lead = core.lead
 export notInQuery = core.notInQuery
 
@@ -207,27 +202,120 @@ export currentTimestamp = core.currentTimestamp
 # when omitting it changes the meaning.
 # ---------------------------------------------------------------------------
 
-export concat = core.concat
-export greatest = core.greatest
-export substring = core.substring
-export round = core.round
-export lpad = core.lpad
-export coalesce = core.coalesce
-export nullIf = core.nullIf
+listFold = list.fold
+atLeastTwo = xs => case ((list.length) xs) {
+    0 => false,
+    1 => false,
+    _ => true,
+}
+
+# SQLite has no CONCAT and its `||` operator propagates NULL. The fold keeps
+# the lowering in base while preserving the usual CONCAT behavior: nullable
+# arguments become empty strings, and the empty accumulator is harmless for a
+# non-empty list (the public function still enforces the two-item minimum at
+# runtime).
+concatNonNull = xs => case {
+    (atLeastTwo xs) => case dialect.name {
+        "sqlite" => listFold (acc => x => sql_fragment "{} || {}" [acc, x]) "" xs,
+        _        => sql_func "CONCAT" xs,
+    },
+    _ => sql_error "concat expects at least two expressions",
+}
+concatNullable = xs => case {
+    (atLeastTwo xs) => case dialect.name {
+        "sqlite" => listFold (acc => x => sql_fragment "{} || {}" [acc, fromMaybe "" x]) "" xs,
+        _        => sql_func "CONCAT" xs,
+    },
+    _ => sql_error "concat expects at least two expressions",
+}
+
+export concat: [string] -> string = xs => concatNonNull xs
+export concat: [(maybe string)] -> string = xs => concatNullable xs
+
+export greatest: [a] -> a = xs => case {
+    (atLeastTwo xs) => case dialect.name {
+        "sqlite" => sql_func "MAX" xs,
+        _        => sql_func "GREATEST" xs,
+    },
+    _ => sql_error "greatest expects at least two expressions",
+}
+export least: [a] -> a = xs => case {
+    (atLeastTwo xs) => case dialect.name {
+        "sqlite" => sql_func "MIN" xs,
+        _        => sql_func "LEAST" xs,
+    },
+    _ => sql_error "least expects at least two expressions",
+}
+
+export round: int -> int -> int = x => scale => sql_func "ROUND" [x, scale]
+export round: float -> int -> float = x => scale => sql_func "ROUND" [x, scale]
+export round: decimal -> int -> decimal = x => scale => sql_func "ROUND" [x, scale]
+
+export substring: string -> int -> (maybe int) -> string = s => start => size => case {
+    (isNull size) => case dialect.name {
+        "sqlite" => sql_func "SUBSTR" [s, start],
+        _        => sql_func "SUBSTRING" [s, start],
+    },
+    _ => case dialect.name {
+        "sqlite" => sql_func "SUBSTR" [s, start, size],
+        _        => sql_func "SUBSTRING" [s, start, size],
+    },
+}
+
+pad = left => s => width => fill => case dialect.name {
+    "sqlite" => let spaces = replace (sql_func "PRINTF" ["%*s", width, ""]) " " fill in
+        let missing = width - length s in
+        let truncated = sql_func "SUBSTR" [s, 1, width] in
+        let padded = sql_func "SUBSTR" [spaces, 1, missing] in
+        case {
+            (length s >= width) => truncated,
+            left == true => sql_fragment "{} || {}" [padded, s],
+            _ => sql_fragment "{} || {}" [s, padded],
+        },
+    _ => case left {
+        true => sql_func "LPAD" [s, width, fill],
+        _    => sql_func "RPAD" [s, width, fill],
+    },
+}
+
+export lpad: string -> int -> string -> string = s => width => fill => pad true s width fill
+export rpad: string -> int -> string -> string = s => width => fill => pad false s width fill
 export reverse = core.reverse
 
 # ---------------------------------------------------------------------------
 # Maybe
 # ---------------------------------------------------------------------------
 
+export fromMaybe = core.fromMaybe
+
+# These are ordinary SQL expressions, not evaluator operations. Keeping them
+# here makes NULL handling part of the library surface while the core only
+# supplies the generic SQL call/fragment vocabulary.
 export just = core.just
 export nothing = core.nothing
-export fromMaybe = core.fromMaybe
-export isNull = core.isNull
-export maybeIsJust = core.maybeIsJust
-export isTrue = core.isTrue
-export isFalse = core.isFalse
-export isUnknown = core.isUnknown
+
+export isNull = core.sql_is_null
+export maybeIsJust: (maybe a) -> bool = x => sql_fragment "{} IS NOT NULL" [x]
+
+export isTrue: bool -> bool = x => sql_fragment "{} IS TRUE" [x]
+export isTrue: (maybe bool) -> bool = x => sql_fragment "{} IS TRUE" [x]
+export isFalse: bool -> bool = x => sql_fragment "{} IS FALSE" [x]
+export isFalse: (maybe bool) -> bool = x => sql_fragment "{} IS FALSE" [x]
+export isUnknown: bool -> bool = x => sql_fragment "{} IS NULL" [x]
+export isUnknown: (maybe bool) -> bool = x => sql_fragment "{} IS NULL" [x]
+
+# `coalesce` keeps both useful forms: a binary curried call and a homogeneous
+# list call. The list is passed directly to the generic SQL-call primitive.
+export coalesce: a -> a -> a = x => y => case {
+    (sql_same_type x y) => sql_func "COALESCE" [x, y],
+    _ => sql_error "coalesce requires matching types",
+}
+export coalesce: [(maybe a)] -> (maybe a) = xs => case {
+    (atLeastTwo xs) => sql_func "COALESCE" xs,
+    _ => sql_error "coalesce expects at least two expressions",
+}
+
+export nullIf: a -> a -> a = x => y => sql_func "NULLIF" [x, y]
 
 # ---------------------------------------------------------------------------
 # Closed Functor / Applicative / Alternative / Monad operations

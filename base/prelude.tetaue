@@ -18,6 +18,7 @@
 # them locally, so the operator definitions below need a real import as well:
 # `import ... as sql` gives the Prelude its own access to the same module.
 import "./sql.tetaue" as sql
+import "./sql.tetaue"
 import "./sql/time.tetaue" as time
 import "./data/function.tetaue" as fn
 
@@ -43,6 +44,7 @@ export _*_ = sql.sql_multiply
 export _/_ = sql.sql_divide
 export _+_ = sql.sql_add
 export _-_ = sql.sql_subtract
+export _<>_: string -> string -> string = x => y => concat [x, y]
 export _<>_ = sql.sql_merge
 export _==_ = sql.sql_equal
 export _!=_ = sql.sql_not_equal

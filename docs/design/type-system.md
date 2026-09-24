@@ -22,9 +22,11 @@ the reflection that shaped the implementation — lives in
    metavariable. A bare `table "users"` gets a fresh row hole
    (`query ?table`) instead of `forall r. query r`.
 4. **SQL NULL is explicit.** `null : forall a. (maybe a)`, `just : a -> (maybe a)`,
-   `nothing : forall a. (maybe a)`, `fromMaybe : a -> (maybe a) -> a`,
-   `isNull` / `isNotNull : (maybe a) -> bool`. `coalesce` remains as the
-   SQL-native choice between two maybe values.
+   `nothing : forall a. (maybe a)`, `fromMaybe : a -> (maybe a) -> a`.
+   `isNull` / `isNotNull` are base-library SQL predicates with type
+   `a -> bool` (SQL can test any expression); `maybeIsJust` keeps the
+   narrower `(maybe a) -> bool` Data.Maybe contract. `coalesce` and `nullIf`
+   are also ordinary definitions in `base/sql.tetaue`.
 5. **Numeric polymorphism is constrained.** `Num t` is retained on inferred
    variables through generalization and instantiation. Its closed instances
    are currently `int`, `float`, and `decimal`.
@@ -221,10 +223,10 @@ then        : closed `>>` dispatch over maybe and list
 just        : forall a. a -> (maybe a)
 nothing     : forall a. (maybe a)
 fromMaybe  : forall a. a -> (maybe a) -> a
-coalesce    : forall a. (maybe a) -> (maybe a) -> (maybe a)
-             | forall a. [(maybe a)] -> (maybe a)   -- list form: coalesce [x, y, z]
-isNull     : forall a. (maybe a) -> bool
-isNotNull : forall a. (maybe a) -> bool
+coalesce    : base overloads for `a -> a -> a` and `[a] -> a`
+nullIf      : base definition `a -> a -> a`
+isNull      : base definition `a -> bool`
+isNotNull   : base definition `a -> bool`
 
 count       : forall a. a -> agg int
 countDistinct : forall a. a -> agg int

@@ -20,7 +20,7 @@
  * validator, hover/completion, and `tetaue types`) all use this pass.
  ******************************************************************************/
 import type { AstNode } from 'langium';
-import { ERROR, checkBinding, createPreludeEnv, describe, namespaceEnv, type Value } from './interpreter.js';
+import { ERROR, checkBinding, createPreludeEnv, describe, maybeNamespaceFromBase, namespaceEnv, type Value } from './interpreter.js';
 import { parseStringLiteral } from './strings.js';
 import { baseClosureFor, baseModuleFor, baseModulesByPath } from './prelude.js';
 import { recursiveBindingMessage, topoOrderBindings, type Diagnostic } from './binding-analysis.js';
@@ -198,6 +198,8 @@ export function checkProject(
         // comments are hidden terminals, so the flag — not the model — is
         // where the directive lives for a caller-built `ProjectModule`.
         if (!isBase && module.noPrelude !== true && prelude) {
+            const maybe = maybeNamespaceFromBase(valueExportsByModule.get(prelude) ?? new Map());
+            if (maybe) env.set('Maybe', maybe);
             for (const [name, scheme] of schemeExportsByModule.get(prelude) ?? []) {
                 if (!inferencer.env.has(name)) inferencer.env.set(name, scheme);
             }
@@ -236,7 +238,11 @@ export function checkProject(
             seen = result.seen;
             value = result.value;
             if (binding.export) {
-                exports.set(binding.name, value);
+                // A repeated exported name is a source-level overload. The
+                // binding's environment already contains the combined runtime
+                // value; exporting only `value` would silently publish the
+                // last alternative and diverge from inference.
+                exports.set(binding.name, env.get(binding.name) ?? value);
             }
         }
 
@@ -288,6 +294,14 @@ export function checkProject(
             // identity differs.
             inferencer.preludeNames = new Set([...inferencer.preludeNames, ...exportedSchemes.keys()]);
             inferencer.preludeEnv = new Map([...inferencer.preludeEnv, ...exportedSchemes]);
+            if (module === prelude) {
+                const maybe = new Map<string, Scheme>();
+                for (const name of ['just', 'nothing', 'isJust', 'isNothing', 'fromMaybe']) {
+                    const scheme = exportedSchemes.get(name);
+                    if (scheme) maybe.set(name, scheme);
+                }
+                inferencer.preludeNamespaces.set('Maybe', maybe);
+            }
         }
         interpreterDiagnostics.push(...moduleDiagnostics);
     }

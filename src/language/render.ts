@@ -106,7 +106,6 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         boolLiteral: b => (b ? '1' : '0'),
         stringLiteral: quoteSingleQuoted,
         functions: {
-            coalesce: 'COALESCE',
             count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'JSON_GROUP_ARRAY', // sqlite has no array type — a JSON array is the closest list
         },
@@ -117,7 +116,6 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteSingleQuoted,
         functions: {
-            coalesce: 'COALESCE',
             count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'ARRAY_AGG',
         },
@@ -132,7 +130,6 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteMysql,
         functions: {
-            coalesce: 'COALESCE',
             count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'JSON_ARRAYAGG',
         },
@@ -144,7 +141,6 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteSingleQuoted,
         functions: {
-            coalesce: 'COALESCE',
             count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'ARRAY_AGG',
         },
@@ -160,7 +156,6 @@ export const DIALECTS: Readonly<Record<string, DialectSpec>> = {
         boolLiteral: b => (b ? 'TRUE' : 'FALSE'),
         stringLiteral: quoteMysql,
         functions: {
-            coalesce: 'COALESCE',
             count: 'COUNT', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX',
             array: 'COLLECT_LIST',
         },
